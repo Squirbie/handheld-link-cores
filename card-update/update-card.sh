@@ -120,6 +120,10 @@ while IFS=$'\t' read -r card file cur new zip inzip; do
     rm -f "$f.hbnew"; say "  !! 옛 판을 backup 으로 못 옮겨서 그대로 뒀어요 · could not back up $file, left as it was"; fail=1; continue
   fi
   if mv -f "$f.hbnew" "$f" && [ "$(md5of "$f")" = "$new" ]; then
+    if [ "$OS" = Darwin ]; then  # macOS tags new files (com.apple.provenance); on exFAT that becomes a "._" file
+      xattr -c "$f" "$bak" "$dir/backup" 2>/dev/null
+      rm -f "$dir/._$file" "$dir/._backup" "$dir/backup/._${bak##*/}"
+    fi
     say "  바꿨어요 · updated   $file   (옛 판 · old: system/hanbang_cores/backup/)"
   else
     [ -f "$f" ] || copy "$bak" "$f"
