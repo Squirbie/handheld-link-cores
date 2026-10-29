@@ -9,7 +9,7 @@
 | | |
 |---|---|
 | 코어 파일 | `fbneo_mj_libretro.so` · `mame2003_plus_mj_libretro.so`, 각각 72,584 바이트, aarch64 리눅스 (둘 다 릴리스 zip `arcade-mahjong-pad-linux-aarch64.zip` 안에 있어요) |
-| 버전 | 소스 한 파일 [`patches/hb_mjpad.c`](patches/hb_mjpad.c) (md5 `7c721fac65a15a9649bd27464777bb3a`)을 컴파일 옵션만 달리해 두 번 빌드해요. 감싸는 진짜 코어는 `fbneo_libretro.so` ([arcade-fbneo](../arcade-fbneo/README.ko.md), md5 `c942499fc72a61400d4e6a486841fb37`)와 `mame2003_plus_libretro.so` ([arcade-mame2003-plus](../arcade-mame2003-plus/README.ko.md), md5 `30e1ebc1ea097bd2cddd4e8e85b31f7e`)예요 |
+| 버전 | 소스 한 파일 [`patches/hb_mjpad.c`](patches/hb_mjpad.c) (md5 `7c721fac65a15a9649bd27464777bb3a`)을 컴파일 옵션만 달리해 두 번 빌드해요. 감싸는 진짜 코어는 `fbneo_libretro.so` ([arcade-fbneo](../arcade-fbneo/README.ko.md), md5 `c942499fc72a61400d4e6a486841fb37`)와 `mame2003_plus_libretro.so` ([arcade-mame2003-plus](../arcade-mame2003-plus/README.ko.md), md5 `5dbeaf459d9c05a5eb175a286c7ed4a7`)예요 |
 | md5 | `fbneo_mj_libretro.so`: `92e23de148cb45fb645cc270cba95bfd`<br>`mame2003_plus_mj_libretro.so`: `fb23fd640ae81b3cbdde89ad3d43f4e5`<br>`fbneo_mj_libretro.so` 의 sha256: `543cc430544efda049cae8257d2a2fc185b667567eb878f235abfeb5a5be72e6`<br>`mame2003_plus_mj_libretro.so` 의 sha256: `294b11405fe9059a7c8936f577ac26fbec9bbe9384350180f5c71848dca47974` |
 | 원본 | 없어요. 직접 쓴 소스예요. FBNeo · MAME 소스는 한 줄도 안 들어 있고, 실행할 때 진짜 코어 파일을 `dlopen` 으로 열어요 |
 | 라이선스 | 감싸는 코어와 같은 조건이에요. `fbneo_mj` 는 FinalBurn Neo 라이선스, `mame2003_plus_mj` 는 MAME 라이선스예요. 둘 다 비상업이라 팔 수 없어요. [라이선스](#라이선스) 참고 |

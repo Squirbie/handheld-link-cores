@@ -1,0 +1,45 @@
+diff --git a/src/inptport.c b/src/inptport.c
+index e21fb1ac..e2ea10e6 100644
+--- a/src/inptport.c
++++ b/src/inptport.c
+@@ -43,6 +43,7 @@ be specified by a CODE_NOT (for example, ALT-TAB on a windows machine).
+ #include "driver.h"
+ #include "config.h"
+ #include "cpuexec.h"
++#include "state.h"
+ 
+ 
+ /***************************************************************************
+@@ -703,6 +704,11 @@ getout:
+ 
+ 	init_analog_seq();
+ 
++	/* the values the board latched at the last VBLANK: the game reads them
++	   until the next one, so a loaded state must bring them back */
++	state_save_register_UINT16("input", 0, "port values", input_port_value, MAX_INPUT_PORTS);
++	state_save_register_UINT16("input", 0, "vblank",      input_vblank,     MAX_INPUT_PORTS);
++
+ 	update_input_ports();
+ 
+ 	/* if we didn't find a saved config, return 0 so the main core knows that it */
+diff --git a/src/cpu/hd6309/hd6309.c b/src/cpu/hd6309/hd6309.c
+index a77a5a4c..9f0dc3cb 100644
+--- a/src/cpu/hd6309/hd6309.c
++++ b/src/cpu/hd6309/hd6309.c
+@@ -587,6 +587,8 @@ void hd6309_init(void)
+ 	state_save_register_UINT16("hd6309", cpu, "X", &X, 1);
+ 	state_save_register_UINT16("hd6309", cpu, "Y", &Y, 1);
+ 	state_save_register_UINT16("hd6309", cpu, "V", &V, 1);
++	state_save_register_UINT16("hd6309", cpu, "D", &D, 1);	/* the accumulators A and B */
++	state_save_register_UINT16("hd6309", cpu, "W", &W, 1);	/* the accumulators E and F */
+ 	state_save_register_UINT8("hd6309", cpu, "DP", &DP, 1);
+ 	state_save_register_UINT8("hd6309", cpu, "CC", &CC, 1);
+ 	state_save_register_UINT8("hd6309", cpu, "MD", &MD, 1);
+@@ -595,6 +597,7 @@ void hd6309_init(void)
+ 	state_save_register_UINT8("hd6309", cpu, "NMI", &hd6309.nmi_state, 1);
+ 	state_save_register_UINT8("hd6309", cpu, "IRQ", &hd6309.irq_state[0], 1);
+ 	state_save_register_UINT8("hd6309", cpu, "FIRQ", &hd6309.irq_state[1], 1);
++	state_save_register_int("hd6309", cpu, "extra_cycles", &hd6309.extra_cycles);	/* the cycles of an interrupt taken outside the execute loop */
+ }
+ 
+ /****************************************************************************/

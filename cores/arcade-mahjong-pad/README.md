@@ -9,7 +9,7 @@
 | | |
 |---|---|
 | Core file | `fbneo_mj_libretro.so` and `mame2003_plus_mj_libretro.so`, 72,584 bytes each, aarch64 Linux (both in the release zip `arcade-mahjong-pad-linux-aarch64.zip`) |
-| Version | One source file, [`patches/hb_mjpad.c`](patches/hb_mjpad.c) (md5 `7c721fac65a15a9649bd27464777bb3a`), compiled twice with different options. It wraps the real cores `fbneo_libretro.so` ([arcade-fbneo](../arcade-fbneo/), md5 `c942499fc72a61400d4e6a486841fb37`) and `mame2003_plus_libretro.so` ([arcade-mame2003-plus](../arcade-mame2003-plus/), md5 `30e1ebc1ea097bd2cddd4e8e85b31f7e`) |
+| Version | One source file, [`patches/hb_mjpad.c`](patches/hb_mjpad.c) (md5 `7c721fac65a15a9649bd27464777bb3a`), compiled twice with different options. It wraps the real cores `fbneo_libretro.so` ([arcade-fbneo](../arcade-fbneo/), md5 `c942499fc72a61400d4e6a486841fb37`) and `mame2003_plus_libretro.so` ([arcade-mame2003-plus](../arcade-mame2003-plus/), md5 `5dbeaf459d9c05a5eb175a286c7ed4a7`) |
 | md5 | `fbneo_mj_libretro.so`: `92e23de148cb45fb645cc270cba95bfd`<br>`mame2003_plus_mj_libretro.so`: `fb23fd640ae81b3cbdde89ad3d43f4e5`<br>sha256 of `fbneo_mj_libretro.so`: `543cc430544efda049cae8257d2a2fc185b667567eb878f235abfeb5a5be72e6`<br>sha256 of `mame2003_plus_mj_libretro.so`: `294b11405fe9059a7c8936f577ac26fbec9bbe9384350180f5c71848dca47974` |
 | Upstream | None. This is original code: it contains no FBNeo or MAME source and loads the real core with `dlopen` at run time |
 | License | The same terms as the core it wraps: the FinalBurn Neo license for `fbneo_mj`, the MAME license for `mame2003_plus_mj`. Both are non-commercial, so you may not sell them. See [License](#license) |

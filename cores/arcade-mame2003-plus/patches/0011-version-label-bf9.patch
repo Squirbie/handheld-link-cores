@@ -1,0 +1,12 @@
+diff --git a/src/mame2003/mame2003.c b/src/mame2003/mame2003.c
+--- a/src/mame2003/mame2003.c
++++ b/src/mame2003/mame2003.c
+@@ -173,7 +173,7 @@
+ #ifndef GIT_VERSION
+ #define GIT_VERSION ""
+ #endif
+-  info->library_version = GIT_VERSION "-blankfix1";
++  info->library_version = GIT_VERSION "-blankfix1-bf9";
+   info->valid_extensions = "zip";
+   info->need_fullpath = true;
+   info->block_extract = true;

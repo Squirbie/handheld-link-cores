@@ -6,3 +6,6 @@
 0006-atarigen-persistent-timers-atarigt-only.patch
 0007-atari-system1-gauntlet-slapstic-atarimo-state.patch
 0008-vsnes-mmc3-and-protection-state.patch
+0009-ym2151-postload-connect-args-upstream-b52156ee.patch
+0010-input-port-latch-hd6309-state-upstream-32775973-6266128c.patch
+0011-version-label-bf9.patch
