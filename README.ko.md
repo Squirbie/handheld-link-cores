@@ -90,6 +90,25 @@ MSX 게임 안 저장이 파일로 남고, 패미컴 매퍼 14 에 작업용 램
 </p>
 <p align="center"><sub>둘째 기기에서 같은 게임을 켜면 이미 열린 방에 같이할지 물어요 — 메뉴도, 주소 입력도 없어요. 10초 안에 안 고르면 혼자 하기로 켜져요.</sub></p>
 
+## 예시 화면
+
+와이파이로 이은 RG35XX Pro 두 대의 실제 화면이에요. 왼쪽이 1번 기기(방장), 오른쪽이 2번 기기(손님)예요.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/gallery/compare-ko.png" alt="원래 넷플레이와 다른 점: 게임기 한 대를 나눠 쓰기 대신 코어 하나 안에서 게임기 두 대가 같은 박자로"></td>
+<td width="50%"><img src="docs/images/gallery/ds-card-ko.png" alt="저사양 화면 하나짜리 기기의 DS: 통신 중 초당 58~59장 · 덜 끊김 · 다른 화면 창"></td>
+</tr>
+<tr>
+<td><img src="docs/images/gallery/gba-link-ko.png" alt="GBA 통신 케이블을 와이파이로: 기기마다 자기 쪽 화면"></td>
+<td><img src="docs/images/gallery/ds-wireless-ko.png" alt="DS 무선 통신: 두 기기가 같은 세계를 각자 화면으로"></td>
+</tr>
+<tr>
+<td><img src="docs/images/gallery/gb-link-ko.png" alt="게임보이 통신 대전: 1번 기기는 '자신의 차례', 2번 기기는 '상대의 차례'"></td>
+<td><img src="docs/images/gallery/ngp-link-ko.png" alt="네오지오 포켓 통신 케이블: 기기마다 자기 캐릭터를 고름"></td>
+</tr>
+</table>
+
 ## 무엇이 들었나
 
 | 기종 | 꾸러미 | 무엇을 고쳤나 | 바탕 |

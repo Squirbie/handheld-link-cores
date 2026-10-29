@@ -90,6 +90,25 @@ MSX in-game saves that stick, work RAM for NES mapper 14, DOS IPX netplay withou
 </p>
 <p align="center"><sub>Start the same game on the second device and it offers to join the room that is already open — no menus, no IP addresses. After 10 seconds it starts solo.</sub></p>
 
+## Gallery
+
+Real screens from two RG35XX Pro handhelds linked over Wi-Fi. Left is device 1 (host), right is device 2 (guest).
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/gallery/compare.png" alt="How it differs from normal netplay: one shared console versus two consoles in lockstep inside one core"></td>
+<td width="50%"><img src="docs/images/gallery/ds-card.png" alt="DS on a low-end single-screen handheld: 58 to 59 fps while linked, fewer Wi-Fi dropouts, popup screens"></td>
+</tr>
+<tr>
+<td><img src="docs/images/gallery/gba-link.png" alt="GBA link cable over Wi-Fi: each handheld shows its own player in a two-player match"></td>
+<td><img src="docs/images/gallery/ds-wireless.png" alt="DS local wireless: two handhelds in the same world, each on its own screen"></td>
+</tr>
+<tr>
+<td><img src="docs/images/gallery/gb-link.png" alt="Game Boy link battle: device 1 shows 'your turn', device 2 shows 'opponent's turn'"></td>
+<td><img src="docs/images/gallery/ngp-link.png" alt="Neo Geo Pocket link cable: each handheld picks its own fighter"></td>
+</tr>
+</table>
+
 ## What's inside
 
 | System | Package | What it fixes | Based on |
