@@ -1,0 +1,175 @@
+diff --git a/src/libretro/core/core.hpp b/src/libretro/core/core.hpp
+index bb52319..7e382dc 100644
+--- a/src/libretro/core/core.hpp
++++ b/src/libretro/core/core.hpp
+@@ -96,6 +96,7 @@ namespace MelonDsDs {
+         bool MpSendPacket(const Packet &p) noexcept;
+         std::optional<Packet> MpNextPacket() noexcept;
+         std::optional<Packet> MpNextPacketBlock() noexcept;
++        uint8_t MpReplyAid(const Packet &p) noexcept { return _mpState.ReplyAid(p); }
+         bool MpActive() const noexcept;
+ 
+         void WriteNdsSave(std::span<const std::byte> savedata, uint32_t writeoffset, uint32_t writelen) noexcept;
+diff --git a/src/libretro/libretro.cpp b/src/libretro/libretro.cpp
+index b56f23a..3e31820 100644
+--- a/src/libretro/libretro.cpp
++++ b/src/libretro/libretro.cpp
+@@ -392,8 +392,9 @@ u16 Platform::MP_RecvReplies(u8* packets, u64 timestamp, u16 aidmask, void*) {
+         return 0;
+     }
+     u16 ret = 0;
++    u16 answered = 0; // hanbang: AIDs that answered at all, including blank "not ready" replies
+     int loops = 0;
+-    while((ret & aidmask) != aidmask) {
++    while((answered & aidmask) != aidmask) {
+         std::optional<MelonDsDs::Packet> o_p = MelonDsDs::Core.MpNextPacketBlock();
+         if(!o_p.has_value()) {
+             return ret;
+@@ -405,8 +406,16 @@ u16 Platform::MP_RecvReplies(u8* packets, u64 timestamp, u16 aidmask, void*) {
+         if(p.PacketType() != MelonDsDs::Packet::Type::Reply) {
+             continue;
+         }
+-        ret |= 1<<p.Aid();
+-        memcpy(&packets[(p.Aid()-1)*1024], p.Data(), std::min(p.Length(), (uint64_t)1024));
++        u8 aid = MelonDsDs::Core.MpReplyAid(p);
++        if(aid == 0 || aid >= 16) {
++            continue;
++        }
++        answered |= 1<<aid;
++        if(p.Aid() == 0) {
++            continue;
++        }
++        ret |= 1<<aid;
++        memcpy(&packets[(aid-1)*1024], p.Data(), std::min(p.Length(), (uint64_t)1024));
+         loops++;
+     }
+     return ret;
+diff --git a/src/libretro/net/mp.cpp b/src/libretro/net/mp.cpp
+index caa185d..1e5d0b7 100644
+--- a/src/libretro/net/mp.cpp
++++ b/src/libretro/net/mp.cpp
+@@ -15,7 +15,9 @@
+ */
+ #include "mp.hpp"
+ #include "environment.hpp"
+-#include <ctime>
++#include <chrono>
++#include <cstdlib>
++#include <thread>
+ #include <libretro.h>
+ #include <retro_assert.h>
+ #include <retro_endianness.h>
+@@ -24,7 +26,19 @@ using namespace MelonDsDs;
+ // How many successive timeouts before
+ // the player gets notified they are not supposed to use a VPN.
+ constexpr int SUCCESSIVE_TIMEOUTS_WARNING = 6;
+-constexpr long RECV_TIMEOUT_MS = 25;
++// hanbang: 25ms of process CPU time (std::clock) was far too short for two slow handhelds
++// on Wi-Fi, so the host gave up on replies and the DS game dropped the link.
++// Wait on the wall clock instead; MELONDSDS_MP_TIMEOUT_MS overrides the default.
++constexpr long RECV_TIMEOUT_MS = 150;
++
++static long RecvTimeoutMs() noexcept {
++    static const long timeout = [] {
++        const char* env = std::getenv("MELONDSDS_MP_TIMEOUT_MS");
++        long value = env ? std::strtol(env, nullptr, 10) : 0;
++        return (value >= 5 && value <= 2000) ? value : RECV_TIMEOUT_MS;
++    }();
++    return timeout;
++}
+ 
+ uint64_t swapToNetwork(uint64_t n) {
+     return swap_if_little64(n);
+@@ -106,6 +120,7 @@ void MpState::SetPollFn(retro_netpacket_poll_receive_t pollFn) noexcept {
+ void MpState::PacketReceived(const void *buf, size_t len, uint16_t client_id) noexcept {
+     retro_assert(IsReady());
+     Packet p = Packet::parsePk(buf, len);
++    p.SetSender(client_id);
+     if(p.PacketType() == Packet::Type::Cmd) {
+         _hostId = client_id;
+         //retro::debug("Host client id is {}", client_id);
+@@ -132,13 +147,15 @@ std::optional<Packet> MpState::NextPacket() noexcept {
+ std::optional<Packet> MpState::NextPacketBlock() noexcept {
+     retro_assert(IsReady());
+     if (receivedPackets.empty()) {
+-        for(std::clock_t start = std::clock(); std::clock() < (start + (RECV_TIMEOUT_MS * CLOCKS_PER_SEC / 1000));) {
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(RecvTimeoutMs());
++        do {
+             _sendFn(RETRO_NETPACKET_FLUSH_HINT, NULL, 0, RETRO_NETPACKET_BROADCAST);
+             _pollFn();
+             if(!receivedPackets.empty()) {
+                 return NextPacket();
+             }
+-        }
++            std::this_thread::yield();
++        } while (std::chrono::steady_clock::now() < deadline);
+     } else {
+         return NextPacket();
+     }
+@@ -151,6 +168,18 @@ std::optional<Packet> MpState::NextPacketBlock() noexcept {
+     return std::nullopt;
+ }
+ 
++// A client that isn't ready to answer a CMD sends a blank reply with AID 0
++// (see SendMPReply in melonDS's Wifi.cpp). Standalone melonDS stops waiting once every client answered,
++// blank or not; here we remember which AID each netplay client uses so its blank reply counts too.
++uint8_t MpState::ReplyAid(const Packet &p) noexcept {
++    if (p.Aid() != 0) {
++        _replyAids[p.Sender()] = p.Aid();
++        return p.Aid();
++    }
++    auto it = _replyAids.find(p.Sender());
++    return it == _replyAids.end() ? 0 : it->second;
++}
++
+ void MpState::SendPacket(const Packet &p) noexcept {
+     retro_assert(IsReady());
+     uint16_t dest = RETRO_NETPACKET_BROADCAST;
+diff --git a/src/libretro/net/mp.hpp b/src/libretro/net/mp.hpp
+index f6b5dfc..807b7b4 100644
+--- a/src/libretro/net/mp.hpp
++++ b/src/libretro/net/mp.hpp
+@@ -17,6 +17,7 @@
+ #include <cstdint>
+ #include <queue>
+ #include <optional>
++#include <unordered_map>
+ #include <vector>
+ #include <libretro.h>
+ 
+@@ -48,12 +49,19 @@ public:
+     [[nodiscard]] uint64_t Length() const noexcept {
+         return _data.size();
+     };
++    [[nodiscard]] uint16_t Sender() const noexcept {
++        return _sender;
++    };
++    void SetSender(uint16_t sender) noexcept {
++        _sender = sender;
++    };
+ 
+     std::vector<uint8_t> ToBuf() const;
+ private:
+     uint64_t _timestamp;
+     uint8_t _aid;
+     Packet::Type _type;
++    uint16_t _sender = 0;
+     std::vector<uint8_t> _data;
+ };
+ 
+@@ -66,6 +74,7 @@ public:
+     void SendPacket(const Packet &p) noexcept;
+     std::optional<Packet> NextPacket() noexcept;
+     std::optional<Packet> NextPacketBlock() noexcept;
++    uint8_t ReplyAid(const Packet &p) noexcept;
+ private:
+     bool _warnedHighLatency = false;
+     int _timeoutCount = 0;
+@@ -73,5 +82,7 @@ private:
+     retro_netpacket_poll_receive_t _pollFn;
+     std::optional<uint16_t> _hostId;
+     std::queue<Packet> receivedPackets;
++    // hanbang: AID each netplay client last replied with, so blank replies can be attributed
++    std::unordered_map<uint16_t, uint8_t> _replyAids;
+ };
+ }

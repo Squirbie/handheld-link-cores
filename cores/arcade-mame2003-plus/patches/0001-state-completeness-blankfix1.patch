@@ -1,0 +1,2111 @@
+diff --git a/src/cpu/m6809/m6809.c b/src/cpu/m6809/m6809.c
+index 968b5d51..11b2c5fd 100644
+--- a/src/cpu/m6809/m6809.c
++++ b/src/cpu/m6809/m6809.c
+@@ -508,6 +508,10 @@ void m6809_init(void)
+ {
+ 	int cpu = cpu_getactivecpu();
+ 	state_save_register_UINT16("m6809", cpu, "PC", &PC, 1);
++	state_save_register_UINT16("m6809", cpu, "PPC", &PPC, 1);
++	state_save_register_UINT16("m6809", cpu, "D", &D, 1);
++	state_save_register_int("m6809", cpu, "EXTRA_CYCLES", &m6809.extra_cycles);
++	state_save_register_UINT8("m6809", cpu, "IREG", &m6809.ireg, 1);
+ 	state_save_register_UINT16("m6809", cpu, "U", &U, 1);
+ 	state_save_register_UINT16("m6809", cpu, "S", &S, 1);
+ 	state_save_register_UINT16("m6809", cpu, "X", &X, 1);
+diff --git a/src/cpu/t11/t11.c b/src/cpu/t11/t11.c
+index 9ed638e5..3a3a257d 100644
+--- a/src/cpu/t11/t11.c
++++ b/src/cpu/t11/t11.c
+@@ -59,6 +59,7 @@ typedef struct
+     UINT16	op;
+     UINT8	wait_state;
+     UINT8 *	bank[8];
++    UINT32 bank_offset[8];
+     UINT8	irq_state;
+     int		interrupt_cycles;
+     int		(*irq_callback)(int irqline);
+@@ -407,8 +408,32 @@ void t11_set_reg(int regnum, unsigned val)
+  *
+  *************************************/
+ 
++static void t11_presave(void)
++{
++	int i;
++	for (i = 0; i < 8; i++) t11.bank_offset[i] = t11.bank[i] - OP_RAM;
++}
++
++static void t11_postload(void)
++{
++	int i;
++	for (i = 0; i < 8; i++) t11.bank[i] = OP_RAM + t11.bank_offset[i];
++}
++
+ void t11_init(void)
+ {
++	int i, cpu = cpu_getactivecpu();
++	for (i = 0; i < 8; i++)
++		state_save_register_UINT32("t11", cpu * 8 + i, "reg", &t11.reg[i].d, 1);
++	state_save_register_UINT32("t11", cpu, "ppc", &t11.ppc.d, 1);
++	state_save_register_UINT32("t11", cpu, "psw", &t11.psw.d, 1);
++	state_save_register_UINT16("t11", cpu, "op", &t11.op, 1);
++	state_save_register_UINT8("t11", cpu, "wait", &t11.wait_state, 1);
++	state_save_register_UINT8("t11", cpu, "irq", &t11.irq_state, 1);
++	state_save_register_INT32("t11", cpu, "interrupt_cycles", &t11.interrupt_cycles, 1);
++	state_save_register_UINT32("t11", cpu, "banks", t11.bank_offset, 8);
++	state_save_register_func_presave(t11_presave);
++	state_save_register_func_postload(t11_postload);
+ }
+ 
+ 
+diff --git a/src/cpu/z80/z80.c b/src/cpu/z80/z80.c
+index 2f03c39d..a546503e 100644
+--- a/src/cpu/z80/z80.c
++++ b/src/cpu/z80/z80.c
+@@ -4099,6 +4099,8 @@ void z80_init(void)
+ 	state_save_register_UINT16("z80", cpu, "IX", &Z80.IX.w.l, 1);
+ 	state_save_register_UINT16("z80", cpu, "IY", &Z80.IY.w.l, 1);
+ 	state_save_register_UINT16("z80", cpu, "PC", &Z80.PC.w.l, 1);
++	state_save_register_UINT16("z80", cpu, "PREPC", &Z80.PREPC.w.l, 1);
++	state_save_register_int("z80", cpu, "EXTRA_CYCLES", &Z80.extra_cycles);
+ 	state_save_register_UINT16("z80", cpu, "SP", &Z80.SP.w.l, 1);
+ 	state_save_register_UINT16("z80", cpu, "AF2", &Z80.AF2.w.l, 1);
+ 	state_save_register_UINT16("z80", cpu, "BC2", &Z80.BC2.w.l, 1);
+diff --git a/src/cpuexec.c b/src/cpuexec.c
+index acf44201..d94fa612 100644
+--- a/src/cpuexec.c
++++ b/src/cpuexec.c
+@@ -161,6 +161,7 @@ struct cpuinfo
+  *************************************/
+ 
+ static struct cpuinfo cpu[MAX_CPU];
++static UINT32 saved_totalcycles[MAX_CPU][2];
+ 
+ static int time_to_reset;
+ static int time_to_quit;
+@@ -228,6 +229,23 @@ static void compute_perfect_interleave(void);
+  *
+  *************************************/
+ 
++static void cpu_scheduler_presave(void)
++{
++	int i;
++	for (i = 0; i < cpu_gettotalcpu(); i++)
++	{
++		saved_totalcycles[i][0] = (UINT32)cpu[i].totalcycles;
++		saved_totalcycles[i][1] = (UINT32)(cpu[i].totalcycles >> 32);
++	}
++}
++
++static void cpu_scheduler_postload(void)
++{
++	int i;
++	for (i = 0; i < cpu_gettotalcpu(); i++)
++		cpu[i].totalcycles = saved_totalcycles[i][0] | ((UINT64)saved_totalcycles[i][1] << 32);
++}
++
+ int cpu_init(void)
+ {
+ 	int cpunum;
+@@ -268,6 +286,25 @@ int cpu_init(void)
+ 	/* save some stuff in tag 0 */
+ 	state_save_set_current_tag(0);
+ 	state_save_register_INT32("cpu", 0, "watchdog count", &watchdog_counter, 1);
++	/* Execution bookkeeping belongs to the machine state, not the frontend. */
++	state_save_register_INT32("cpu_scheduler", 0, "current_frame", &current_frame, 1);
++	state_save_register_INT32("cpu_scheduler", 0, "vblank", &vblank, 1);
++	state_save_register_INT32("cpu_scheduler", 0, "vblank_countdown", &vblank_countdown, 1);
++	for (cpunum = 0; cpunum < cpu_gettotalcpu(); cpunum++)
++	{
++		state_save_register_INT32("cpu_scheduler", cpunum, "suspend", &cpu[cpunum].suspend, 1);
++		state_save_register_INT32("cpu_scheduler", cpunum, "nextsuspend", &cpu[cpunum].nextsuspend, 1);
++		state_save_register_INT32("cpu_scheduler", cpunum, "eatcycles", &cpu[cpunum].eatcycles, 1);
++		state_save_register_INT32("cpu_scheduler", cpunum, "nexteatcycles", &cpu[cpunum].nexteatcycles, 1);
++		state_save_register_INT32("cpu_scheduler", cpunum, "trigger", &cpu[cpunum].trigger, 1);
++		state_save_register_INT32("cpu_scheduler", cpunum, "iloops", &cpu[cpunum].iloops, 1);
++		state_save_register_INT32("cpu_scheduler", cpunum, "vblankint_countdown", &cpu[cpunum].vblankint_countdown, 1);
++		state_save_register_UINT32("cpu_scheduler", cpunum, "totalcycles_words", saved_totalcycles[cpunum], 2);
++		state_save_register_double("cpu_scheduler", cpunum, "localtime", &cpu[cpunum].localtime, 1);
++	}
++
++	state_save_register_func_presave(cpu_scheduler_presave);
++	state_save_register_func_postload(cpu_scheduler_postload);
+ 
+ 	/* reset the IRQ lines and save those */
+ 	if (cpuint_init())
+@@ -291,6 +328,8 @@ static void cpu_pre_run(void)
+ 	log_cb(RETRO_LOG_INFO, LOGPRE "Preparing emulated CPUs for execution.\n");
+ 
+ 	begin_resource_tracking();
++	/* Reset recreates machine-level timers/RAM after the last CPU save tag. */
++	state_save_set_current_tag(0);
+ 
+ 	/* read hi scores information from hiscore.dat */
+ 	hs_open(Machine->gamedrv->name);
+@@ -1011,6 +1050,7 @@ void cpu_init_refresh_timer(void)
+ 	refresh_period = TIME_IN_HZ(Machine->drv->frames_per_second);
+ 	refresh_period_inv = 1.0 / refresh_period;
+ 	refresh_timer = timer_alloc(NULL);
++	timer_save_register("cpu_timers", 0, "refresh", refresh_timer);
+ 
+ 	/* while we're at it, compute the scanline times */
+ 	cpu_compute_scanline_timing();
+@@ -1626,11 +1666,14 @@ static void cpu_inittimers(void)
+ 		ipf = 1;
+ 	timeslice_period = TIME_IN_HZ(Machine->drv->frames_per_second * ipf);
+ 	timeslice_timer = timer_alloc(cpu_timeslicecallback);
++	timer_save_register("cpu_timers", 0, "timeslice", timeslice_timer);
+ 	timer_adjust(timeslice_timer, timeslice_period, 0, timeslice_period);
+ 
+ 	/* allocate timers to handle interleave boosts */
+ 	interleave_boost_timer = timer_alloc(NULL);
+ 	interleave_boost_timer_end = timer_alloc(end_interleave_boost);
++	timer_save_register("cpu_timers", 0, "interleave", interleave_boost_timer);
++	timer_save_register("cpu_timers", 0, "interleave_end", interleave_boost_timer_end);
+ 
+ 	/*
+ 	 *	The following code finds all the CPUs that are interrupting in sync with the VBLANK
+@@ -1675,6 +1718,7 @@ static void cpu_inittimers(void)
+ 	/* allocate a vblank timer at the frame rate * the LCD number of interrupts per frame */
+ 	vblank_period = TIME_IN_HZ(Machine->drv->frames_per_second * vblank_multiplier);
+ 	vblank_timer = timer_alloc(cpu_vblankcallback);
++	timer_save_register("cpu_timers", 0, "vblank", vblank_timer);
+ 	vblank_countdown = vblank_multiplier;
+ 
+ 	/*
+@@ -1692,6 +1736,7 @@ static void cpu_inittimers(void)
+ 			ipf = 1;
+ 		cpu[cpunum].vblankint_period = TIME_IN_HZ(Machine->drv->frames_per_second * ipf);
+ 		cpu[cpunum].vblankint_timer = timer_alloc(NULL);
++		timer_save_register("cpu_timers", cpunum, "vblankint", cpu[cpunum].vblankint_timer);
+ 
+ 		/* see if we need to allocate a CPU timer */
+ 		ipf = Machine->drv->cpu[cpunum].timed_interrupts_per_second;
+@@ -1699,6 +1744,7 @@ static void cpu_inittimers(void)
+ 		{
+ 			cpu[cpunum].timedint_period = cpu_computerate(ipf);
+ 			cpu[cpunum].timedint_timer = timer_alloc(cpu_timedintcallback);
++			timer_save_register("cpu_timers", cpunum, "timedint", cpu[cpunum].timedint_timer);
+ 			timer_adjust(cpu[cpunum].timedint_timer, cpu[cpunum].timedint_period, cpunum, cpu[cpunum].timedint_period);
+ 		}
+ 	}
+diff --git a/src/cpuint.c b/src/cpuint.c
+index 8a27ebe6..ca2ede60 100644
+--- a/src/cpuint.c
++++ b/src/cpuint.c
+@@ -61,6 +61,29 @@ static INT32 irq_line_vector[MAX_CPU][MAX_IRQ_LINES];
+ #define MAX_IRQ_EVENTS		256
+ static INT32 irq_event_queue[MAX_CPU][MAX_IRQ_EVENTS];
+ static int irq_event_index[MAX_CPU];
++static mame_timer *irq_event_timer[MAX_CPU];
++static double irq_event_timeleft[MAX_CPU];
++
++static void cpu_empty_event_queue(int cpunum);
++
++static void cpuint_presave(void)
++{
++	int cpunum;
++	for (cpunum = 0; cpunum < cpu_gettotalcpu(); cpunum++)
++		irq_event_timeleft[cpunum] = irq_event_index[cpunum] ? timer_timeleft(irq_event_timer[cpunum]) : 0;
++}
++
++static void cpuint_postload(void)
++{
++	int cpunum;
++	for (cpunum = 0; cpunum < cpu_gettotalcpu(); cpunum++)
++	{
++		if (irq_event_index[cpunum])
++			timer_adjust(irq_event_timer[cpunum], irq_event_timeleft[cpunum], cpunum, 0);
++		else
++			timer_enable(irq_event_timer[cpunum], 0);
++	}
++}
+ 
+ 
+ 
+@@ -123,6 +146,7 @@ int cpuint_init(void)
+ 		
+ 		/* reset the IRQ event queues */
+ 		irq_event_index[cpunum] = 0;
++		irq_event_timer[cpunum] = timer_alloc(cpu_empty_event_queue);
+ 	}
+ 
+ 	/* set up some stuff to save */
+@@ -131,6 +155,11 @@ int cpuint_init(void)
+ 	state_save_register_INT32("cpu", 0, "irq vector",     &interrupt_vector[0][0],cpu_gettotalcpu() * MAX_IRQ_LINES);
+ 	state_save_register_UINT8("cpu", 0, "irqline state",  &irq_line_state[0][0],  cpu_gettotalcpu() * MAX_IRQ_LINES);
+ 	state_save_register_INT32("cpu", 0, "irqline vector", &irq_line_vector[0][0], cpu_gettotalcpu() * MAX_IRQ_LINES);
++	state_save_register_INT32("cpu", 0, "irq event queue", &irq_event_queue[0][0], cpu_gettotalcpu() * MAX_IRQ_EVENTS);
++	state_save_register_INT32("cpu", 0, "irq event index", irq_event_index, cpu_gettotalcpu());
++	state_save_register_double("cpu", 0, "irq event timeleft", irq_event_timeleft, cpu_gettotalcpu());
++	state_save_register_func_presave(cpuint_presave);
++	state_save_register_func_postload(cpuint_postload);
+ 
+ 	return 0;
+ }
+@@ -157,6 +186,7 @@ void cpuint_reset_cpu(int cpunum)
+ 	}
+ 
+ 	/* reset any driver hooks into the IRQ acknowledge callbacks */
++	timer_enable(irq_event_timer[cpunum], 0);
+ 	drv_irq_callbacks[cpunum] = NULL;
+ }
+ 
+@@ -321,7 +351,7 @@ void cpu_set_irq_line_and_vector(int cpunum, int irqline, int state, int vector)
+ 		
+ 		/* if this is the first one, set the timer */
+ 		if (event_index == 0)
+-			timer_set(TIME_NOW, cpunum, cpu_empty_event_queue);
++			timer_adjust(irq_event_timer[cpunum], TIME_NOW, cpunum, 0);
+ 	}
+ #if 0
+ 	else
+diff --git a/src/drivers/atarisy2.c b/src/drivers/atarisy2.c
+index f77065ab..a620e4ed 100644
+--- a/src/drivers/atarisy2.c
++++ b/src/drivers/atarisy2.c
+@@ -222,6 +222,14 @@ static MACHINE_INIT( atarisy2 )
+ 
+ 	p2portwr_state = 0;
+ 	p2portrd_state = 0;
++	state_save_register_UINT8("atarisy2", 0, "interrupt_enable", &interrupt_enable, 1);
++	state_save_register_UINT8("atarisy2", 0, "tms5220_data", &tms5220_data, 1);
++	state_save_register_UINT8("atarisy2", 0, "tms5220_data_strobe", &tms5220_data_strobe, 1);
++	state_save_register_UINT8("atarisy2", 0, "which_adc", &which_adc, 1);
++	state_save_register_UINT8("atarisy2", 0, "p2portwr_state", &p2portwr_state, 1);
++	state_save_register_UINT8("atarisy2", 0, "p2portrd_state", &p2portrd_state, 1);
++	state_save_register_INT8("atarisy2", 0, "pedal_count", &pedal_count, 1);
++
+ 
+ 	which_adc = 0;
+ }
+diff --git a/src/drivers/shanghai.c b/src/drivers/shanghai.c
+index d4b6da40..4b38b147 100644
+--- a/src/drivers/shanghai.c
++++ b/src/drivers/shanghai.c
+@@ -30,6 +30,8 @@ static UINT16 HD63484_reg[256/2];
+ static int org,rwp;
+ static UINT16 cl0,cl1,ccmp;
+ static INT16 cpx,cpy;
++static int regno;
++static unsigned char reg[2], dat[2];
+ 
+ 
+ static int instruction_length[64] =
+@@ -78,6 +80,22 @@ int HD63484_start(void)
+ 	HD63484_ram = auto_malloc(HD63484_RAM_SIZE);
+ 	if (!HD63484_ram) return 1;
+ 	memset(HD63484_ram,0,HD63484_RAM_SIZE);
++	state_save_register_UINT8("hd63484", 0, "ram", HD63484_ram, HD63484_RAM_SIZE);
++	state_save_register_UINT16("hd63484", 0, "registers", HD63484_reg, 128);
++	state_save_register_UINT16("hd63484", 0, "fifo", fifo, FIFO_LENGTH);
++	state_save_register_INT32("hd63484", 0, "fifo_counter", &fifo_counter, 1);
++	state_save_register_INT32("hd63484", 0, "org", &org, 1);
++	state_save_register_INT32("hd63484", 0, "rwp", &rwp, 1);
++	state_save_register_INT32("hd63484", 0, "regno", &regno, 1);
++	state_save_register_UINT16("hd63484", 0, "readfifo", &readfifo, 1);
++	state_save_register_UINT16("hd63484", 0, "cl0", &cl0, 1);
++	state_save_register_UINT16("hd63484", 0, "cl1", &cl1, 1);
++	state_save_register_UINT16("hd63484", 0, "ccmp", &ccmp, 1);
++	state_save_register_INT16("hd63484", 0, "cpx", &cpx, 1);
++	state_save_register_INT16("hd63484", 0, "cpy", &cpy, 1);
++	state_save_register_UINT8("hd63484", 0, "reg", reg, 2);
++	state_save_register_UINT8("hd63484", 0, "dat", dat, 2);
++
+ 	return 0;
+ }
+ 
+@@ -609,7 +627,7 @@ usrintf_showmessage("unsupported command %s (%04x)",instruction_name[fifo[0]>>10
+ 	}
+ }
+ 
+-static int regno;
++
+ 
+ static READ_HANDLER( HD63484_status_r )
+ {
+@@ -621,7 +639,7 @@ static READ_HANDLER( HD63484_status_r )
+ 
+ static WRITE_HANDLER( HD63484_address_w )
+ {
+-	static unsigned char reg[2];
++
+ 
+ 	reg[offset] = data;
+ 	regno = reg[0];	/* only low 8 bits are used */
+@@ -631,7 +649,7 @@ static WRITE_HANDLER( HD63484_address_w )
+ 
+ static WRITE_HANDLER( HD63484_data_w )
+ {
+-	static unsigned char dat[2];
++
+ 
+ 	dat[offset] = data;
+ 	if (offset == 1)
+diff --git a/src/drivers/superqix.c b/src/drivers/superqix.c
+index 78079f20..f9173b86 100644
+--- a/src/drivers/superqix.c
++++ b/src/drivers/superqix.c
+@@ -199,14 +199,20 @@ static struct AY8910interface ay8910_interface =
+ 	{ 0 }	/* port Bwrite */
+ };
+ 
+-INTERRUPT_GEN( sqix_interrupt )
++static int sqix_interrupt_loop;
++
++static MACHINE_INIT( superqix )
+ {
+-	static int loop=0;
++	sqix_interrupt_loop = 0;
++	state_save_register_int("superqix", 0, "interrupt_loop", &sqix_interrupt_loop);
++}
+ 
+-	loop++;
++INTERRUPT_GEN( sqix_interrupt )
++{
++	sqix_interrupt_loop++;
+ 
+-	if(loop>2) {
+-		if(loop==6) loop=0;
++	if(sqix_interrupt_loop>2) {
++		if(sqix_interrupt_loop==6) sqix_interrupt_loop=0;
+ 		nmi_line_pulse();
+ 	}
+ }
+@@ -224,6 +230,7 @@ static MACHINE_DRIVER_START( superqix )
+ 
+ 	MDRV_FRAMES_PER_SECOND(60)
+ 	MDRV_VBLANK_DURATION(DEFAULT_REAL_60HZ_VBLANK_DURATION)
++	MDRV_MACHINE_INIT(superqix)
+ 
+ 	/* video hardware */
+ 	MDRV_VIDEO_ATTRIBUTES(VIDEO_TYPE_RASTER)
+diff --git a/src/drivers/taito_l.c b/src/drivers/taito_l.c
+index a9378ead..513dc23d 100644
+--- a/src/drivers/taito_l.c
++++ b/src/drivers/taito_l.c
+@@ -100,6 +100,13 @@ static unsigned char *current_base[4];
+ static int cur_rombank, cur_rombank2, cur_rambank[4];
+ static int irq_adr_table[3];
+ static int irq_enable = 0;
++static int extport;
++static int *mcu_reply;
++static int mcu_pos = 0, mcu_reply_len = 0;
++static int last_data_adr, last_data;
++static int puzznic_mcu_reply[] = { 0x50, 0x1f, 0xb6, 0xba, 0x06, 0x03, 0x47, 0x05, 0x00 };
++static int mux_ctrl = 0;
++static int trackx,tracky;
+ 
+ unsigned char *taitol_rambanks;
+ 
+@@ -135,6 +142,8 @@ log_cb(RETRO_LOG_DEBUG, LOGPRE "Large palette ? %03x (%04x)\n", addr, activecpu_
+ 	}
+ }
+ 
++static void taitol_machine_postload(void);
++
+ static void machine_init(void)
+ {
+ 	int i;
+@@ -142,6 +151,23 @@ static void machine_init(void)
+ 	taitol_rambanks = auto_malloc(0x1000*12);
+ 	palette_ram = auto_malloc(0x1000);
+ 	empty_ram = auto_malloc(0x1000);
++	state_save_register_UINT8("taitol_machine", 0, "rambanks", taitol_rambanks, 0xc000);
++	state_save_register_UINT8("taitol_machine", 0, "palette_ram", palette_ram, 0x1000);
++	state_save_register_UINT8("taitol_machine", 0, "empty_ram", empty_ram, 0x1000);
++	state_save_register_INT32("taitol_machine", 0, "cur_rombank", &cur_rombank, 1);
++	state_save_register_INT32("taitol_machine", 0, "cur_rombank2", &cur_rombank2, 1);
++	state_save_register_INT32("taitol_machine", 0, "irq_enable", &irq_enable, 1);
++	state_save_register_INT32("taitol_machine", 0, "cur_rambank", cur_rambank, 4);
++	state_save_register_INT32("taitol_machine", 0, "irq_adr_table", irq_adr_table, 3);
++	state_save_register_int("taitol_machine", 0, "extport", &extport);
++	state_save_register_int("taitol_machine", 0, "mcu_pos", &mcu_pos);
++	state_save_register_int("taitol_machine", 0, "mcu_reply_len", &mcu_reply_len);
++	state_save_register_int("taitol_machine", 0, "last_data_adr", &last_data_adr);
++	state_save_register_int("taitol_machine", 0, "last_data", &last_data);
++	state_save_register_int("taitol_machine", 0, "mux_ctrl", &mux_ctrl);
++	state_save_register_int("taitol_machine", 0, "trackx", &trackx);
++	state_save_register_int("taitol_machine", 0, "tracky", &tracky);
++	state_save_register_func_postload(taitol_machine_postload);
+ 
+ 	for(i=0;i<3;i++)
+ 		irq_adr_table[i] = 0;
+@@ -374,6 +400,27 @@ log_cb(RETRO_LOG_DEBUG, LOGPRE "unknown rambankswitch %d, %02x (%04x)\n", offset
+ 	}
+ }
+ 
++static void taitol_machine_postload(void)
++{
++	int i, bank;
++	mcu_reply = puzznic_mcu_reply;
++	cpu_setbank(1, memory_region(REGION_CPU1)+0x10000+0x2000*cur_rombank);
++	if (memory_region(REGION_CPU3))
++		cpu_setbank(6, memory_region(REGION_CPU3)+0x10000+0x4000*cur_rombank2);
++	for (i = 0; i < 4; i++)
++	{
++		bank = cur_rambank[i];
++		cur_rambank[i] = -1;
++		rambankswitch_w(i, bank);
++	}
++	for (i = 0; i < 512; i++)
++	{
++		decodechar(Machine->gfx[2], i, taitol_rambanks, Machine->drv->gfxdecodeinfo[2].gfxlayout);
++		decodechar(Machine->gfx[2], i+512, taitol_rambanks+0x4000, Machine->drv->gfxdecodeinfo[2].gfxlayout);
++	}
++	tilemap_mark_all_tiles_dirty(ALL_TILEMAPS);
++}
++
+ static READ_HANDLER( rambankswitch_r )
+ {
+ 	return cur_rambank[offset];
+@@ -427,8 +474,6 @@ static WRITE_HANDLER( control2_w )
+ 	coin_counter_w(1,data & 0x08);
+ }
+ 
+-static int extport;
+-
+ static READ_HANDLER( portA_r )
+ {
+ 	if (extport == 0) return porte0_r(0);
+@@ -453,12 +498,6 @@ static READ_HANDLER( ym2203_data1_r )
+ 	return YM2203_read_port_0_r(offset);
+ }
+ 
+-static int *mcu_reply;
+-static int mcu_pos = 0, mcu_reply_len = 0;
+-static int last_data_adr, last_data;
+-
+-static int puzznic_mcu_reply[] = { 0x50, 0x1f, 0xb6, 0xba, 0x06, 0x03, 0x47, 0x05, 0x00 };
+-
+ static WRITE_HANDLER( mcu_data_w )
+ {
+ 	last_data = data;
+@@ -511,8 +550,6 @@ static WRITE_HANDLER( shared_w )
+ 	shared_ram[offset] = data;
+ }
+ 
+-static int mux_ctrl = 0;
+-
+ static READ_HANDLER( mux_r )
+ {
+ 	switch(mux_ctrl)
+@@ -578,8 +615,6 @@ static WRITE_HANDLER( champwr_adpcm_hi_w )
+ 
+ 
+ 
+-static int trackx,tracky;
+-
+ static READ_HANDLER( horshoes_tracky_reset_r )
+ {
+ 	/* reset the trackball counter */
+diff --git a/src/machine/atarigen.c b/src/machine/atarigen.c
+index b4567d9d..0d565a03 100644
+--- a/src/machine/atarigen.c
++++ b/src/machine/atarigen.c
+@@ -144,6 +144,10 @@ void atarigen_interrupt_reset(atarigen_int_callback update_int)
+ 	
+ 	/* create a timer for scanlines */
+ 	scanline_interrupt_timer = timer_alloc(scanline_interrupt_callback);
++	state_save_register_INT32("atarigen", 0, "atarigen_video_int_state", &atarigen_video_int_state, 1);
++	state_save_register_INT32("atarigen", 0, "atarigen_sound_int_state", &atarigen_sound_int_state, 1);
++	state_save_register_INT32("atarigen", 0, "atarigen_scanline_int_state", &atarigen_scanline_int_state, 1);
++
+ }
+ 
+ 
+@@ -540,6 +544,13 @@ void atarigen_sound_io_reset(int cpu_num)
+ 	/* reset the sound I/O states */
+ 	atarigen_cpu_to_sound = atarigen_sound_to_cpu = 0;
+ 	atarigen_cpu_to_sound_ready = atarigen_sound_to_cpu_ready = 0;
++	state_save_register_UINT8("atarigen", 0, "timed_int", &timed_int, 1);
++	state_save_register_UINT8("atarigen", 0, "ym2151_int", &ym2151_int, 1);
++	state_save_register_UINT8("atarigen", 0, "atarigen_cpu_to_sound", &atarigen_cpu_to_sound, 1);
++	state_save_register_UINT8("atarigen", 0, "atarigen_sound_to_cpu", &atarigen_sound_to_cpu, 1);
++	state_save_register_INT32("atarigen", 0, "atarigen_cpu_to_sound_ready", &atarigen_cpu_to_sound_ready, 1);
++	state_save_register_INT32("atarigen", 0, "atarigen_sound_to_cpu_ready", &atarigen_sound_to_cpu_ready, 1);
++
+ }
+ 
+ 
+diff --git a/src/machine/decocass_machine.c b/src/machine/decocass_machine.c
+index 32060a71..41a3a5d9 100644
+--- a/src/machine/decocass_machine.c
++++ b/src/machine/decocass_machine.c
+@@ -14,6 +14,7 @@
+ int tape_dir;
+ int tape_speed;
+ double tape_time0;
++static double tape_position;
+ void *tape_timer;
+ 
+ static int firsttime = 1;
+@@ -1626,6 +1627,14 @@ WRITE_HANDLER( decocass_e5xx_w )
+  *	init machine functions (select dongle and determine tape image size)
+  *
+  ***************************************************************************/
++static void decocass_state_save_presave(void)
++{
++	/* The tape timer itself is not serialized by the legacy timer system. */
++	tape_position = tape_time0;
++	if (tape_timer)
++		tape_position += tape_dir * timer_timeelapsed(tape_timer);
++}
++
+ static void decocass_state_save_postload(void)
+ {
+ 	int A;
+@@ -1634,8 +1643,11 @@ static void decocass_state_save_postload(void)
+ 
+ 	memory_set_opcode_base(0, mem + diff);
+ 
+-	for (A = 0;A < 0x10000; A++)
+-		decocass_w(A, mem[A]);
++	/* Rebuild decoded opcodes only. Replaying IO writes corrupts the restored
++	 * palette, video registers, reset lines and sound command latches. */
++	for (A = 0; A < 0x10000; A++)
++		mem[A + diff] = (mem[A] & 0x9f) | ((mem[A] & 0x20) << 1) | ((mem[A] & 0x40) >> 1);
++	tape_time0 = tape_position;
+ 	/* restart the timer if the tape was playing */
+ 	if (0 != tape_dir)
+ 		timer_adjust(tape_timer, TIME_NEVER, 0, 0);
+@@ -1705,6 +1717,8 @@ void decocass_init_common(void)
+ 	decocass_sound_timer = timer_alloc(decocass_sound_nmi_pulse);
+ 
+ 	/* state saving code */
++	state_save_register_func_presave(decocass_state_save_presave);
++	state_save_register_double("decocass", 0, "tape_position", &tape_position, 1);
+ 	state_save_register_func_postload(decocass_state_save_postload);
+ 	state_save_register_int 	("decocass", 0, "tape_dir", &tape_dir);
+ 	state_save_register_int 	("decocass", 0, "tape_speed", &tape_speed);
+diff --git a/src/machine/leland_machine.c b/src/machine/leland_machine.c
+index 7131488e..1e5ee9aa 100644
+--- a/src/machine/leland_machine.c
++++ b/src/machine/leland_machine.c
+@@ -65,6 +65,7 @@ static UINT8 top_board_bank;
+ static UINT8 sound_port_bank;
+ static UINT8 alternate_bank;
+ static UINT8 master_bank;
++static UINT32 ataxx_slave_bank_offset;
+ void (*leland_update_master_bank)(void);
+ 
+ static UINT32 xrom1_addr;
+@@ -401,11 +402,30 @@ MACHINE_INIT( leland )
+ }
+ 
+ 
++static void ataxx_machine_postload(void)
++{
++	ataxx_bankswitch();
++	cpu_setbank(3, slave_base + ataxx_slave_bank_offset);
++}
++
+ MACHINE_INIT( ataxx )
+ {
+ 	/* set the odd data banks */
+ 	battery_ram = memory_region(REGION_USER2);
+ 	extra_tram = battery_ram + LELAND_BATTERY_RAM_SIZE;
++	state_save_register_UINT8("ataxx_machine", 0, "master_bank", &master_bank, 1);
++	state_save_register_UINT8("ataxx_machine", 0, "wcol_enable", &wcol_enable, 1);
++	state_save_register_UINT8("ataxx_machine", 0, "analog_result", &analog_result, 1);
++	state_save_register_UINT8("ataxx_machine", 0, "battery_ram_enable", &battery_ram_enable, 1);
++	state_save_register_UINT32("ataxx_machine", 0, "xrom1_addr", &xrom1_addr, 1);
++	state_save_register_UINT32("ataxx_machine", 0, "xrom2_addr", &xrom2_addr, 1);
++	state_save_register_UINT32("ataxx_machine", 0, "ataxx_slave_bank_offset", &ataxx_slave_bank_offset, 1);
++	state_save_register_UINT8("ataxx_machine", 0, "dial_last_input", dial_last_input, 4);
++	state_save_register_UINT8("ataxx_machine", 0, "dial_last_result", dial_last_result, 4);
++	state_save_register_UINT8("ataxx_machine", 0, "extra_ram", battery_ram, LELAND_BATTERY_RAM_SIZE + ATAXX_EXTRA_TRAM_SIZE);
++	ataxx_slave_bank_offset = 0x10000;
++	state_save_register_func_postload(ataxx_machine_postload);
++
+ 
+ 	/* initialize the XROM */
+ 	xrom_length = memory_region_length(REGION_USER1);
+@@ -415,6 +435,7 @@ MACHINE_INIT( ataxx )
+ 
+ 	/* start scanline interrupts going */
+ 	master_int_timer = timer_alloc(ataxx_interrupt_callback);
++	timer_save_register("ataxx_machine", 0, "master_interrupt", master_int_timer);
+ 	timer_adjust(master_int_timer, cpu_getscanlinetime(8), 8, 0);
+ 
+ 	/* reset globals */
+@@ -1435,6 +1456,7 @@ WRITE_HANDLER( ataxx_slave_banksw_w )
+ 		log_cb(RETRO_LOG_DEBUG, LOGPRE "%04X:Slave bank %02X out of range!", activecpu_get_previouspc(), data & 0x3f);
+ 		bankaddress = 0x2000;
+ 	}
++	ataxx_slave_bank_offset = bankaddress;
+ 	cpu_setbank(3, &slave_base[bankaddress]);
+ 
+ 	if (LOG_BANKSWITCHING_S) log_cb(RETRO_LOG_DEBUG, LOGPRE "%04X:Slave bank = %02X (%05X)\n", activecpu_get_previouspc(), data, bankaddress);
+diff --git a/src/machine/namcond1_machine.c b/src/machine/namcond1_machine.c
+index 99d80930..fc3f490c 100644
+--- a/src/machine/namcond1_machine.c
++++ b/src/machine/namcond1_machine.c
+@@ -42,6 +42,10 @@ MACHINE_INIT( namcond1 )
+ 
+     /* initialise MCU states*/
+     namcond1_h8_irq5_enabled = 0;
++	state_save_register_UINT8("namcond1", 0, "namcond1_h8_irq5_enabled", &namcond1_h8_irq5_enabled, 1);
++	state_save_register_UINT8("namcond1", 0, "coin_state", &coin_state, 1);
++	state_save_register_UINT8("namcond1", 0, "coin_count", coin_count, 4);
++
+     coin_state = 0;
+     coin_count[0] = coin_count[1] =
+     coin_count[2] = coin_count[3] = 0;
+diff --git a/src/machine/slapstic.c b/src/machine/slapstic.c
+index 49523d5d..9801c760 100644
+--- a/src/machine/slapstic.c
++++ b/src/machine/slapstic.c
+@@ -794,6 +794,13 @@ void slapstic_init(int chip)
+ 	if (!slapstic_table[chip - 101])
+ 		return;
+ 	slapstic = *slapstic_table[chip - 101];
++	state_save_register_INT32("slapstic", 0, "state", (INT32 *)&state, 1);
++	state_save_register_INT8("slapstic", 0, "current_bank", &current_bank, 1);
++	state_save_register_INT8("slapstic", 0, "alt_bank", &alt_bank, 1);
++	state_save_register_INT8("slapstic", 0, "bit_bank", &bit_bank, 1);
++	state_save_register_INT8("slapstic", 0, "add_bank", &add_bank, 1);
++	state_save_register_UINT8("slapstic", 0, "bit_xor", &bit_xor, 1);
++
+ 
+ 	/* reset the chip */
+ 	slapstic_reset();
+diff --git a/src/machine/taitosj_machine.c b/src/machine/taitosj_machine.c
+index 49239c40..c23a5ec6 100644
+--- a/src/machine/taitosj_machine.c
++++ b/src/machine/taitosj_machine.c
+@@ -17,6 +17,15 @@
+ static unsigned char fromz80,toz80;
+ static int zaccept,zready;
+ static int spacecr_prot_value;
++static unsigned char portA_in, portA_out;
++static int address;
++static int protection_value;
++static UINT8 rombank;
++
++static void taitosj_machine_postload(void)
++{
++	cpu_setbank(1, memory_region(REGION_CPU1) + ((rombank & 0x80) ? 0x10000 : 0x6000));
++}
+ 
+ WRITE_HANDLER( taitosj_bankswitch_w );
+ 
+@@ -33,6 +42,18 @@ MACHINE_INIT( taitosj )
+  	if (Machine->drv->cpu[2].cpu_type != CPU_DUMMY)
+ 	cpu_set_irq_line(2,0,CLEAR_LINE);
+ 	spacecr_prot_value = 0;
++	state_save_register_UINT8("taitosj_machine", 0, "fromz80", &fromz80, 1);
++	state_save_register_UINT8("taitosj_machine", 0, "toz80", &toz80, 1);
++	state_save_register_UINT8("taitosj_machine", 0, "portA_in", &portA_in, 1);
++	state_save_register_UINT8("taitosj_machine", 0, "portA_out", &portA_out, 1);
++	state_save_register_UINT8("taitosj_machine", 0, "rombank", &rombank, 1);
++	state_save_register_INT32("taitosj_machine", 0, "zaccept", &zaccept, 1);
++	state_save_register_INT32("taitosj_machine", 0, "zready", &zready, 1);
++	state_save_register_INT32("taitosj_machine", 0, "spacecr_prot_value", &spacecr_prot_value, 1);
++	state_save_register_INT32("taitosj_machine", 0, "address", &address, 1);
++	state_save_register_INT32("taitosj_machine", 0, "protection_value", &protection_value, 1);
++	state_save_register_func_postload(taitosj_machine_postload);
++
+ }
+ 
+ 
+@@ -40,6 +61,7 @@ WRITE_HANDLER( taitosj_bankswitch_w )
+ {
+ 	unsigned char *RAM = memory_region(REGION_CPU1);
+ 
++	rombank = data;
+ 	coin_lockout_global_w(~data & 1);
+ 
+ 	cpu_setbank(1,&RAM[(data & 0x80) ? 0x10000 : 0x6000]);
+@@ -122,7 +144,7 @@ READ_HANDLER( taitosj_mcu_status_r )
+ 	return ~((zready << 0) | (zaccept << 1));
+ }
+ 
+-static unsigned char portA_in,portA_out;
++
+ 
+ READ_HANDLER( taitosj_68705_portA_r )
+ {
+@@ -167,7 +189,7 @@ READ_HANDLER( taitosj_68705_portB_r )
+ 	return 0xff;
+ }
+ 
+-static int address;
++
+ 
+ /* timer callback : 68705 is going to read data from the Z80 */
+ void taitosj_mcu_data_real_r(int param)
+@@ -287,7 +309,7 @@ READ_HANDLER( spacecr_prot_r )
+ 
+ /* Alpine Ski protection crack routines */
+ 
+-static int protection_value;
++
+ 
+ WRITE_HANDLER( alpine_protection_w )
+ {
+diff --git a/src/machine/vsnes_machine.c b/src/machine/vsnes_machine.c
+index e5bdb8e3..6890f70f 100644
+--- a/src/machine/vsnes_machine.c
++++ b/src/machine/vsnes_machine.c
+@@ -259,6 +259,9 @@ DRIVER_INIT( vsnes )
+ {
+ 	/* set the controller to default */
+ 	vsnes_gun_controller = 0;
++	state_save_register_INT32("vsnes", 0, "input_latch", input_latch, 4);
++	state_save_register_INT32("vsnes", 0, "sound_fix", &sound_fix, 1);
++
+ 
+ 	/* no color remapping */
+ 	remapped_colortable = 0;
+@@ -1180,6 +1183,7 @@ static READ_HANDLER ( set_bnglngby_irq_r )
+ 
+ DRIVER_INIT( bnglngby )
+ {
++	state_save_register_int("bnglngby", 0, "irq_latch", &ret);
+ 	install_mem_read_handler( 0, 0x0231, 0x0231, set_bnglngby_irq_r );
+ 	install_mem_write_handler( 0, 0x0231, 0x0231, set_bnglngby_irq_w );
+ 
+diff --git a/src/machine/williams_machine.c b/src/machine/williams_machine.c
+index 9737bcd4..10148f49 100644
+--- a/src/machine/williams_machine.c
++++ b/src/machine/williams_machine.c
+@@ -488,6 +488,10 @@ READ_HANDLER( williams_input_port_49way_0_5_r )
+  *
+  *************************************/
+ 
++static mame_timer *williams2_va11_timer;
++static mame_timer *williams2_endscreen_timer;
++static mame_timer *williams2_endscreen_off_timer;
++
+ static void williams2_va11_callback(int scanline)
+ {
+ 	/* the IRQ signal comes into CB1, and is set to VA11 */
+@@ -500,7 +504,7 @@ static void williams2_va11_callback(int scanline)
+ 	/* set a timer for the next update */
+ 	scanline += 8;
+ 	if (scanline >= 256) scanline = 0;
+-	timer_set(cpu_getscanlinetime(scanline), scanline, williams2_va11_callback);
++	timer_adjust(williams2_va11_timer, cpu_getscanlinetime(scanline), scanline, 0);
+ }
+ 
+ 
+@@ -517,10 +521,10 @@ static void williams2_endscreen_callback(int param)
+ 	pia_0_ca1_w(0, 0);
+ 
+ 	/* set a timer to turn it off once the scanline counter resets */
+-	timer_set(cpu_getscanlinetime(8), 0, williams2_endscreen_off_callback);
++	timer_adjust(williams2_endscreen_off_timer, cpu_getscanlinetime(8), 0, 0);
+ 
+ 	/* set a timer for next frame */
+-	timer_set(cpu_getscanlinetime(254), 0, williams2_endscreen_callback);
++	timer_adjust(williams2_endscreen_timer, cpu_getscanlinetime(254), 0, 0);
+ }
+ 
+ 
+@@ -531,6 +535,11 @@ static void williams2_endscreen_callback(int param)
+  *
+  *************************************/
+ 
++static void williams2_machine_postload(void)
++{
++	williams2_bank_select_w(0, williams2_bank);
++}
++
+ MACHINE_INIT( williams2 )
+ {
+ 	/* reset the PIAs */
+@@ -538,12 +547,23 @@ MACHINE_INIT( williams2 )
+ 
+ 	/* make sure our banking is reset */
+ 	williams2_bank_select_w(0, 0);
++	state_save_register_UINT8("williams2_machine", 0, "bank", &williams2_bank, 1);
++	state_save_register_UINT8("williams2_machine", 0, "port_select", &port_select, 1);
++	state_save_register_UINT16("williams2_machine", 0, "sound_data", &joust2_current_sound_data, 1);
++	state_save_register_func_postload(williams2_machine_postload);
++
+ 
+ 	/* set a timer to go off every 16 scanlines, to toggle the VA11 line and update the screen */
+-	timer_set(cpu_getscanlinetime(0), 0, williams2_va11_callback);
++	williams2_va11_timer = timer_alloc(williams2_va11_callback);
++	williams2_endscreen_timer = timer_alloc(williams2_endscreen_callback);
++	williams2_endscreen_off_timer = timer_alloc(williams2_endscreen_off_callback);
++	timer_save_register("williams2_machine", 0, "va11_timer", williams2_va11_timer);
++	timer_save_register("williams2_machine", 0, "endscreen_timer", williams2_endscreen_timer);
++	timer_save_register("williams2_machine", 0, "endscreen_off_timer", williams2_endscreen_off_timer);
++	timer_adjust(williams2_va11_timer, cpu_getscanlinetime(0), 0, 0);
+ 
+ 	/* also set a timer to go off on scanline 254 */
+-	timer_set(cpu_getscanlinetime(254), 0, williams2_endscreen_callback);
++	timer_adjust(williams2_endscreen_timer, cpu_getscanlinetime(254), 0, 0);
+ }
+ 
+ 
+@@ -933,6 +953,8 @@ MACHINE_INIT( joust2 )
+ 	/* make sure sound board starts out in the reset state */
+ 	williams_cvsd_init(2, 3);
+ 	pia_reset();
++	/* pia_init exists upstream but this driver never called it. */
++	pia_init(4);
+ }
+ 
+ 
+diff --git a/src/mame2003/mame2003.c b/src/mame2003/mame2003.c
+index ca4233b4..142c5095 100644
+--- a/src/mame2003/mame2003.c
++++ b/src/mame2003/mame2003.c
+@@ -173,7 +173,7 @@ void retro_get_system_info(struct retro_system_info *info)
+ #ifndef GIT_VERSION
+ #define GIT_VERSION ""
+ #endif
+-  info->library_version = GIT_VERSION;
++  info->library_version = GIT_VERSION "-blankfix1";
+   info->valid_extensions = "zip";
+   info->need_fullpath = true;
+   info->block_extract = true;
+diff --git a/src/sndhrdw/leland_sndhrdw.c b/src/sndhrdw/leland_sndhrdw.c
+index f068ad90..1950c608 100644
+--- a/src/sndhrdw/leland_sndhrdw.c
++++ b/src/sndhrdw/leland_sndhrdw.c
+@@ -221,6 +221,9 @@ static UINT8 *ext_base;
+ 
+ static UINT8 *active_mask;
+ static int total_reads;
++static UINT8 i186_port_even_byte, dac_10bit_even_byte;
++static UINT16 internal_relocation;
++static void leland_i186_postload(void);
+ 
+ struct mem_state
+ {
+@@ -552,6 +555,75 @@ int leland_i186_sh_start(const struct MachineSound *msound)
+ 	for (i = 0; i < 9; i++)
+ 		counter[i].timer = timer_alloc(NULL);
+ 
++	state_save_register_UINT8("leland_i186", 0, "sound_command", sound_command, 2);
++	state_save_register_UINT8("leland_i186", 0, "last_control", &last_control, 1);
++	state_save_register_UINT8("leland_i186", 0, "clock_active", &clock_active, 1);
++	state_save_register_UINT8("leland_i186", 0, "clock_tick", &clock_tick, 1);
++	state_save_register_UINT8("leland_i186", 0, "sound_response", &sound_response, 1);
++	state_save_register_UINT8("leland_i186", 0, "ext_active", &ext_active, 1);
++	state_save_register_UINT8("leland_i186", 0, "i186_port_even_byte", &i186_port_even_byte, 1);
++	state_save_register_UINT8("leland_i186", 0, "dac_10bit_even_byte", &dac_10bit_even_byte, 1);
++	state_save_register_UINT32("leland_i186", 0, "ext_start", &ext_start, 1);
++	state_save_register_UINT32("leland_i186", 0, "ext_stop", &ext_stop, 1);
++	state_save_register_int("leland_i186", 0, "total_reads", &total_reads);
++	state_save_register_UINT16("leland_i186", 0, "internal_relocation", &internal_relocation, 1);
++	state_save_register_UINT16("leland_i186_mem", 0, "lower", &i186.mem.lower, 1);
++	state_save_register_UINT16("leland_i186_mem", 0, "upper", &i186.mem.upper, 1);
++	state_save_register_UINT16("leland_i186_mem", 0, "middle", &i186.mem.middle, 1);
++	state_save_register_UINT16("leland_i186_mem", 0, "middle_size", &i186.mem.middle_size, 1);
++	state_save_register_UINT16("leland_i186_mem", 0, "peripheral", &i186.mem.peripheral, 1);
++	state_save_register_UINT8("leland_i186_intr", 0, "pending", &i186.intr.pending, 1);
++	state_save_register_UINT16("leland_i186_intr", 0, "ack_mask", &i186.intr.ack_mask, 1);
++	state_save_register_UINT16("leland_i186_intr", 0, "priority_mask", &i186.intr.priority_mask, 1);
++	state_save_register_UINT16("leland_i186_intr", 0, "in_service", &i186.intr.in_service, 1);
++	state_save_register_UINT16("leland_i186_intr", 0, "request", &i186.intr.request, 1);
++	state_save_register_UINT16("leland_i186_intr", 0, "status", &i186.intr.status, 1);
++	state_save_register_UINT16("leland_i186_intr", 0, "poll_status", &i186.intr.poll_status, 1);
++	state_save_register_UINT16("leland_i186_intr", 0, "timer", &i186.intr.timer, 1);
++	state_save_register_UINT16("leland_i186_intr", 0, "dma", i186.intr.dma, 2);
++	state_save_register_UINT16("leland_i186_intr", 0, "ext", i186.intr.ext, 4);
++	for (i = 0; i < 3; i++)
++	{
++		state_save_register_UINT16("leland_i186_timer", i, "control", &i186.timer[i].control, 1);
++		state_save_register_UINT16("leland_i186_timer", i, "maxA", &i186.timer[i].maxA, 1);
++		state_save_register_UINT16("leland_i186_timer", i, "maxB", &i186.timer[i].maxB, 1);
++		state_save_register_UINT16("leland_i186_timer", i, "count", &i186.timer[i].count, 1);
++		state_save_register_UINT8("leland_i186_timer", i, "active", &i186.timer[i].time_timer_active, 1);
++		state_save_register_double("leland_i186_timer", i, "last_time", &i186.timer[i].last_time, 1);
++		timer_save_register("leland_i186_timer", i, "interrupt", i186.timer[i].int_timer);
++		timer_save_register("leland_i186_timer", i, "time", i186.timer[i].time_timer);
++	}
++	for (i = 0; i < 2; i++)
++	{
++		state_save_register_UINT32("leland_i186_dma", i, "source", &i186.dma[i].source, 1);
++		state_save_register_UINT32("leland_i186_dma", i, "dest", &i186.dma[i].dest, 1);
++		state_save_register_UINT16("leland_i186_dma", i, "count", &i186.dma[i].count, 1);
++		state_save_register_UINT16("leland_i186_dma", i, "control", &i186.dma[i].control, 1);
++		state_save_register_UINT8("leland_i186_dma", i, "finished", &i186.dma[i].finished, 1);
++		timer_save_register("leland_i186_dma", i, "finish", i186.dma[i].finish_timer);
++	}
++	for (i = 0; i < 8; i++)
++	{
++		state_save_register_INT16("leland_i186_dac", i, "value", &dac[i].value, 1);
++		state_save_register_INT16("leland_i186_dac", i, "volume", &dac[i].volume, 1);
++		state_save_register_UINT32("leland_i186_dac", i, "frequency", &dac[i].frequency, 1);
++		state_save_register_UINT32("leland_i186_dac", i, "step", &dac[i].step, 1);
++		state_save_register_UINT32("leland_i186_dac", i, "fraction", &dac[i].fraction, 1);
++		state_save_register_UINT32("leland_i186_dac", i, "bufin", &dac[i].bufin, 1);
++		state_save_register_UINT32("leland_i186_dac", i, "bufout", &dac[i].bufout, 1);
++		state_save_register_UINT32("leland_i186_dac", i, "buftarget", &dac[i].buftarget, 1);
++		state_save_register_INT16("leland_i186_dac", i, "buffer", dac[i].buffer, DAC_BUFFER_SIZE);
++	}
++	for (i = 0; i < 9; i++)
++	{
++		state_save_register_INT32("leland_i186_counter", i, "count", &counter[i].count, 1);
++		state_save_register_UINT8("leland_i186_counter", i, "mode", &counter[i].mode, 1);
++		state_save_register_UINT8("leland_i186_counter", i, "readbyte", &counter[i].readbyte, 1);
++		state_save_register_UINT8("leland_i186_counter", i, "writebyte", &counter[i].writebyte, 1);
++		timer_save_register("leland_i186_counter", i, "time", counter[i].timer);
++	}
++	state_save_register_func_postload(leland_i186_postload);
++
+ 	return 0;
+ }
+ 
+@@ -617,6 +689,7 @@ void leland_i186_sound_init(void)
+ 
+ 	/* reset our internal stuff */
+ 	last_control = 0xf8;
++	internal_relocation = 0x00ff;
+ 	clock_active = 0;
+ 
+ 	/* reset the external DAC */
+@@ -1289,16 +1362,15 @@ static READ_HANDLER( i186_internal_port_r )
+ 
+ static WRITE_HANDLER( i186_internal_port_w )
+ {
+-	static UINT8 even_byte;
+ 	int temp, which, data16;
+ 
+ 	/* warning: this assumes all port writes here are word-sized */
+ 	if (!(offset & 1))
+ 	{
+-		even_byte = data;
++		i186_port_even_byte = data;
+ 		return;
+ 	}
+-	data16 = (data << 8) | even_byte;
++	data16 = (data << 8) | i186_port_even_byte;
+ 
+ 	switch (offset & ~1)
+ 	{
+@@ -1510,6 +1582,7 @@ static WRITE_HANDLER( i186_internal_port_w )
+ 			break;
+ 
+ 		case 0xfe:
++			internal_relocation = data16;
+ 			log_cb(RETRO_LOG_DEBUG, LOGPRE "%05X:80186 relocation register = %04X\n", activecpu_get_pc(), data16);
+ 
+ 			/* we assume here there that this doesn't happen too often */
+@@ -1544,6 +1617,43 @@ static WRITE_HANDLER( i186_internal_port_w )
+  *
+  *************************************/
+ 
++static void leland_i186_postload(void)
++{
++	int base;
++	cpu_setbank(6, ram_base);
++	cpu_setbank(7, ram_base);
++	base = (internal_relocation & 0x0fff) << 8;
++	if (internal_relocation & 0x1000)
++	{
++		install_mem_read_handler(2, base, base + 0xff, i186_internal_port_r);
++		install_mem_write_handler(2, base, base + 0xff, i186_internal_port_w);
++	}
++	else
++	{
++		base &= 0xffff;
++		install_port_read_handler(2, base, base + 0xff, i186_internal_port_r);
++		install_port_write_handler(2, base, base + 0xff, i186_internal_port_w);
++	}
++	if (i186.mem.middle_size)
++	{
++		base = (i186.mem.peripheral & 0xffc0) << 4;
++		if (i186.mem.middle_size & 0x0040)
++		{
++			install_mem_read_handler(2, base, base + 0x2ff, peripheral_r);
++			install_mem_write_handler(2, base, base + 0x2ff, peripheral_w);
++		}
++		else
++		{
++			base &= 0xffff;
++			install_port_read_handler(2, base, base + 0x2ff, peripheral_r);
++			install_port_write_handler(2, base, base + 0x2ff, peripheral_w);
++		}
++		cpuintrf_push_context(2);
++		i86_set_irq_callback(int_callback);
++		cpuintrf_pop_context();
++	}
++}
++
+ static INLINE void counter_update_count(int which)
+ {
+ 	/* only update if the timer is running */
+@@ -1935,7 +2045,6 @@ static WRITE_HANDLER( redline_dac_w )
+ 
+ static WRITE_HANDLER( dac_10bit_w )
+ {
+-	static UINT8 even_byte;
+ 	struct dac_state *d = &dac[6];
+ 	int count = (d->bufin - d->bufout) & DAC_BUFFER_SIZE_MASK;
+ 	int data16;
+@@ -1944,10 +2053,10 @@ static WRITE_HANDLER( dac_10bit_w )
+ 	/* if the offset is even, just stash the value */
+ 	if (!(offset & 1))
+ 	{
+-		even_byte = data;
++		dac_10bit_even_byte = data;
+ 		return;
+ 	}
+-	data16 = (data << 8) | even_byte;
++	data16 = (data << 8) | dac_10bit_even_byte;
+ 
+ 	/* set the new value */
+ 	d->value = (INT16)data16 - 0x200;
+diff --git a/src/sndhrdw/williams_sndhrdw.c b/src/sndhrdw/williams_sndhrdw.c
+index 8df15d9e..af075f58 100644
+--- a/src/sndhrdw/williams_sndhrdw.c
++++ b/src/sndhrdw/williams_sndhrdw.c
+@@ -33,6 +33,7 @@ static INT8 soundalt_cpunum;
+ static UINT8 williams_pianum;
+ 
+ static UINT8 adpcm_bank_count;
++static UINT8 cvsd_bank;
+ 
+ 
+ 
+@@ -319,6 +320,11 @@ static INLINE UINT8 *get_narc_slave_bank_base(int data)
+ 	INITIALIZATION
+ ****************************************************************************/
+ 
++static void cvsd_postload(void)
++{
++	cvsd_bank_select_w(0, cvsd_bank);
++}
++
+ void williams_cvsd_init(int cpunum, int pianum)
+ {
+ 	/* configure the CPU */
+@@ -338,6 +344,9 @@ void williams_cvsd_init(int cpunum, int pianum)
+ 
+ 	/* reset the IRQ state */
+ 	pia_set_input_ca1(williams_pianum, 1);
++	state_save_register_UINT8("williams_cvsd", 0, "bank", &cvsd_bank, 1);
++	state_save_register_UINT8("williams_cvsd", 0, "interrupt", &williams_sound_int_state, 1);
++	state_save_register_func_postload(cvsd_postload);
+ }
+ 
+ 
+@@ -482,6 +491,7 @@ static void adpcm_ym2151_irq(int state)
+ 
+ static WRITE_HANDLER( cvsd_bank_select_w )
+ {
++	cvsd_bank = data;
+ 	cpu_setbank(6, get_cvsd_bank_base(data));
+ }
+ 
+diff --git a/src/sound/ym2151.c b/src/sound/ym2151.c
+index a634bafe..0f797138 100644
+--- a/src/sound/ym2151.c
++++ b/src/sound/ym2151.c
+@@ -1557,6 +1557,8 @@ int YM2151Init(int num, int clock, int rate)
+ /* this must be done _before_ a call to YM2151ResetChip() */
+ 		YMPSG[i].timer_A = timer_alloc(timer_callback_a);
+ 		YMPSG[i].timer_B = timer_alloc(timer_callback_b);
++		timer_save_register("YM2151_timer", i, "A", YMPSG[i].timer_A);
++		timer_save_register("YM2151_timer", i, "B", YMPSG[i].timer_B);
+ #else
+ 		YMPSG[i].tim_A      = 0;
+ 		YMPSG[i].tim_B      = 0;
+diff --git a/src/state.c b/src/state.c
+index 5d295d78..b203d9fd 100644
+--- a/src/state.c
++++ b/src/state.c
+@@ -215,6 +215,9 @@ static ss_entry *ss_register_entry(const char *module, int instance, const char
+ 	while((e = *ep) != 0) {
+ 		int pos = strcmp(e->name, name);
+ 		if(!pos) {
++			/* Soft reset may recreate driver RAM/timers at a new local address. */
++			if (e->type == type && e->size == size && e->tag == ss_current_tag)
++				e->data = data;
+ 			log_cb(RETRO_LOG_DEBUG, LOGPRE "Duplicate save state registration entry (%s, %d, %s)\n", module, instance, name);
+ 			return NULL;
+ 		}
+diff --git a/src/timer.c b/src/timer.c
+index a32e3c35..955bae2a 100644
+--- a/src/timer.c
++++ b/src/timer.c
+@@ -64,6 +64,8 @@ struct _mame_timer
+ 	double period;
+ 	double start;
+ 	double expire;
++	int save_order;
++	UINT8 save_registered;
+ };
+ 
+ 
+@@ -88,6 +90,9 @@ static mame_timer *callback_timer;
+ static int callback_timer_modified;
+ static double callback_timer_expire_time;
+ 
++static void timer_postload(void);
++static void timer_presave(void);
++
+ 
+ 
+ /*-------------------------------------------------
+@@ -235,6 +240,9 @@ void timer_init(void)
+ 
+ 	/* we need to wait until the first call to timer_cyclestorun before using real CPU times */
+ 	global_offset = 0.0;
++	state_save_register_double("timer", 0, "global_offset", &global_offset, 1);
++	state_save_register_func_presave(timer_presave);
++	state_save_register_func_postload(timer_postload);
+ 	callback_timer = NULL;
+ 	callback_timer_modified = 0;
+ 
+@@ -383,6 +391,8 @@ mame_timer *timer_alloc(void (*callback)(int))
+ 	timer->temporary = 0;
+ 	timer->tag = get_resource_tag();
+ 	timer->period = 0;
++	timer->save_registered = 0;
++	timer->save_order = 0;
+ 
+ 	/* compute the time of the next firing and insert into the list */
+ 	timer->start = time;
+@@ -393,6 +403,62 @@ mame_timer *timer_alloc(void (*callback)(int))
+ 	return timer;
+ }
+ 
++void timer_save_register(const char *module, int instance, const char *name, mame_timer *which)
++{
++	char field[128];
++	if (!which) return;
++	which->save_registered = 1;
++	snprintf(field, sizeof(field), "%s.order", name);
++	state_save_register_int(module, instance, field, &which->save_order);
++	snprintf(field, sizeof(field), "%s.param", name);
++	state_save_register_int(module, instance, field, &which->callback_param);
++	snprintf(field, sizeof(field), "%s.enabled", name);
++	state_save_register_UINT8(module, instance, field, &which->enabled, 1);
++	snprintf(field, sizeof(field), "%s.period", name);
++	state_save_register_double(module, instance, field, &which->period, 1);
++	snprintf(field, sizeof(field), "%s.start", name);
++	state_save_register_double(module, instance, field, &which->start, 1);
++	snprintf(field, sizeof(field), "%s.expire", name);
++	state_save_register_double(module, instance, field, &which->expire, 1);
++}
++
++static void timer_presave(void)
++{
++	mame_timer *timer;
++	int order = 0;
++	for (timer = timer_head; timer; timer = timer->next)
++		timer->save_order = order++;
++}
++
++static void timer_postload(void)
++{
++	mame_timer *list[MAX_TIMERS], *timer;
++	int order[MAX_TIMERS], count = 0, i, j, key;
++	/* Restored deadlines need a new ordering; never deserialize native pointers. */
++	for (timer = timer_head; timer; timer = timer->next)
++	{
++		order[count] = timer->save_registered ? timer->save_order : count;
++		list[count++] = timer;
++	}
++	/* timer_list_insert treats deadlines within 1 ns as equal. Preserve their
++	 * original order too, otherwise vblank/scanline IRQs can swap after load. */
++	for (i = 1; i < count; i++)
++	{
++		timer = list[i];
++		key = order[i];
++		for (j = i; j > 0 && order[j-1] > key; j--)
++		{
++			list[j] = list[j-1];
++			order[j] = order[j-1];
++		}
++		list[j] = timer;
++		order[j] = key;
++	}
++	timer_head = NULL;
++	for (i = 0; i < count; i++)
++		timer_list_insert(list[i]);
++}
++
+ 
+ 
+ /*-------------------------------------------------
+diff --git a/src/timer.h b/src/timer.h
+index 3339c9a9..ddf3cbde 100644
+--- a/src/timer.h
++++ b/src/timer.h
+@@ -43,6 +43,8 @@ void timer_set(double duration, int param, void (*callback)(int));
+ void timer_reset(mame_timer *which, double duration);
+ void timer_remove(mame_timer *which);
+ int timer_enable(mame_timer *which, int enable);
++/* Register scalar state of a permanent timer. Callback/list pointers stay local. */
++void timer_save_register(const char *module, int instance, const char *name, mame_timer *which);
+ double timer_timeelapsed(mame_timer *which);
+ double timer_timeleft(mame_timer *which);
+ double timer_get_time(void);
+diff --git a/src/vidhrdw/atarimo_vidhrdw.c b/src/vidhrdw/atarimo_vidhrdw.c
+index ec1322df..8177a02e 100644
+--- a/src/vidhrdw/atarimo_vidhrdw.c
++++ b/src/vidhrdw/atarimo_vidhrdw.c
+@@ -357,6 +357,12 @@ int atarimo_init(int map, const struct atarimo_desc *desc)
+ 
+ 	/* clear it to zero */
+ 	memset(mo->spriteram, 0, sizeof(mo->spriteram[0]) * mo->spriteramsize);
++	state_save_register_UINT16("atarimo", map, "sprites", (UINT16 *)mo->spriteram, mo->spriteramsize * 4);
++	state_save_register_INT32("atarimo", map, "bank", &mo->bank, 1);
++	state_save_register_INT32("atarimo", map, "xscroll", &mo->xscroll, 1);
++	state_save_register_INT32("atarimo", map, "yscroll", &mo->yscroll, 1);
++	state_save_register_INT32("atarimo", map, "palettebase", &mo->palettebase, 1);
++
+ 
+ 	/* allocate the code lookup */
+ 	mo->codelookup = auto_malloc(sizeof(mo->codelookup[0]) * round_to_powerof2(mo->codemask.mask));
+diff --git a/src/vidhrdw/atarisy2_vidhrdw.c b/src/vidhrdw/atarisy2_vidhrdw.c
+index 4dcade60..2fba6724 100644
+--- a/src/vidhrdw/atarisy2_vidhrdw.c
++++ b/src/vidhrdw/atarisy2_vidhrdw.c
+@@ -8,6 +8,7 @@
+ #include "machine/atarigen.h"
+ #include "slapstic.h"
+ #include "atarisy2.h"
++#include "state.h"
+ 
+ 
+ 
+@@ -142,6 +143,9 @@ VIDEO_START( atarisy2 )
+ 	/* reset the statics */
+ 	yscroll_reset_timer = timer_alloc(reset_yscroll_callback);
+ 	videobank = 0;
++	state_save_register_UINT16("atarisy2_video", 0, "vram", vram, 0x8000 / 2);
++	state_save_register_UINT32("atarisy2_video", 0, "videobank", &videobank, 1);
++	state_save_register_UINT32("atarisy2_video", 0, "tile_bank", playfield_tile_bank, 2);
+ 	return 0;
+ }
+ 
+diff --git a/src/vidhrdw/balsente_vidhrdw.c b/src/vidhrdw/balsente_vidhrdw.c
+index 88c6d2fd..5f9f5767 100644
+--- a/src/vidhrdw/balsente_vidhrdw.c
++++ b/src/vidhrdw/balsente_vidhrdw.c
+@@ -36,6 +36,17 @@ static UINT8 palettebank_vis;
+  *
+  *************************************/
+ 
++static void balsente_video_postload(void)
++{
++	int i;
++	for (i = 0; i < 0x8000; i++)
++	{
++		local_videoram[i * 2] = videoram[i] >> 4;
++		local_videoram[i * 2 + 1] = videoram[i] & 15;
++	}
++	memset(scanline_dirty, 1, 256);
++}
++
+ VIDEO_START( balsente )
+ {
+ 	/* reset the system */
+@@ -74,6 +85,11 @@ VIDEO_START( balsente )
+ 	/* determine sprite size */
+ 	sprite_data = memory_region(REGION_GFX1);
+ 	sprite_mask = memory_region_length(REGION_GFX1) - 1;
++	state_save_register_UINT8("balsente_video", 0, "scanline_palette", scanline_palette, 256);
++	state_save_register_UINT8("balsente_video", 0, "last_scanline_palette", &last_scanline_palette, 1);
++	state_save_register_UINT8("balsente_video", 0, "screen_refresh_counter", &screen_refresh_counter, 1);
++	state_save_register_UINT8("balsente_video", 0, "palettebank_vis", &palettebank_vis, 1);
++	state_save_register_func_postload(balsente_video_postload);
+ 
+ 	return 0;
+ }
+diff --git a/src/vidhrdw/decocass_vidhrdw.c b/src/vidhrdw/decocass_vidhrdw.c
+index b23f4279..dbdaf41e 100644
+--- a/src/vidhrdw/decocass_vidhrdw.c
++++ b/src/vidhrdw/decocass_vidhrdw.c
+@@ -684,6 +684,15 @@ static void decode_modified(unsigned char *sprite_ram, int interleave)
+ 	}
+ }
+ 
++static void decocass_video_postload(void)
++{
++	memset(sprite_dirty, 1, 256);
++	memset(char_dirty, 1, 1024);
++	memset(tile_dirty, 1, 16);
++	object_dirty = 1;
++	tilemap_mark_all_tiles_dirty(ALL_TILEMAPS);
++}
++
+ VIDEO_START( decocass )
+ {
+ 	if (NULL == (sprite_dirty = auto_malloc(256)) ||
+@@ -724,6 +733,7 @@ VIDEO_START( decocass )
+ 	state_save_register_int("decocass", 0, "part_v_shift", &part_v_shift);
+ 	state_save_register_int("decocass", 0, "center_h_shift_space", &center_h_shift_space);
+ 	state_save_register_int("decocass", 0, "center_v_shift", &center_v_shift);
++	state_save_register_func_postload(decocass_video_postload);
+ 
+ 	return 0;
+ }
+diff --git a/src/vidhrdw/leland_vidhrdw.c b/src/vidhrdw/leland_vidhrdw.c
+index 75d9e3f7..d8445594 100644
+--- a/src/vidhrdw/leland_vidhrdw.c
++++ b/src/vidhrdw/leland_vidhrdw.c
+@@ -43,6 +43,8 @@ static UINT8 sync_next_write;
+ 
+ /* partial screen updating */
+ static int next_update_scanline;
++static mame_timer *scanline_reset_timer;
++static void scanline_reset(int param);
+ 
+ /* scroll background registers */
+ static UINT16 xscroll;
+@@ -57,6 +59,21 @@ static UINT8 gfxbank;
+  *
+  *************************************/
+ 
++static void leland_video_postload(void)
++{
++	int y, x;
++	UINT8 pixels[VIDEO_WIDTH * 8];
++	for (y = 0; y < VIDEO_HEIGHT * 8; y++)
++	{
++		for (x = 0; x < VIDEO_WIDTH * 4; x++)
++		{
++			pixels[2*x] = leland_video_ram[y*256+x] >> 4;
++			pixels[2*x+1] = leland_video_ram[y*256+x] & 15;
++		}
++		draw_scanline8(fgbitmap, 0, y, VIDEO_WIDTH * 8, pixels, NULL, -1);
++	}
++}
++
+ VIDEO_START( leland )
+ {
+ 	/* allocate memory */
+@@ -69,6 +86,21 @@ VIDEO_START( leland )
+ 
+ 	/* reset videoram */
+     memset(leland_video_ram, 0, VRAM_SIZE);
++	scanline_reset_timer = timer_alloc(scanline_reset);
++	timer_save_register("leland_video", 0, "scanline_reset", scanline_reset_timer);
++	state_save_register_UINT8("leland_video", 0, "vram", leland_video_ram, VRAM_SIZE);
++	state_save_register_UINT16("leland_video", 0, "addr0", &vram_state[0].addr, 1);
++	state_save_register_UINT8("leland_video", 0, "latch0", vram_state[0].latch, 2);
++	state_save_register_UINT16("leland_video", 0, "addr1", &vram_state[1].addr, 1);
++	state_save_register_UINT8("leland_video", 0, "latch1", vram_state[1].latch, 2);
++	state_save_register_UINT8("leland_video", 0, "sync_next_write", &sync_next_write, 1);
++	state_save_register_UINT8("leland_video", 0, "gfxbank", &gfxbank, 1);
++	state_save_register_UINT8("leland_video", 0, "leland_last_scanline_int", &leland_last_scanline_int, 1);
++	state_save_register_UINT16("leland_video", 0, "xscroll", &xscroll, 1);
++	state_save_register_UINT16("leland_video", 0, "yscroll", &yscroll, 1);
++	state_save_register_INT32("leland_video", 0, "next_update_scanline", &next_update_scanline, 1);
++	state_save_register_func_postload(leland_video_postload);
++
+ 	return 0;
+ }
+ 
+@@ -86,6 +118,8 @@ VIDEO_START( ataxx )
+ 
+ 	/* reset QRAM */
+ 	memset(ataxx_qram, 0, QRAM_SIZE);
++	state_save_register_UINT8("leland_video", 0, "qram", ataxx_qram, QRAM_SIZE);
++
+ 	return 0;
+ }
+ 
+@@ -483,7 +517,7 @@ VIDEO_EOF( leland )
+ 	update_for_scanline(VIDEO_HEIGHT * 8);
+ 
+ 	/* set a timer to go off at the top of the frame */
+-	timer_set(cpu_getscanlinetime(0), 0, scanline_reset);
++	timer_adjust(scanline_reset_timer, cpu_getscanlinetime(0), 0, 0);
+ }
+ 
+ 
+diff --git a/src/vidhrdw/megasys1_vidhrdw.c b/src/vidhrdw/megasys1_vidhrdw.c
+index c32b5ded..11c8cec2 100644
+--- a/src/vidhrdw/megasys1_vidhrdw.c
++++ b/src/vidhrdw/megasys1_vidhrdw.c
+@@ -197,6 +197,7 @@ actual code sent to the hardware.
+ 
+ /* Variables defined here, that have to be shared: */
+ struct tilemap *megasys1_tmap[3];
++static int cached_scroll_flag[3];
+ 
+ data16_t *megasys1_scrollram_0, *megasys1_scrollram_1, *megasys1_scrollram_2;
+ data16_t *megasys1_objectram, *megasys1_vregs, *megasys1_ram;
+@@ -249,6 +250,8 @@ static UINT16 *megasys1_buffer_objectram,*megasys1_buffer2_objectram,*megasys1_b
+ extern struct GameDriver driver_lomakai;
+ extern struct GameDriver driver_soldamj;
+ 
++static void megasys1_video_postload(void);
++
+ 
+ VIDEO_START( megasys1 )
+ {
+@@ -268,6 +271,7 @@ VIDEO_START( megasys1 )
+ 	{
+ 		megasys1_scroll_flag[i] = megasys1_scrollx[i] = megasys1_scrolly[i] = 0;
+ 		megasys1_pages_per_tmap_x[i] = megasys1_pages_per_tmap_y[i] = 0;
++		cached_scroll_flag[i] = -1;
+ 	}
+ 
+  	megasys1_bits_per_color_code = 4;
+@@ -303,6 +307,19 @@ VIDEO_START( megasys1 )
+ 		Machine->gamedrv->clone_of	==	&driver_lomakai )
+ 		hardware_type_z = 1;
+ 
++	state_save_register_INT32("megasys1_video", 0, "scroll_flag", megasys1_scroll_flag, 3);
++	state_save_register_INT32("megasys1_video", 0, "scrollx", megasys1_scrollx, 3);
++	state_save_register_INT32("megasys1_video", 0, "scrolly", megasys1_scrolly, 3);
++	state_save_register_int("megasys1_video", 0, "active_layers", &megasys1_active_layers);
++	state_save_register_int("megasys1_video", 0, "sprite_bank", &megasys1_sprite_bank);
++	state_save_register_int("megasys1_video", 0, "screen_flag", &megasys1_screen_flag);
++	state_save_register_int("megasys1_video", 0, "sprite_flag", &megasys1_sprite_flag);
++	state_save_register_UINT16("megasys1_video", 0, "objects1", megasys1_buffer_objectram, 0x1000);
++	state_save_register_UINT16("megasys1_video", 0, "objects2", megasys1_buffer2_objectram, 0x1000);
++	state_save_register_UINT16("megasys1_video", 0, "sprites1", megasys1_buffer_spriteram16, 0x1000);
++	state_save_register_UINT16("megasys1_video", 0, "sprites2", megasys1_buffer2_spriteram16, 0x1000);
++	state_save_register_func_postload(megasys1_video_postload);
++
+  	return 0;
+ }
+ 
+@@ -403,9 +420,10 @@ MEGASYS1_SCROLLRAM_W(2)
+ #define MEGASYS1_SCROLL_FLAG_W(_n_) \
+ void megasys1_scroll_##_n_##_flag_w(int data) \
+ { \
+-	if ((megasys1_scroll_flag[_n_] != data) || (megasys1_tmap[_n_] == 0) ) \
++	if ((cached_scroll_flag[_n_] != data) || (megasys1_tmap[_n_] == 0) ) \
+ 	{ \
+ 		megasys1_scroll_flag[_n_] = data; \
++		cached_scroll_flag[_n_] = data; \
+ \
+ 		if (megasys1_tmap[_n_]) \
+ 			tilemap_dispose(megasys1_tmap[_n_]); \
+@@ -442,6 +460,15 @@ MEGASYS1_SCROLL_FLAG_W(0)
+ MEGASYS1_SCROLL_FLAG_W(1)
+ MEGASYS1_SCROLL_FLAG_W(2)
+ 
++static void megasys1_video_postload(void)
++{
++	/* Recreate only when the local cache has a different layout. */
++	megasys1_scroll_0_flag_w(megasys1_scroll_flag[0]);
++	megasys1_scroll_1_flag_w(megasys1_scroll_flag[1]);
++	if (!hardware_type_z) megasys1_scroll_2_flag_w(megasys1_scroll_flag[2]);
++	tilemap_mark_all_tiles_dirty(ALL_TILEMAPS);
++}
++
+ 
+ /* Used by MS1-A/Z, B */
+ WRITE16_HANDLER( megasys1_vregs_A_w )
+diff --git a/src/vidhrdw/paradise_vidhrdw.c b/src/vidhrdw/paradise_vidhrdw.c
+index 1c57ff3d..60bb9ced 100644
+--- a/src/vidhrdw/paradise_vidhrdw.c
++++ b/src/vidhrdw/paradise_vidhrdw.c
+@@ -161,6 +161,14 @@ WRITE_HANDLER( paradise_pixmap_w )
+ 
+ ***************************************************************************/
+ 
++static void paradise_video_postload(void)
++{
++	int i;
++	for (i = 0; i < 0x8000; i++)
++		paradise_pixmap_w(i, videoram[i]);
++	tilemap_mark_all_tiles_dirty(ALL_TILEMAPS);
++}
++
+ VIDEO_START( paradise )
+ {
+ 	tilemap_0 = tilemap_create(	get_tile_info_0, tilemap_scan_rows,
+@@ -186,6 +194,12 @@ VIDEO_START( paradise )
+ 	tilemap_set_transparent_pen(tilemap_0,0x0f);
+ 	tilemap_set_transparent_pen(tilemap_1,0xff);
+ 	tilemap_set_transparent_pen(tilemap_2,0xff);
++	state_save_register_UINT8("paradise_video", 0, "paradise_palbank", &paradise_palbank, 1);
++	state_save_register_UINT8("paradise_video", 0, "paradise_priority", &paradise_priority, 1);
++	state_save_register_UINT8("paradise_video", 0, "palette_ram", paletteram, 0x1800);
++	state_save_register_UINT8("paradise_video", 0, "pixmap", videoram, 0x8000);
++	state_save_register_func_postload(paradise_video_postload);
++
+ 	return 0;
+ }
+ 
+diff --git a/src/vidhrdw/ppu2c03b.c b/src/vidhrdw/ppu2c03b.c
+index fe5442ec..24ed4004 100644
+--- a/src/vidhrdw/ppu2c03b.c
++++ b/src/vidhrdw/ppu2c03b.c
+@@ -9,6 +9,7 @@
+ 
+ #include <math.h>
+ #include "vidhrdw/ppu2c03b.h"
++#include "state.h"
+ 
+ /* constant definitions */
+ #define BOTTOM_VISIBLE_SCANLINE	239		/* The bottommost visible scanline */
+@@ -45,6 +46,7 @@ typedef struct {
+ 	ppu2c03b_scanline_cb	scanline_callback_proc;	/* optinal scanline callback */
+ 	ppu2c03b_vidaccess_cb	vidaccess_callback_proc;/* optinal video access callback */
+ 	int						has_videorom;			/* wether we access a video rom or not */
++	int                     mirroring;              /* rebuild local page pointers after load */
+ 	int						videorom_banks;			/* number of banks in the videorom (if available) */
+ 	int						regs[PPU_MAX_REG];		/* registers */
+ 	int						refresh_data;			/* refresh-related */
+@@ -72,6 +74,17 @@ static ppu2c03b_chip *chips = 0;
+ 
+ static void scanline_callback( int num );
+ 
++static void ppu2c03b_postload(void)
++{
++	int i;
++	for (i = 0; i < intf->num; i++)
++	{
++		ppu2c03b_set_mirroring(i, chips[i].mirroring);
++		memset(chips[i].dirtychar, 1, CHARGEN_NUM_CHARS);
++		chips[i].chars_are_dirty = 1;
++	}
++}
++
+ void (*ppu_latch)( offs_t offset );
+ 
+ 
+@@ -212,6 +225,7 @@ int ppu2c03b_init( struct ppu2c03b_interface *interface )
+ 	{
+ 		/* initialize the scanline handling portion */
+ 		chips[i].scanline_timer = timer_alloc(scanline_callback);
++		timer_save_register("ppu2c03b", i, "scanline_timer", chips[i].scanline_timer);
+ 		chips[i].scanline = 0;
+ 		chips[i].scan_scale = 1;
+ 
+@@ -269,7 +283,33 @@ int ppu2c03b_init( struct ppu2c03b_interface *interface )
+ 
+ 		/* setup our videoram handlers based on mirroring */
+ 		ppu2c03b_set_mirroring( i, intf->mirroring[i] );
++
++		/* CPU RAM alone does not include the PPU's private RAM or latches. */
++		state_save_register_UINT8("ppu2c03b", i, "videoram", chips[i].videoram, VIDEORAM_SIZE);
++		state_save_register_UINT8("ppu2c03b", i, "spriteram", chips[i].spriteram, SPRITERAM_SIZE);
++		state_save_register_INT32("ppu2c03b", i, "regs", chips[i].regs, PPU_MAX_REG);
++		state_save_register_INT32("ppu2c03b", i, "nes_vram", chips[i].nes_vram, 8);
++		state_save_register_UINT32("ppu2c03b", i, "colortable", Machine->gfx[intf->gfx_layout_number[i]]->colortable, 32);
++		state_save_register_UINT32("ppu2c03b", i, "mono", chips[i].colortable_mono, 32);
++#define PPU_SAVE(member) state_save_register_int("ppu2c03b", i, #member, &chips[i].member)
++		PPU_SAVE(mirroring);
++		PPU_SAVE(scanline);
++		PPU_SAVE(refresh_data);
++		PPU_SAVE(refresh_latch);
++		PPU_SAVE(x_fine);
++		PPU_SAVE(toggle);
++		PPU_SAVE(add);
++		PPU_SAVE(videoram_addr);
++		PPU_SAVE(videoram_addr_latch);
++		PPU_SAVE(videoram_data_latch);
++		PPU_SAVE(tile_page);
++		PPU_SAVE(sprite_page);
++		PPU_SAVE(back_color);
++		PPU_SAVE(scan_scale);
++		PPU_SAVE(scanlines_per_frame);
++#undef PPU_SAVE
+ 	}
++	state_save_register_func_postload(ppu2c03b_postload);
+ 
+ 	/* success */
+ 	return 0;
+@@ -1235,6 +1275,7 @@ void ppu2c03b_set_mirroring( int num, int mirroring )
+ 		return;
+ 	}
+ 
++	chips[num].mirroring = mirroring;
+ 	/* setup our videoram handlers based on mirroring */
+ 	switch( mirroring )
+ 	{
+diff --git a/src/vidhrdw/superqix_vidhrdw.c b/src/vidhrdw/superqix_vidhrdw.c
+index 5c759cb3..4b2f1869 100644
+--- a/src/vidhrdw/superqix_vidhrdw.c
++++ b/src/vidhrdw/superqix_vidhrdw.c
+@@ -10,6 +10,7 @@
+ #include "vidhrdw/generic.h"
+ 
+ static int gfxbank;
++static UINT8 control_latch;
+ static UINT8 *superqix_bitmapram,*superqix_bitmapram2,*superqix_bitmapram_dirty,*superqix_bitmapram2_dirty;
+ static struct mame_bitmap *tmpbitmap2;
+ int sqix_minx,sqix_maxx,sqix_miny,sqix_maxy;
+@@ -83,6 +84,7 @@ WRITE_HANDLER( superqix_0410_w )
+ 	int bankaddress;
+ 	UINT8 *RAM = memory_region(REGION_CPU1);
+ 
++	control_latch = data;
+ 	/* bits 0-1 select the tile bank */
+ 	if (gfxbank != (data & 0x03))
+ 	{
+@@ -125,6 +127,14 @@ static void get_bg_tile_info(int tile_index)
+ 	SET_TILE_INFO(bank, code, color, 0)
+ }
+ 
++static void superqix_postload(void)
++{
++	memset(superqix_bitmapram_dirty, 1, 0x7000);
++	memset(superqix_bitmapram2_dirty, 1, 0x7000);
++	sqix_minx = 0; sqix_maxx = 127; sqix_miny = 0; sqix_maxy = 223;
++	cpu_setbank(1, memory_region(REGION_CPU1) + 0x10000 + ((control_latch & 0x30) >> 4) * 0x4000);
++}
++
+ VIDEO_START( superqix )
+ {
+ 	/* palette RAM is accessed thorough I/O ports, so we have to */
+@@ -161,6 +171,15 @@ VIDEO_START( superqix )
+ 		return 1;
+ 
+ 	tilemap_set_transparent_pen(bg_tilemap, 0);
++	state_save_register_UINT8("superqix_video", 0, "superqix_bitmapram", superqix_bitmapram, 0x7000);
++	state_save_register_UINT8("superqix_video", 0, "superqix_bitmapram2", superqix_bitmapram2, 0x7000);
++	state_save_register_UINT8("superqix_video", 0, "paletteram", paletteram, 256);
++	state_save_register_INT32("superqix_video", 0, "gfxbank", &gfxbank, 1);
++	state_save_register_INT32("superqix_video", 0, "sqix_last_bitmap", &sqix_last_bitmap, 1);
++	state_save_register_INT32("superqix_video", 0, "sqix_current_bitmap", &sqix_current_bitmap, 1);
++	state_save_register_UINT8("superqix_video", 0, "control_latch", &control_latch, 1);
++	state_save_register_func_postload(superqix_postload);
++
+ 
+ 	return 0;
+ }
+diff --git a/src/vidhrdw/system1_vidhrdw.c b/src/vidhrdw/system1_vidhrdw.c
+index 5ed1bf06..fb5e8a13 100644
+--- a/src/vidhrdw/system1_vidhrdw.c
++++ b/src/vidhrdw/system1_vidhrdw.c
+@@ -112,6 +112,12 @@ WRITE_HANDLER( system1_paletteram_w )
+ 
+ 
+ 
++static void system1_video_postload(void)
++{
++	memset(bg_dirtybuffer, 1, 1024);
++	flip_screen_set(system1_video_mode & 0x80);
++}
++
+ VIDEO_START( system1 )
+ {
+ 	if ((sprite_onscreen_map = auto_malloc(256*256)) == 0)
+@@ -126,6 +132,15 @@ VIDEO_START( system1 )
+ 	memset(wbml_paged_videoram,0,0x4000);
+ 	if ((tmp_bitmap = auto_bitmap_alloc(Machine->drv->screen_width,Machine->drv->screen_height)) == 0)
+ 		return 1;
++	state_save_register_INT32("system1_video", 0, "background_scrollx", &background_scrollx, 1);
++	state_save_register_INT32("system1_video", 0, "background_scrolly", &background_scrolly, 1);
++	state_save_register_INT32("system1_video", 0, "system1_video_mode", &system1_video_mode, 1);
++	state_save_register_INT32("system1_video", 0, "scrollx_row", scrollx_row, 32);
++	state_save_register_UINT8("system1_video", 0, "wbml_videoram_bank", &wbml_videoram_bank, 1);
++	state_save_register_UINT8("system1_video", 0, "wbml_videoram_bank_latch", &wbml_videoram_bank_latch, 1);
++	state_save_register_UINT8("system1_video", 0, "paged_videoram", wbml_paged_videoram, 0x4000);
++	state_save_register_func_postload(system1_video_postload);
++
+ 
+ 	return 0;
+ }
+diff --git a/src/vidhrdw/taito_l_vidhrdw.c b/src/vidhrdw/taito_l_vidhrdw.c
+index 4bc6ab6d..916c60f4 100644
+--- a/src/vidhrdw/taito_l_vidhrdw.c
++++ b/src/vidhrdw/taito_l_vidhrdw.c
+@@ -71,6 +71,12 @@ static void get_ch1a_tile_info(int tile_index)
+ 
+ ***************************************************************************/
+ 
++static void taitol_video_postload(void)
++{
++	flipscreen = cur_ctrl & 0x10;
++	tilemap_set_flip(ALL_TILEMAPS, flipscreen ? (TILEMAP_FLIPY | TILEMAP_FLIPX) : 0);
++}
++
+ VIDEO_START( taitol )
+ {
+ 	int i;
+@@ -95,6 +101,12 @@ VIDEO_START( taitol )
+ 	tilemap_set_scrolldx(ch1a_tilemap,-8,-8);
+ 	tilemap_set_scrolldx(bg18_tilemap,28,-11);
+ 	tilemap_set_scrolldx(bg19_tilemap,38,-21);
++	state_save_register_INT32("taitol_video", 0, "cur_ctrl", &cur_ctrl, 1);
++	state_save_register_INT32("taitol_video", 0, "horshoes_gfxbank", &horshoes_gfxbank, 1);
++	state_save_register_INT32("taitol_video", 0, "bankc", bankc, 4);
++	state_save_register_UINT8("taitol_video", 0, "sprites", buffered_spriteram, SPRITERAM_SIZE);
++	state_save_register_func_postload(taitol_video_postload);
++
+ 
+ 	return 0;
+ }
+diff --git a/src/vidhrdw/taitosj_vidhrdw.c b/src/vidhrdw/taitosj_vidhrdw.c
+index c96fcf81..1bfea578 100644
+--- a/src/vidhrdw/taitosj_vidhrdw.c
++++ b/src/vidhrdw/taitosj_vidhrdw.c
+@@ -8,6 +8,7 @@
+ 
+ #include "driver.h"
+ #include "vidhrdw/generic.h"
++#include "state.h"
+ 
+ #ifndef MIN
+ #define MIN(x,y) (x)<(y)?(x):(y)
+@@ -187,6 +188,20 @@ WRITE_HANDLER( taitosj_paletteram_w )
+   Start the video hardware emulation.
+ 
+ ***************************************************************************/
++static void taitosj_video_postload(void)
++{
++	memset(dirtybuffer, 1, videoram_size);
++	memset(dirtybuffer2, 1, videoram_size);
++	memset(dirtybuffer3, 1, videoram_size);
++	memset(dirtycharacter1, 1, sizeof(dirtycharacter1));
++	memset(dirtycharacter2, 1, sizeof(dirtycharacter2));
++	memset(dirtysprite1, 1, sizeof(dirtysprite1));
++	memset(dirtysprite2, 1, sizeof(dirtysprite2));
++	flipscreen[0] = taitosj_video_enable & 1;
++	flipscreen[1] = taitosj_video_enable & 2;
++	taitosj_spritebank = (taitosj_video_enable & 4) ? spriteram_2 : spriteram;
++}
++
+ VIDEO_START( taitosj )
+ {
+ 	int i;
+@@ -231,6 +246,9 @@ VIDEO_START( taitosj )
+ 	flipscreen[0] = flipscreen[1] = 0;
+ 
+ 	taitosj_spritebank = spriteram;
++	state_save_register_int("taitosj_video", 0, "enable", &taitosj_video_enable);
++	state_save_register_UINT8("taitosj_video", 0, "collision", taitosj_collision_reg, 4);
++	state_save_register_func_postload(taitosj_video_postload);
+ 
+ 	return 0;
+ }
+diff --git a/src/vidhrdw/toaplan1_vidhrdw.c b/src/vidhrdw/toaplan1_vidhrdw.c
+index b7353916..8ae1ab7a 100644
+--- a/src/vidhrdw/toaplan1_vidhrdw.c
++++ b/src/vidhrdw/toaplan1_vidhrdw.c
+@@ -209,6 +209,27 @@ static int toaplan1_tile_buffers_alloc(void)
+ 		return 1;
+ 	}
+ 	memset(tile_list[16],0,max_list_size[16]*sizeof(tile_struct));
++	state_save_register_UINT16("toaplan1_video", 0, "tiles", toaplan1_tileram16, TOAPLAN1_TILEVRAM_SIZE * 4 / 2);
++	state_save_register_UINT16("toaplan1_video", 0, "palette_ram", paletteram16, (toaplan1_colorram1_size + toaplan1_colorram2_size) / 2);
++	state_save_register_INT32("toaplan1_video", 0, "bcu_flipscreen", &bcu_flipscreen, 1);
++	state_save_register_INT32("toaplan1_video", 0, "fcu_flipscreen", &fcu_flipscreen, 1);
++	state_save_register_INT32("toaplan1_video", 0, "scrollx_offs1", &scrollx_offs1, 1);
++	state_save_register_INT32("toaplan1_video", 0, "scrollx_offs2", &scrollx_offs2, 1);
++	state_save_register_INT32("toaplan1_video", 0, "scrollx_offs3", &scrollx_offs3, 1);
++	state_save_register_INT32("toaplan1_video", 0, "scrollx_offs4", &scrollx_offs4, 1);
++	state_save_register_INT32("toaplan1_video", 0, "scrolly_offs", &scrolly_offs, 1);
++	state_save_register_INT32("toaplan1_video", 0, "flip_y_offs", &flip_y_offs, 1);
++	state_save_register_INT32("toaplan1_video", 0, "tiles_offsetx", &tiles_offsetx, 1);
++	state_save_register_INT32("toaplan1_video", 0, "tiles_offsety", &tiles_offsety, 1);
++	state_save_register_INT32("toaplan1_video", 0, "toaplan1_reset", &toaplan1_reset, 1);
++	state_save_register_UINT32("toaplan1_video", 0, "tileram_offs", &tileram_offs, 1);
++	state_save_register_UINT32("toaplan1_video", 0, "spriteram_offs", &spriteram_offs, 1);
++	state_save_register_UINT32("toaplan1_video", 0, "scrollregs", scrollregs, 8);
++	state_save_register_INT32("toaplan1_video", 0, "layer_scrollx", layer_scrollx, 4);
++	state_save_register_INT32("toaplan1_video", 0, "layer_scrolly", layer_scrolly, 4);
++	state_save_register_INT32("toaplan1_video", 0, "layer_offsetx", layer_offsetx, 4);
++	state_save_register_INT32("toaplan1_video", 0, "layer_offsety", layer_offsety, 4);
++
+ 
+ 	return 0;
+ }
+@@ -282,6 +303,11 @@ VIDEO_START( toaplan1 )
+ 	bcu_flipscreen = 0;
+ 	fcu_flipscreen = 0;
+ 	toaplan1_reset = 1;
++	state_save_register_UINT16("toaplan1_video", 0, "spriteram16", spriteram16, TOAPLAN1_SPRITERAM_SIZE / 2);
++	state_save_register_UINT16("toaplan1_video", 0, "buffered_spriteram16", buffered_spriteram16, TOAPLAN1_SPRITERAM_SIZE / 2);
++	state_save_register_UINT16("toaplan1_video", 0, "toaplan1_spritesizeram16", toaplan1_spritesizeram16, TOAPLAN1_SPRITESIZERAM_SIZE / 2);
++	state_save_register_UINT16("toaplan1_video", 0, "toaplan1_buffered_spritesizeram16", toaplan1_buffered_spritesizeram16, TOAPLAN1_SPRITESIZERAM_SIZE / 2);
++
+ 
+ 	return 0;
+ }
+diff --git a/src/vidhrdw/williams_vidhrdw.c b/src/vidhrdw/williams_vidhrdw.c
+index 4ffe4e40..0d40377e 100644
+--- a/src/vidhrdw/williams_vidhrdw.c
++++ b/src/vidhrdw/williams_vidhrdw.c
+@@ -187,6 +187,8 @@ VIDEO_START( williams )
+ 
+ 	/* reset everything */
+ 	memset(williams_videoram, 0, VIDEORAM_SIZE);
++	state_save_register_UINT8("williams_video", 0, "vram", williams_videoram, VIDEORAM_SIZE);
++
+ 
+ 	/* pick the blitters */
+ 	blitter_table = williams_blitters;
+@@ -261,6 +263,10 @@ VIDEO_START( williams2 )
+ 	/* reset the FG/BG colors */
+ 	williams2_fg_color = 0;
+ 	williams2_bg_color = 0;
++	state_save_register_UINT8("williams2_video", 0, "palette", williams2_paletteram, 4 * 1024 * 4 / 8);
++	state_save_register_UINT8("williams2_video", 0, "williams2_fg_color", &williams2_fg_color, 1);
++	state_save_register_UINT8("williams2_video", 0, "williams2_bg_color", &williams2_bg_color, 1);
++
+ 
+ 	return 0;
+ }
+diff --git a/src/vidhrdw/ygv608.c b/src/vidhrdw/ygv608.c
+index 2b978478..a7a00ba3 100644
+--- a/src/vidhrdw/ygv608.c
++++ b/src/vidhrdw/ygv608.c
+@@ -43,6 +43,9 @@
+ /*#define _SHOW_VIDEO_DEBUG*/
+ 
+ static YGV608 ygv608;
++static int irq_timer;
++static int read_p0_state, read_p3_state, read_pattern_name_base;
++static int write_p0_state, write_p3_state, write_pattern_name_base;
+ 
+ static struct tilemap *tilemap_A = NULL;
+ static struct tilemap *tilemap_B = NULL;
+@@ -62,13 +65,13 @@ INTERRUPT_GEN( ygv608_timed_interrupt )
+       this more generic - or move it into the machine driver
+ */
+ 
+-	static int timer = 0;
+ 
+-	if( ++timer == 1000 )
+-		timer = 0;
++
++	if( ++irq_timer == 1000 )
++		irq_timer = 0;
+ 
+     /* once every 60Hz, set the vertical border interval start flag */
+-	if( ( timer % (1000/60) ) == 0 )
++	if( ( irq_timer % (1000/60) ) == 0 )
+     {
+ 		ygv608.ports.s.p6 |= p6_fv;;
+ 		if (ygv608.regs.s.r14 & r14_iev)
+@@ -76,7 +79,7 @@ INTERRUPT_GEN( ygv608_timed_interrupt )
+ 	}
+ 
+ 	/* once every 60Hz, set the position detection flag (somewhere) */
+-	else if( ( timer % (1000/60) ) == 7 )
++	else if( ( irq_timer % (1000/60) ) == 7 )
+ 	{
+ 		ygv608.ports.s.p6 |= p6_fp;
+ 		if (ygv608.regs.s.r14 & r14_iep)
+@@ -438,6 +441,12 @@ static void get_tile_info_B_16( int offset )
+ 	}
+ }
+ 
++static void ygv608_postload(void)
++{
++	ygv608.screen_resize = 1;
++	ygv608.tilemap_resize = 1;
++}
++
+ VIDEO_START( ygv608 )
+ {
+ 	memset( &ygv608, 0, sizeof(ygv608) );
+@@ -446,6 +455,36 @@ VIDEO_START( ygv608 )
+ 	ygv608.screen_resize = 1;
+ 	ygv608.tilemap_resize = 1;
+ 	namcond1_gfxbank = 0;
++	state_save_register_UINT8("ygv608", 0, "ports.b", ygv608.ports.b, 8);
++	state_save_register_UINT8("ygv608", 0, "regs.b", ygv608.regs.b, 50);
++	state_save_register_UINT8("ygv608", 0, "pattern_name_table", ygv608.pattern_name_table, 4096);
++	state_save_register_UINT8("ygv608", 0, "sprite_attribute_table.b", ygv608.sprite_attribute_table.b, 256);
++	state_save_register_UINT8("ygv608", 0, "scroll_data_table[0]", ygv608.scroll_data_table[0], 512);
++	state_save_register_UINT8("ygv608", 0, "colour_palette[0]", ygv608.colour_palette[0], 768);
++	state_save_register_UINT32("ygv608", 0, "bits16", &ygv608.bits16, 1);
++	state_save_register_UINT32("ygv608", 0, "page_x", &ygv608.page_x, 1);
++	state_save_register_UINT32("ygv608", 0, "page_y", &ygv608.page_y, 1);
++	state_save_register_UINT32("ygv608", 0, "pny_shift", &ygv608.pny_shift, 1);
++	state_save_register_UINT32("ygv608", 0, "ax", &ygv608.ax, 1);
++	state_save_register_UINT32("ygv608", 0, "dx", &ygv608.dx, 1);
++	state_save_register_UINT32("ygv608", 0, "dxy", &ygv608.dxy, 1);
++	state_save_register_UINT32("ygv608", 0, "ay", &ygv608.ay, 1);
++	state_save_register_UINT32("ygv608", 0, "dy", &ygv608.dy, 1);
++	state_save_register_UINT32("ygv608", 0, "dyx", &ygv608.dyx, 1);
++	state_save_register_UINT32("ygv608", 0, "base_y_shift", &ygv608.base_y_shift, 1);
++	state_save_register_UINT32("ygv608", 0, "base_addr", ygv608.base_addr[0], 16);
++	state_save_register_UINT8("ygv608", 0, "na8_mask", &ygv608.na8_mask, 1);
++	state_save_register_INT32("ygv608", 0, "col_shift", &ygv608.col_shift, 1);
++	state_save_register_INT32("ygv608", 0, "irq_timer", &irq_timer, 1);
++	state_save_register_INT32("ygv608", 0, "read_p0_state", &read_p0_state, 1);
++	state_save_register_INT32("ygv608", 0, "read_p3_state", &read_p3_state, 1);
++	state_save_register_INT32("ygv608", 0, "read_pattern_name_base", &read_pattern_name_base, 1);
++	state_save_register_INT32("ygv608", 0, "write_p0_state", &write_p0_state, 1);
++	state_save_register_INT32("ygv608", 0, "write_p3_state", &write_p3_state, 1);
++	state_save_register_INT32("ygv608", 0, "write_pattern_name_base", &write_pattern_name_base, 1);
++	state_save_register_INT32("ygv608", 0, "namcond1_gfxbank", &namcond1_gfxbank, 1);
++	state_save_register_func_postload(ygv608_postload);
++
+ 
+ 	return 0;
+ }
+@@ -902,9 +941,6 @@ static void SetPostShortcuts( int reg );
+ 
+ READ16_HANDLER( ygv608_r )
+ {
+-	static int p0_state = 0;
+-	static int p3_state = 0;
+-	static int pattern_name_base = 0;  /* pattern name table base address */
+ 	int pn=0;
+ 	data16_t  data = 0;
+ 
+@@ -915,20 +951,20 @@ READ16_HANDLER( ygv608_r )
+ 			UINT8 xTile = ygv608.regs.s.r1 & r1_pnx;
+ 			UINT8 yTile = ygv608.regs.s.r0 & r0_pny;
+ 
+-			switch (p0_state)
++			switch (read_p0_state)
+ 			{
+ 				case 0:
+ 					/* Are we reading from plane B? */
+ 					if (!((ygv608.regs.s.r7 & r7_md) & MD_1PLANE) && (ygv608.regs.s.r0 & r0_b_a))
+-						pattern_name_base = ((ygv608.page_y << ygv608.pny_shift) << ygv608.bits16);
++						read_pattern_name_base = ((ygv608.page_y << ygv608.pny_shift) << ygv608.bits16);
+ 
+ 					/* read character from ram */
+-					pn = pattern_name_base + (((yTile << ygv608.pny_shift) + xTile) << ygv608.bits16);
++					pn = read_pattern_name_base + (((yTile << ygv608.pny_shift) + xTile) << ygv608.bits16);
+ 					break;
+ 
+ 				case 1:
+ 					/* read character from ram */
+-					pn = pattern_name_base + (((yTile << ygv608.pny_shift) + xTile) << ygv608.bits16) + 1;
++					pn = read_pattern_name_base + (((yTile << ygv608.pny_shift) + xTile) << ygv608.bits16) + 1;
+ 					break;
+ 			}
+ 
+@@ -936,23 +972,23 @@ READ16_HANDLER( ygv608_r )
+ 			{
+ 				logerror( "attempt (%d) to read pattern name %d\n"
+ 					"mode = %d, pgs = %d (%dx%d)\n"
+-					"pattern_name_base = %d\n"
++					"read_pattern_name_base = %d\n"
+ 					"pnx = %d, pny = %d, pny_shift = %d, bits16 = %d\n",
+-					p0_state,
++					read_p0_state,
+ 					pn, ygv608.regs.s.r7 & r7_md, ygv608.regs.s.r8 & r8_pgs,
+ 					ygv608.page_x, ygv608.page_y,
+-					pattern_name_base,
++					read_pattern_name_base,
+ 					xTile, yTile, ygv608.pny_shift,
+ 					ygv608.bits16 );
+ 				pn = 0;
+ 			}
+ 			data = ygv608.pattern_name_table[pn];
+ 
+-			p0_state++;
++			read_p0_state++;
+ 			if ((ygv608.regs.s.r7 & r7_md) == MD_2PLANE_8BIT )
+-				p0_state++;
++				read_p0_state++;
+ 
+-			if (p0_state == 2)
++			if (read_p0_state == 2)
+ 			{
+ 				if (ygv608.regs.s.r0 & r0_pnya)
+ 				{
+@@ -988,8 +1024,8 @@ READ16_HANDLER( ygv608_r )
+ 					ygv608.regs.s.r1 &= ~r1_pnx;
+ 					ygv608.regs.s.r1 |= xTile;
+ 				}
+-				p0_state = 0;
+-				pattern_name_base = 0;
++				read_p0_state = 0;
++				read_pattern_name_base = 0;
+ 			}
+ 			return (data << 8);
+ 		}
+@@ -1015,10 +1051,10 @@ READ16_HANDLER( ygv608_r )
+ 			break;
+ 
+ 		case 0x03: /* P#3 - color palette data port */
+-			data = ygv608.colour_palette[ygv608.regs.s.cc][p3_state];
+-			if( ++p3_state == 3 )
++			data = ygv608.colour_palette[ygv608.regs.s.cc][read_p3_state];
++			if( ++read_p3_state == 3 )
+ 			{
+-				p3_state = 0;
++				read_p3_state = 0;
+ 				if( ygv608.regs.s.r2 & r2_cpar)
+ 					ygv608.regs.s.cc++;
+ 			}
+@@ -1061,9 +1097,6 @@ READ16_HANDLER( ygv608_r )
+ 
+ WRITE16_HANDLER( ygv608_w )
+ {
+-	static int p0_state = 0;
+-	static int p3_state = 0;
+-	static int pattern_name_base = 0;  /* pattern name table base address */
+ 	int pn=0;
+ 
+ 	data = ( data >> 8 ) & 0xff;
+@@ -1075,20 +1108,20 @@ WRITE16_HANDLER( ygv608_w )
+ 			UINT8 xTile = ygv608.regs.s.r1 & r1_pnx;
+ 			UINT8 yTile = ygv608.regs.s.r0 & r0_pny;
+ 
+-			switch (p0_state)
++			switch (write_p0_state)
+ 			{
+ 				case 0:
+ 					/* Are we reading from plane B? */
+ 					if (!((ygv608.regs.s.r7 & r7_md) & MD_1PLANE) && (ygv608.regs.s.r0 & r0_b_a))
+-						pattern_name_base = ((ygv608.page_y << ygv608.pny_shift) << ygv608.bits16);
++						write_pattern_name_base = ((ygv608.page_y << ygv608.pny_shift) << ygv608.bits16);
+ 
+ 					/* read character from ram */
+-					pn = pattern_name_base + (((yTile << ygv608.pny_shift) + xTile) << ygv608.bits16);
++					pn = write_pattern_name_base + (((yTile << ygv608.pny_shift) + xTile) << ygv608.bits16);
+ 					break;
+ 
+ 				case 1:
+ 					/* read character from ram */
+-					pn = pattern_name_base + (((yTile << ygv608.pny_shift) + xTile) << ygv608.bits16) + 1;
++					pn = write_pattern_name_base + (((yTile << ygv608.pny_shift) + xTile) << ygv608.bits16) + 1;
+ 					break;
+ 			}
+ 
+@@ -1096,23 +1129,23 @@ WRITE16_HANDLER( ygv608_w )
+ 			{
+ 				logerror( "attempt (%d) to read pattern name %d\n"
+ 					"mode = %d, pgs = %d (%dx%d)\n"
+-					"pattern_name_base = %d\n"
++					"write_pattern_name_base = %d\n"
+ 					"pnx = %d, pny = %d, pny_shift = %d, bits16 = %d\n",
+-					p0_state,
++					write_p0_state,
+ 					pn, ygv608.regs.s.r7 & r7_md, ygv608.regs.s.r8 & r8_pgs,
+ 					ygv608.page_x, ygv608.page_y,
+-					pattern_name_base,
++					write_pattern_name_base,
+ 					xTile, yTile, ygv608.pny_shift,
+ 					ygv608.bits16 );
+ 				pn = 0;
+ 			}
+ 			ygv608.pattern_name_table[pn] = data;
+ 
+-			p0_state++;
++			write_p0_state++;
+ 			if ((ygv608.regs.s.r7 & r7_md) == MD_2PLANE_8BIT )
+-				p0_state++;
++				write_p0_state++;
+ 
+-			if (p0_state == 2)
++			if (write_p0_state == 2)
+ 			{
+ 				if (ygv608.regs.s.r0 & r0_pnya)
+ 				{
+@@ -1146,8 +1179,8 @@ WRITE16_HANDLER( ygv608_w )
+ 					ygv608.regs.s.r1 &= ~r1_pnx;
+ 					ygv608.regs.s.r1 |= xTile;
+ 				}
+-				p0_state = 0;
+-				pattern_name_base = 0;
++				write_p0_state = 0;
++				write_pattern_name_base = 0;
+ 			}
+ 		}
+ 		break;
+@@ -1170,10 +1203,10 @@ WRITE16_HANDLER( ygv608_w )
+ 			break;
+ 
+ 		case 0x03: /* P#3 - colour palette data port */
+-			ygv608.colour_palette[ygv608.regs.s.cc][p3_state] = data;
+-			if (++p3_state == 3)
++			ygv608.colour_palette[ygv608.regs.s.cc][write_p3_state] = data;
++			if (++write_p3_state == 3)
+ 			{
+-				p3_state = 0;
++				write_p3_state = 0;
+ 				palette_set_color(ygv608.regs.s.cc,
+ 			    	ygv608.colour_palette[ygv608.regs.s.cc][0] << 2,
+ 			    	ygv608.colour_palette[ygv608.regs.s.cc][1] << 2,

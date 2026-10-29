@@ -1,0 +1,35 @@
+From 7b5d908748bc1854c614d2c09477e5ebe5e3bbdf Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Sun, 25 Oct 2026 23:16:16 +0900
+Subject: [PATCH] NGP Dual 1.2-os5: COMCREATEDATA returns FF when the send ring
+ is full
+
+When the 64-byte send ring is full, COMCREATEDATA now returns RA3 = 0xFF
+instead of 2. Card Fighters' Clash puts its deck data one byte at a
+time and retries when RA3 is 0xFF (ROM 0x242334); with 2 it took the
+byte as sent, 32 bytes were lost and both machines stopped at
+VS START COMMUNICATION. Now the match starts.
+
+---
+ mednafen/ngp/hb_link.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/mednafen/ngp/hb_link.c b/mednafen/ngp/hb_link.c
+index 21c071c..ea2f541 100644
+--- a/mednafen/ngp/hb_link.c
++++ b/mednafen/ngp/hb_link.c
+@@ -339,7 +339,10 @@ int hb_com_hle(uint32_t vector)
+             COMMStatus &= ~1;
+          return 1;
+       case VECT_COMCREATEDATA:
+-         rCodeB(0x30) = com_put(rCodeB(0x35)) ? COM_BUF_OK : COM_BUF_OVER;
++         /* (10/25 1.2-os5) 보낼 고리(64바이트)가 가득이면 0xFF — 카드 파이터즈는 덱 자료를 한 바이트씩 넣다가
++          * RA3 == 0xFF 면 COMSENDSTATUS · COMSENDSTART 뒤 다시 넣음(롬 0x242334). 예전 2 는 '넣었음'으로 보고 그 바이트를 버려
++          * 'VS START COMMUNICATION' 에서 둘 다 멈췄음 */
++         rCodeB(0x30) = com_put(rCodeB(0x35)) ? COM_BUF_OK : 0xFF;
+          return 1;
+       case VECT_COMGETDATA:
+          if (com_get(&data))
+-- 
+2.39.5
+

@@ -1,0 +1,238 @@
+Subject: GBA rollback: preserve VRAM contention latch and SIO event queues
+Series-Step: 11/19 (mgba_dual 1.6-os4)
+Origin: hanbang (this project)
+요약: 되감기 정확성: VRAM 경합 마스크(stallMask)를 상태에 저장하고, 같은 시각 SIO 이벤트 순서와 빈 목록 끝을 정리.
+
+The latched VRAM contention mask (previously a reserved word, flag bit 2 of the video flags) is saved and restored,
+so a state taken in the middle of a scanline replays identically. Two SIO events with the same deadline keep their
+original order on restore, and the queued and free node lists of the lockstep driver are rebuilt as disjoint terminated
+lists. _calculateStallMask no longer needs the GBA struct (it takes DISPCNT and the BGCNT array).
+
+---
+diff --git a/include/mgba/internal/gba/serialize.h b/include/mgba/internal/gba/serialize.h
+index bffc0caa6a7a..80c5521df6a4 100644
+--- a/include/mgba/internal/gba/serialize.h
++++ b/include/mgba/internal/gba/serialize.h
+@@ -112,9 +112,11 @@ mLOG_DECLARE_CATEGORY(GBA_STATE);
+  *   | bits 8 - 31: Reserved
+  * | 0x001E8 - 0x001EF: Reserved
+  * 0x001F0 - 0x001FF: Video miscellaneous state
+- * | 0x001F0 - 0x001F3: Reserved
++ * | 0x001F0 - 0x001F3: Latched VRAM contention mask (when flag bit 2 is set)
+  * | 0x001F4 - 0x001F7: Next event
+  * | 0x001F8 - 0x001FB: Miscellaneous flags
++ *   | bits 0 - 1: Video event mode
++ *   | bit 2: Latched VRAM contention mask is present
+  * | 0x001FC - 0x001FF: Frame counter
+  * 0x00200 - 0x00213: Timer 0
+  * | 0x00200 - 0x00201: Reload value
+@@ -288,6 +290,7 @@ DECL_BITS(GBASerializedAudioFlags2, ChBSource, 6, 2);
+ 
+ DECL_BITFIELD(GBASerializedVideoFlags, uint32_t);
+ DECL_BITS(GBASerializedVideoFlags, Mode, 0, 2);
++DECL_BIT(GBASerializedVideoFlags, StallMaskSaved, 2);
+ 
+ DECL_BITFIELD(GBASerializedHWFlags1, uint16_t);
+ DECL_BIT(GBASerializedHWFlags1, ReadWrite, 0);
+@@ -369,7 +372,7 @@ struct GBASerializedState {
+ 	} audio;
+ 
+ 	struct {
+-		int32_t reserved;
++		uint32_t stallMask;
+ 		int32_t nextEvent;
+ 		GBASerializedVideoFlags flags;
+ 		uint32_t frameCounter;
+diff --git a/src/gba/sio/lockstep.c b/src/gba/sio/lockstep.c
+index 94448c32b572..993bbb9a1622 100644
+--- a/src/gba/sio/lockstep.c
++++ b/src/gba/sio/lockstep.c
+@@ -28,6 +28,7 @@ DECL_BITS(GBASIOLockstepSerializedFlags, Player0Mode, 10, 3);
+ DECL_BITS(GBASIOLockstepSerializedFlags, Player1Mode, 13, 3);
+ DECL_BITS(GBASIOLockstepSerializedFlags, Player2Mode, 16, 3);
+ DECL_BITS(GBASIOLockstepSerializedFlags, Player3Mode, 19, 3);
++DECL_BIT(GBASIOLockstepSerializedFlags, BeforeSioComplete, 22);
+ DECL_BITS(GBASIOLockstepSerializedFlags, TransferMode, 28, 3);
+ DECL_BIT(GBASIOLockstepSerializedFlags, TransferActive, 31);
+ 
+@@ -356,7 +357,20 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
+ 	if (GBASIOLockstepSerializedFlagsGetEventScheduled(flags)) {
+ 		int32_t when;
+ 		LOAD_32LE(when, 0, &state->driver.nextEvent);
++		struct mTiming* timing = &driver->p->p->timing;
++		struct mTimingEvent* complete = &driver->p->completeEvent;
++		/* These two events have the same priority. Keep their original
++		 * order when their deadlines coincide, instead of letting the
++		 * order of deserialization choose the winner. */
++		bool beforeComplete = GBASIOLockstepSerializedFlagsIsBeforeSioComplete(flags)
++		    && mTimingIsScheduled(timing, complete) && mTimingUntil(timing, complete) == when;
++		if (beforeComplete) {
++			mTimingDeschedule(timing, complete);
++		}
+ 		mTimingSchedule(&driver->p->p->timing, &lockstep->event, when);
++		if (beforeComplete) {
++			mTimingSchedule(timing, complete, when);
++		}
+ 	}
+ 
+ 	if (GBASIOLockstepSerializedFlagsGetAsleep(flags)) {
+@@ -375,6 +389,7 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
+ 	for (i = 0; i < MAX_LOCKSTEP_EVENTS - 1; ++i) {
+ 		player->buffer[i].next = &player->buffer[i + 1];
+ 	}
++	player->buffer[MAX_LOCKSTEP_EVENTS - 1].next = NULL;
+ 	player->freeList = &player->buffer[0];
+ 	player->queue = NULL;
+ 
+@@ -404,6 +419,9 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
+ 			break;
+ 		}
+ 	}
++	/* The queued and free nodes must be disjoint terminated lists. The
++	 * last queued node otherwise still points into the rebuilt free list. */
++	*lastEvent = NULL;
+ 
+ 	if (player->playerId == 0) {
+ 		LOAD_32LE(coordinator->cycle, 0, &state->coordinator.cycle);
+@@ -442,6 +460,20 @@ static void GBASIOLockstepDriverSaveState(struct GBASIODriver* driver, void** st
+ 	flags = GBASIOLockstepSerializedFlagsSetDataReceived(flags, player->dataReceived);
+ 	flags = GBASIOLockstepSerializedFlagsSetDriverMode(flags, _modeEnumToInt(player->mode));
+ 	flags = GBASIOLockstepSerializedFlagsSetEventScheduled(flags, mTimingIsScheduled(&driver->p->p->timing, &lockstep->event));
++	const struct mTiming* timing = &driver->p->p->timing;
++	const struct mTimingEvent* complete = &driver->p->completeEvent;
++	if (lockstep->event.when == complete->when && mTimingIsScheduled(timing, complete)) {
++		const struct mTimingEvent* event = timing->root ? timing->root : timing->reroot;
++		for (; event; event = event->next) {
++			if (event == complete) {
++				break;
++			}
++			if (event == &lockstep->event) {
++				flags = GBASIOLockstepSerializedFlagsFillBeforeSioComplete(flags);
++				break;
++			}
++		}
++	}
+ 
+ 	flags = GBASIOLockstepSerializedFlagsSetPlayer0Mode(flags, _modeEnumToInt(player->otherModes[0]));
+ 	flags = GBASIOLockstepSerializedFlagsSetPlayer1Mode(flags, _modeEnumToInt(player->otherModes[1]));
+diff --git a/src/gba/video.c b/src/gba/video.c
+index 28f072ec0b88..1a5f719d20ea 100644
+--- a/src/gba/video.c
++++ b/src/gba/video.c
+@@ -35,7 +35,7 @@ static void GBAVideoDummyRendererPutPixels(struct GBAVideoRenderer* renderer, si
+ 
+ static void _startHblank(struct mTiming*, void* context, uint32_t cyclesLate);
+ static void _startHdraw(struct mTiming*, void* context, uint32_t cyclesLate);
+-static unsigned _calculateStallMask(struct GBA* gba, unsigned dispcnt);
++static unsigned _calculateStallMask(unsigned dispcnt, const uint16_t* bgcnt);
+ 
+ MGBA_EXPORT const int GBAVideoObjSizes[16][2] = {
+ 	{ 8, 8 },
+@@ -158,7 +158,7 @@ void _startHdraw(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+ 
+ 	if (video->vcount < GBA_VIDEO_VERTICAL_PIXELS) {
+ 		unsigned dispcnt = video->p->memory.io[GBA_REG(DISPCNT)];
+-		video->stallMask = _calculateStallMask(video->p, dispcnt);
++		video->stallMask = _calculateStallMask(dispcnt, &video->p->memory.io[GBA_REG(BG0CNT)]);
+ 	}
+ 
+ 	GBARegisterDISPSTAT dispstat = video->p->memory.io[GBA_REG(DISPSTAT)];
+@@ -243,7 +243,7 @@ uint16_t GBAVideoWriteDISPSTAT(struct GBAVideo* video, uint16_t value) {
+ 	return dispstat;
+ }
+ 
+-static unsigned _calculateStallMask(struct GBA* gba, unsigned dispcnt) {
++static unsigned _calculateStallMask(unsigned dispcnt, const uint16_t* bgcnt) {
+ 	unsigned mask = 0;
+ 
+ 	if (GBARegisterDISPCNTIsForcedBlank(dispcnt)) {
+@@ -253,28 +253,28 @@ static unsigned _calculateStallMask(struct GBA* gba, unsigned dispcnt) {
+ 	switch (GBARegisterDISPCNTGetMode(dispcnt)) {
+ 	case 0:
+ 		if (GBARegisterDISPCNTIsBg0Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG0CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[0])) {
+ 				mask |= GBA_VSTALL_T8(0);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(0);
+ 			}
+ 		}
+ 		if (GBARegisterDISPCNTIsBg1Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG1CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[1])) {
+ 				mask |= GBA_VSTALL_T8(1);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(1);
+ 			}
+ 		}
+ 		if (GBARegisterDISPCNTIsBg2Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG2CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[2])) {
+ 				mask |= GBA_VSTALL_T8(2);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(2);
+ 			}
+ 		}
+ 		if (GBARegisterDISPCNTIsBg3Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG3CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[3])) {
+ 				mask |= GBA_VSTALL_T8(3);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(3);
+@@ -283,14 +283,14 @@ static unsigned _calculateStallMask(struct GBA* gba, unsigned dispcnt) {
+ 		break;
+ 	case 1:
+ 		if (GBARegisterDISPCNTIsBg0Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG0CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[0])) {
+ 				mask |= GBA_VSTALL_T8(0);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(0);
+ 			}
+ 		}
+ 		if (GBARegisterDISPCNTIsBg1Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG1CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[1])) {
+ 				mask |= GBA_VSTALL_T8(1);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(1);
+@@ -449,6 +449,10 @@ void GBAVideoSerialize(const struct GBAVideo* video, struct GBASerializedState*
+ 	} else if (video->event.callback == _startHblank) {
+ 		flags = GBASerializedVideoFlagsSetMode(flags, 2);
+ 	}
++	/* VRAM contention is latched at the start of Hdraw. It cannot be
++	 * reconstructed from registers changed later in the scanline. */
++	STORE_32(video->stallMask, 0, &state->video.stallMask);
++	flags = GBASerializedVideoFlagsFillStallMaskSaved(flags);
+ 	STORE_32(flags, 0, &state->video.flags);
+ 	STORE_32(video->frameCounter, 0, &state->video.frameCounter);
+ }
+@@ -484,12 +488,27 @@ void GBAVideoDeserialize(struct GBAVideo* video, const struct GBASerializedState
+ 		break;
+ 	case 2:
+ 		video->event.callback = _startHblank;
+-		video->stallMask = _calculateStallMask(video->p, state->io[GBA_REG(DISPCNT)]);
+ 		break;
+ 	case 3:
+ 		video->event.callback = _startHdraw;
+ 		break;
+ 	}
++	if (GBASerializedVideoFlagsIsStallMaskSaved(flags)) {
++		LOAD_32(video->stallMask, 0, &state->video.stallMask);
++	} else {
++		/* Legacy states have no latch. Use saved registers, not the live
++		 * timeline (GBAIODeserialize has not run yet), and never introduce
++		 * display contention during VBlank or HBlank. */
++		uint16_t vcount, dispcnt, bgcnt[4];
++		LOAD_16(vcount, GBA_REG_VCOUNT, state->io);
++		LOAD_16(dispcnt, GBA_REG_DISPCNT, state->io);
++		for (i = 0; i < 4; ++i) {
++			LOAD_16(bgcnt[i], GBA_REG_BG0CNT + i * 2, state->io);
++		}
++		if (video->event.callback == _startHblank && vcount < GBA_VIDEO_VERTICAL_PIXELS) {
++			video->stallMask = _calculateStallMask(dispcnt, bgcnt);
++		}
++	}
+ 	uint32_t when;
+ 	if (state->versionMagic < 0x01000007) {
+ 		// This field was moved in v7

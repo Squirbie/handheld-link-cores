@@ -1,0 +1,37 @@
+From 86e1ca63c33899b0f2697c122310876af25a4e2b Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Sun, 25 Oct 2026 22:58:46 +0900
+Subject: [PATCH 9/9] NGP Dual 1.2-os5: COMRECIVESTART asserts RTS
+
+Receive start now also turns RTS on (ready to receive), unless the
+receive ring stopped itself (0x6D05 = FF, flow control).
+
+Card Fighters' Clash waits on the "press A on either side" screen by
+calling only COMGETDATA and COMRECIVESTART; it never calls COMONRTS on
+the waiting side, so the first byte (0x55) of the side that pressed A
+waited for CTS forever. With this, VS mode starts (exhibition match).
+Delta Warp and Koi Koi Mahjong give the same bytes and pictures.
+
+---
+ mednafen/ngp/hb_link.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/mednafen/ngp/hb_link.c b/mednafen/ngp/hb_link.c
+index f966de1..21c071c 100644
+--- a/mednafen/ngp/hb_link.c
++++ b/mednafen/ngp/hb_link.c
+@@ -332,6 +332,11 @@ int hb_com_hle(uint32_t vector)
+          return 1;
+       case VECT_COMRECIVESTART:
+          sio_mod |= 0x20;
++         /* (10/25 1.2-os5) 받기 시작 = 받을 준비(RTS 켬). 카드 파이터즈는 '어느 쪽이든 A' 화면에서 기다리는 쪽이
++          * COMGETDATA · COMRECIVESTART 만 되풀이하고 COMONRTS 를 안 부름 → 예전엔 RTS 가 꺼진 채라 누른 쪽 첫 바이트(0x55)가
++          * CTS 를 기다리며 멈췄음. 받는 고리가 차서 멈춘 때(0x6D05=FF)는 그대로 둠(흐름 조절) */
++         if (loadB(COM_RXSTOP) != 0xFF)
++            COMMStatus &= ~1;
+          return 1;
+       case VECT_COMCREATEDATA:
+          rCodeB(0x30) = com_put(rCodeB(0x35)) ? COM_BUF_OK : COM_BUF_OVER;
+-- 
+2.39.5
+

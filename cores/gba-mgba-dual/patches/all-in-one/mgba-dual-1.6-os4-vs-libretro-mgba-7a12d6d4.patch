@@ -1,0 +1,3981 @@
+Subject: mGBA Dual 1.6-os4, all nineteen patches in one
+Series-Step: all-in-one (mgba_dual 1.6-os4)
+Origin: hanbang (this project) + tangobattle/mgba commits; apply to libretro/mgba 7a12d6d4b9acb14c0ae62c9166b6a2f3d08007f6 (tree 8ccf4fd1929a)
+요약: 개별 패치 열아홉 개를 차례로 얹은 결과와 같은 한 덩어리 패치. 개별 패치와 함께 쓰지 말 것(둘 중 하나만).
+
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9d528e790ed3..1b8e2b6e1ab4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1029,6 +1029,19 @@ if(BUILD_LIBRETRO)
+ 	file(GLOB RETRO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/libretro/*.c)
+ 	set(LIBRETRO_CORE_SRC ${CORE_SRC})
+ 	list(APPEND LIBRETRO_CORE_SRC ${VFS_SRC})
++	# mGBA Dual (hanbang): two GBAs on one lockstep link cable in one core
++	option(LIBRETRO_DUAL "Build mgba_dual_libretro (two linked GBAs) instead of mgba_libretro" OFF)
++	if(LIBRETRO_DUAL)
++		set(RETRO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/libretro/libretro-audio.c
++		              ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/libretro/libretro-vfs.c
++		              ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/libretro/dual/libretro_dual.c)
++		list(APPEND LIBRETRO_CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/gba/sio/lockstep.c)
++		# 1.5 짝 게임: 2P 짝 롬 ZIP 풀기(hb_romfile.h) — 들어 있는 zlib 의 inflate 만(이름은 link.T 로 안 내보냄)
++		foreach(HB_ZLIB_FILE adler32 crc32 inffast inflate inftrees zutil)
++			list(APPEND RETRO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/third-party/zlib/${HB_ZLIB_FILE}.c)
++			set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/third-party/zlib/${HB_ZLIB_FILE}.c PROPERTIES COMPILE_DEFINITIONS Z_PREFIX)
++		endforeach()
++	endif()
+ 	list(FILTER LIBRETRO_CORE_SRC EXCLUDE REGEX "/core/(scripting|library|mem-search|rewind|input)\\.c$")
+ 	list(FILTER LIBRETRO_CORE_SRC EXCLUDE REGEX "/util/(audio-resampler|interpolator)\\.c$")
+ 	if(CMAKE_TRY_COMPILE_TARGET_TYPE STREQUAL "STATIC_LIBRARY" AND NOT APPLE)
+@@ -1100,6 +1113,9 @@ if(BUILD_LIBRETRO)
+ 		endif()
+ 	endif()
+ 	add_dependencies(${BINARY_NAME}_libretro ${BINARY_NAME}-version-info)
++	if(LIBRETRO_DUAL)
++		set_target_properties(${BINARY_NAME}_libretro PROPERTIES OUTPUT_NAME ${BINARY_NAME}_dual_libretro)
++	endif()
+ 	# The make-era libretro builds all used the gnu dialect (-std=gnu99) plus
+ 	# _GNU_SOURCE; newlib toolchains hide POSIX declarations under strict c11
+ 	set_target_properties(${BINARY_NAME}_libretro PROPERTIES PREFIX "" C_EXTENSIONS ON COMPILE_DEFINITIONS "__LIBRETRO__;_GNU_SOURCE;${LIBRETRO_COLOR_DEFINES};DISABLE_THREADING;MGBA_STANDALONE;${OS_DEFINES};${FUNCTION_DEFINES};ENABLE_VFS;ENABLE_DIRECTORIES;MINIMAL_CORE=2;${LIBRETRO_EXTRA_DEFINES}")
+diff --git a/include/mgba/internal/gb/serialize.h b/include/mgba/internal/gb/serialize.h
+index 72fe9c436834..1c7ee7e273a5 100644
+--- a/include/mgba/internal/gb/serialize.h
++++ b/include/mgba/internal/gb/serialize.h
+@@ -211,33 +211,105 @@ DECL_BIT(GBSerializedAudioFlags, Ch1SweepEnabled, 25);
+ DECL_BIT(GBSerializedAudioFlags, Ch1SweepOccurred, 26);
+ DECL_BIT(GBSerializedAudioFlags, Ch3Readable, 27);
+ DECL_BIT(GBSerializedAudioFlags, SkipFrame, 28);
++// ch3's decoded GBA volume — round-tripped in spare flag bits (see the PSG
++// state struct's frequency/duty/rate fields for the why).
++DECL_BITS(GBSerializedAudioFlags, Ch3Volume, 29, 3);
++// Length-enable ("stop", NRx4 bit 6) flags: their only restore path was the
++// SOUNDxCNT_X write replay that the deserialize no longer performs. A stale
++// stop=true from the pre-load timeline makes the (correctly restored) frame
++// sequencer run the (correctly restored) length counter down to zero and
++// silence the channel — and the per-frame re-save then bakes the dead channel
++// into every later snapshot, so the dropout persists until the game happens
++// to retrigger. Bits 7 and 15 are the flags word's only free bits; ch3's and
++// ch4's stop flags live in their channels' own spare bits.
++DECL_BIT(GBSerializedAudioFlags, Ch1Stop, 7);
++DECL_BIT(GBSerializedAudioFlags, Ch2Stop, 15);
+ 
+ DECL_BITFIELD(GBSerializedAudioEnvelope, uint32_t);
+ DECL_BITS(GBSerializedAudioEnvelope, Length, 0, 7);
+ DECL_BITS(GBSerializedAudioEnvelope, NextStep, 7, 3);
+ DECL_BITS(GBSerializedAudioEnvelope, Frequency, 10, 11);
+ DECL_BITS(GBSerializedAudioEnvelope, DutyIndex, 21, 3);
++// ch4 has no reserved struct slot, so its decoded noise control round-trips in
++// the unused high bits of its envelope word (square channels don't use these).
++DECL_BITS(GBSerializedAudioEnvelope, NoiseRatio, 24, 3);
++DECL_BITS(GBSerializedAudioEnvelope, NoiseFrequency, 27, 4);
++DECL_BIT(GBSerializedAudioEnvelope, NoisePower, 31);
++// Envelope auto-volume sweep params (stepTime/direction/initialVolume): the
++// NRx2 handlers set them but they were never serialized, so a load_state left
++// them stale and _updateEnvelope stepped the wrong direction / period under
++// Tango's per-frame deserialize — audible as crunch on sustained PSG notes
++// (currentVolume IS restored, but the next envelope step then corrupts it). The
++// square channels store them in the high bits they leave free; ch4 (noise)
++// reuses the frequency/duty-index bits it never uses.
++DECL_BITS(GBSerializedAudioEnvelope, SquareStepTime, 24, 3);
++DECL_BIT(GBSerializedAudioEnvelope, SquareDirection, 27);
++DECL_BITS(GBSerializedAudioEnvelope, SquareInitialVolume, 28, 4);
++DECL_BITS(GBSerializedAudioEnvelope, NoiseStepTime, 10, 3);
++DECL_BIT(GBSerializedAudioEnvelope, NoiseDirection, 13);
++DECL_BITS(GBSerializedAudioEnvelope, NoiseInitialVolume, 14, 4);
++DECL_BIT(GBSerializedAudioEnvelope, NoiseStop, 18);
+ 
+ DECL_BITFIELD(GBSerializedAudioSweep, uint32_t);
+ DECL_BITS(GBSerializedAudioSweep, Time, 0, 3);
++// NR10's decoded sweep params and the live countdown toward the next sweep
++// tick. These can't be re-derived by replaying NR10 on load: _writeSweep's
++// negate-exit quirk reads the pre-load `occurred` flag and can spuriously
++// kill ch1, and `step` isn't register-backed at all. Stale shift/direction
++// make _updateSweep slide to the wrong frequency or overflow-kill ch1.
++DECL_BITS(GBSerializedAudioSweep, Shift, 3, 3);
++DECL_BIT(GBSerializedAudioSweep, Direction, 6);
++DECL_BITS(GBSerializedAudioSweep, Step, 7, 4);
++
++// ch3's rate only needs 11 bits of its slot; the rest round-trips the decoded
++// SOUND3CNT_LO fields (the register is no longer replayed on load). Stale
++// bank/size corrupt the GBA wave-RAM rotation window; a stale enable=false
++// makes every retrigger during re-simulation fail, muting ch3.
++DECL_BITFIELD(GBSerializedAudioCh3Rate, uint16_t);
++DECL_BITS(GBSerializedAudioCh3Rate, Rate, 0, 11);
++DECL_BIT(GBSerializedAudioCh3Rate, Stop, 11);
++DECL_BIT(GBSerializedAudioCh3Rate, Enable, 12);
++DECL_BIT(GBSerializedAudioCh3Rate, Bank, 13);
++DECL_BIT(GBSerializedAudioCh3Rate, Size, 14);
+ 
+ struct GBSerializedPSGState {
+ 	struct {
+ 		GBSerializedAudioEnvelope envelope;
+ 		int32_t nextFrame;
+-		int32_t reserved;
++		// Decoded control fields the SOUNDxCNT_* handlers set but that weren't
++		// otherwise serialized — a load_state left them stale and the PSG
++		// channels resampled at the wrong pitch/duty (audible as crunch under
++		// Tango's per-frame deserialize). Round-tripped in the reserved slots
++		// as decoded values (sweep-adjusted frequency included), so the struct
++		// size is unchanged.
++		uint16_t frequency;
++		uint8_t duty;
++		// ch3's/ch4's current output samples (parked in the square channels'
++		// spare bytes). The channels only refresh `sample` when their next
++		// wave/LFSR step comes due, so after a load the pre-load value keeps
++		// sounding until then — and the io-replay during deserialize actively
++		// clobbers it via GBAudioRun. ch1/ch2 need no slot: their sample is
++		// the invariant duty[index]*currentVolume, recomputed on load.
++		int8_t ch3Sample;
+ 		GBSerializedAudioSweep sweep;
+ 		uint32_t lastUpdate;
+ 	} ch1;
+ 	struct {
+ 		GBSerializedAudioEnvelope envelope;
+-		int32_t reserved[2];
++		uint16_t frequency;
++		uint8_t duty;
++		int8_t ch4Sample;
++		// ch4's between-flush averaging accumulators (nSamples/samples) —
++		// parked in ch2's spare slot because ch4's struct has none. They're
++		// flushed every output sample, so int16 is ample.
++		int16_t ch4NSamples;
++		int16_t ch4Samples;
+ 		uint32_t lastUpdate;
+ 	} ch2;
+ 	struct {
+ 		uint32_t wavebanks[8];
+ 		int16_t length;
+-		int16_t reserved;
++		GBSerializedAudioCh3Rate rate;
+ 		uint32_t nextEvent;
+ 	} ch3;
+ 	struct {
+diff --git a/include/mgba/internal/gba/serialize.h b/include/mgba/internal/gba/serialize.h
+index 0192cd90ffee..80c5521df6a4 100644
+--- a/include/mgba/internal/gba/serialize.h
++++ b/include/mgba/internal/gba/serialize.h
+@@ -112,9 +112,11 @@ mLOG_DECLARE_CATEGORY(GBA_STATE);
+  *   | bits 8 - 31: Reserved
+  * | 0x001E8 - 0x001EF: Reserved
+  * 0x001F0 - 0x001FF: Video miscellaneous state
+- * | 0x001F0 - 0x001F3: Reserved
++ * | 0x001F0 - 0x001F3: Latched VRAM contention mask (when flag bit 2 is set)
+  * | 0x001F4 - 0x001F7: Next event
+  * | 0x001F8 - 0x001FB: Miscellaneous flags
++ *   | bits 0 - 1: Video event mode
++ *   | bit 2: Latched VRAM contention mask is present
+  * | 0x001FC - 0x001FF: Frame counter
+  * 0x00200 - 0x00213: Timer 0
+  * | 0x00200 - 0x00201: Reload value
+@@ -288,6 +290,7 @@ DECL_BITS(GBASerializedAudioFlags2, ChBSource, 6, 2);
+ 
+ DECL_BITFIELD(GBASerializedVideoFlags, uint32_t);
+ DECL_BITS(GBASerializedVideoFlags, Mode, 0, 2);
++DECL_BIT(GBASerializedVideoFlags, StallMaskSaved, 2);
+ 
+ DECL_BITFIELD(GBASerializedHWFlags1, uint16_t);
+ DECL_BIT(GBASerializedHWFlags1, ReadWrite, 0);
+@@ -303,6 +306,7 @@ DECL_BITS(GBASerializedHWFlags2, GbpTxPosition, 4, 4);
+ 
+ DECL_BITFIELD(GBASerializedHWFlags3, uint8_t);
+ DECL_BITS(GBASerializedHWFlags3, RtcSioOutput, 0, 1);
++DECL_BIT(GBASerializedHWFlags3, SioCompleteScheduled, 1);
+ 
+ DECL_BITFIELD(GBASerializedUnlCartFlags, uint16_t);
+ DECL_BITS(GBASerializedUnlCartFlags, Type, 0, 5);
+@@ -368,7 +372,7 @@ struct GBASerializedState {
+ 	} audio;
+ 
+ 	struct {
+-		int32_t reserved;
++		uint32_t stallMask;
+ 		int32_t nextEvent;
+ 		GBASerializedVideoFlags flags;
+ 		uint32_t frameCounter;
+diff --git a/include/mgba/internal/gba/sio/lockstep.h b/include/mgba/internal/gba/sio/lockstep.h
+index 0053e6b94b75..60c52edba101 100644
+--- a/include/mgba/internal/gba/sio/lockstep.h
++++ b/include/mgba/internal/gba/sio/lockstep.h
+@@ -45,6 +45,9 @@ struct GBASIOLockstepCoordinator {
+ 
+ 	uint16_t multiData[4];
+ 	uint32_t normalData[4];
++
++	// Reschedule-underflow log budget; diagnostic only, never serialized.
++	int underflows;
+ };
+ 
+ struct GBASIOLockstepEvent {
+diff --git a/src/gb/audio.c b/src/gb/audio.c
+index 6a97d8beab5a..0cda89222b6e 100644
+--- a/src/gb/audio.c
++++ b/src/gb/audio.c
+@@ -996,6 +996,7 @@ void GBAudioPSGSerialize(const struct GBAudio* audio, struct GBSerializedPSGStat
+ 	uint32_t sweep = 0;
+ 	uint32_t ch1Flags = 0;
+ 	uint32_t ch2Flags = 0;
++	GBSerializedAudioCh3Rate ch3Rate = 0;
+ 	uint32_t ch4Flags = 0;
+ 
+ 	flags = GBSerializedAudioFlagsSetFrame(flags, audio->frame);
+@@ -1006,35 +1007,72 @@ void GBAudioPSGSerialize(const struct GBAudio* audio, struct GBSerializedPSGStat
+ 	flags = GBSerializedAudioFlagsSetCh1Dead(flags, audio->ch1.envelope.dead);
+ 	flags = GBSerializedAudioFlagsSetCh1SweepEnabled(flags, audio->ch1.sweep.enable);
+ 	flags = GBSerializedAudioFlagsSetCh1SweepOccurred(flags, audio->ch1.sweep.occurred);
++	flags = GBSerializedAudioFlagsSetCh1Stop(flags, audio->ch1.control.stop);
+ 	ch1Flags = GBSerializedAudioEnvelopeSetLength(ch1Flags, audio->ch1.control.length);
+ 	ch1Flags = GBSerializedAudioEnvelopeSetNextStep(ch1Flags, audio->ch1.envelope.nextStep);
+ 	ch1Flags = GBSerializedAudioEnvelopeSetFrequency(ch1Flags, audio->ch1.sweep.realFrequency);
+ 	ch1Flags = GBSerializedAudioEnvelopeSetDutyIndex(ch1Flags, audio->ch1.index);
++	ch1Flags = GBSerializedAudioEnvelopeSetSquareStepTime(ch1Flags, audio->ch1.envelope.stepTime);
++	ch1Flags = GBSerializedAudioEnvelopeSetSquareDirection(ch1Flags, audio->ch1.envelope.direction);
++	ch1Flags = GBSerializedAudioEnvelopeSetSquareInitialVolume(ch1Flags, audio->ch1.envelope.initialVolume);
+ 	sweep = GBSerializedAudioSweepSetTime(sweep, audio->ch1.sweep.time & 7);
++	sweep = GBSerializedAudioSweepSetShift(sweep, audio->ch1.sweep.shift);
++	sweep = GBSerializedAudioSweepSetDirection(sweep, audio->ch1.sweep.direction);
++	sweep = GBSerializedAudioSweepSetStep(sweep, audio->ch1.sweep.step & 15);
+ 	STORE_32LE(ch1Flags, 0, &state->ch1.envelope);
+ 	STORE_32LE(sweep, 0, &state->ch1.sweep);
+ 	STORE_32LE(audio->ch1.lastUpdate - mTimingCurrentTime(audio->timing), 0, &state->ch1.lastUpdate);
++	// Round-trip the decoded control fields the SOUNDxCNT_* handlers set but
++	// that weren't otherwise serialized — leaving them stale after a load and
++	// crunching the PSG under Tango's per-frame deserialize. Stored as decoded
++	// values (sweep-adjusted frequency included), not raw registers.
++	STORE_16LE(audio->ch1.control.frequency, 0, &state->ch1.frequency);
++	state->ch1.duty = audio->ch1.envelope.duty;
+ 
+ 	flags = GBSerializedAudioFlagsSetCh2Volume(flags, audio->ch2.envelope.currentVolume);
+ 	flags = GBSerializedAudioFlagsSetCh2Dead(flags, audio->ch2.envelope.dead);
++	flags = GBSerializedAudioFlagsSetCh2Stop(flags, audio->ch2.control.stop);
+ 	ch2Flags = GBSerializedAudioEnvelopeSetLength(ch2Flags, audio->ch2.control.length);
+ 	ch2Flags = GBSerializedAudioEnvelopeSetNextStep(ch2Flags, audio->ch2.envelope.nextStep);
+ 	ch2Flags = GBSerializedAudioEnvelopeSetDutyIndex(ch2Flags, audio->ch2.index);
++	ch2Flags = GBSerializedAudioEnvelopeSetSquareStepTime(ch2Flags, audio->ch2.envelope.stepTime);
++	ch2Flags = GBSerializedAudioEnvelopeSetSquareDirection(ch2Flags, audio->ch2.envelope.direction);
++	ch2Flags = GBSerializedAudioEnvelopeSetSquareInitialVolume(ch2Flags, audio->ch2.envelope.initialVolume);
+ 	STORE_32LE(ch2Flags, 0, &state->ch2.envelope);
+ 	STORE_32LE(audio->ch2.lastUpdate - mTimingCurrentTime(audio->timing), 0, &state->ch2.lastUpdate);
++	STORE_16LE(audio->ch2.control.frequency, 0, &state->ch2.frequency);
++	state->ch2.duty = audio->ch2.envelope.duty;
+ 
+ 	flags = GBSerializedAudioFlagsSetCh3Readable(flags, audio->ch3.readable);
+ 	memcpy(state->ch3.wavebanks, audio->ch3.wavedata32, sizeof(state->ch3.wavebanks));
+ 	STORE_16LE(audio->ch3.length, 0, &state->ch3.length);
+ 	STORE_32LE(audio->ch3.nextUpdate - mTimingCurrentTime(audio->timing), 0, &state->ch3.nextEvent);
++	ch3Rate = GBSerializedAudioCh3RateSetRate(ch3Rate, audio->ch3.rate);
++	ch3Rate = GBSerializedAudioCh3RateSetStop(ch3Rate, audio->ch3.stop);
++	ch3Rate = GBSerializedAudioCh3RateSetEnable(ch3Rate, audio->ch3.enable);
++	ch3Rate = GBSerializedAudioCh3RateSetBank(ch3Rate, audio->ch3.bank);
++	ch3Rate = GBSerializedAudioCh3RateSetSize(ch3Rate, audio->ch3.size);
++	STORE_16LE(ch3Rate, 0, &state->ch3.rate);
++	flags = GBSerializedAudioFlagsSetCh3Volume(flags, audio->ch3.volume);
++	state->ch1.ch3Sample = audio->ch3.sample;
+ 
+ 	flags = GBSerializedAudioFlagsSetCh4Volume(flags, audio->ch4.envelope.currentVolume);
+ 	flags = GBSerializedAudioFlagsSetCh4Dead(flags, audio->ch4.envelope.dead);
+ 	STORE_32LE(audio->ch4.lfsr, 0, &state->ch4.lfsr);
+ 	ch4Flags = GBSerializedAudioEnvelopeSetLength(ch4Flags, audio->ch4.length);
+ 	ch4Flags = GBSerializedAudioEnvelopeSetNextStep(ch4Flags, audio->ch4.envelope.nextStep);
++	ch4Flags = GBSerializedAudioEnvelopeSetNoiseRatio(ch4Flags, audio->ch4.ratio);
++	ch4Flags = GBSerializedAudioEnvelopeSetNoiseFrequency(ch4Flags, audio->ch4.frequency);
++	ch4Flags = GBSerializedAudioEnvelopeSetNoisePower(ch4Flags, audio->ch4.power);
++	ch4Flags = GBSerializedAudioEnvelopeSetNoiseStepTime(ch4Flags, audio->ch4.envelope.stepTime);
++	ch4Flags = GBSerializedAudioEnvelopeSetNoiseDirection(ch4Flags, audio->ch4.envelope.direction);
++	ch4Flags = GBSerializedAudioEnvelopeSetNoiseInitialVolume(ch4Flags, audio->ch4.envelope.initialVolume);
++	ch4Flags = GBSerializedAudioEnvelopeSetNoiseStop(ch4Flags, audio->ch4.stop);
+ 	STORE_32LE(ch4Flags, 0, &state->ch4.envelope);
+ 	STORE_32LE(audio->ch4.lastEvent, 0, &state->ch4.lastEvent);
++	STORE_16LE(audio->ch4.nSamples, 0, &state->ch2.ch4NSamples);
++	STORE_16LE(audio->ch4.samples, 0, &state->ch2.ch4Samples);
++	state->ch2.ch4Sample = audio->ch4.sample;
+ 
+ 	int32_t cycles = audio->ch4.ratio ? 2 * audio->ch4.ratio : 1;
+ 	cycles <<= audio->ch4.frequency;
+@@ -1049,7 +1087,9 @@ void GBAudioPSGDeserialize(struct GBAudio* audio, const struct GBSerializedPSGSt
+ 	uint32_t sweep;
+ 	uint32_t ch1Flags = 0;
+ 	uint32_t ch2Flags = 0;
++	GBSerializedAudioCh3Rate ch3Rate;
+ 	uint32_t ch4Flags = 0;
++	int16_t ch4Acc;
+ 	uint32_t when;
+ 
+ 	audio->playingCh1 = !!(*audio->nr52 & 0x0001);
+@@ -1077,21 +1117,42 @@ void GBAudioPSGDeserialize(struct GBAudio* audio, const struct GBSerializedPSGSt
+ 	if (!audio->ch1.sweep.time) {
+ 		audio->ch1.sweep.time = 8;
+ 	}
++	audio->ch1.sweep.shift = GBSerializedAudioSweepGetShift(sweep);
++	audio->ch1.sweep.direction = GBSerializedAudioSweepGetDirection(sweep);
++	audio->ch1.sweep.step = GBSerializedAudioSweepGetStep(sweep);
++	audio->ch1.control.stop = GBSerializedAudioFlagsGetCh1Stop(flags);
+ 	audio->ch1.control.length = GBSerializedAudioEnvelopeGetLength(ch1Flags);
+ 	audio->ch1.envelope.nextStep = GBSerializedAudioEnvelopeGetNextStep(ch1Flags);
+ 	audio->ch1.sweep.realFrequency = GBSerializedAudioEnvelopeGetFrequency(ch1Flags);
+ 	audio->ch1.index = GBSerializedAudioEnvelopeGetDutyIndex(ch1Flags);
+ 	LOAD_32LE(audio->ch1.lastUpdate, 0, &state->ch1.lastUpdate);
+ 	audio->ch1.lastUpdate += mTimingCurrentTime(audio->timing);
++	LOAD_16LE(audio->ch1.control.frequency, 0, &state->ch1.frequency);
++	audio->ch1.envelope.duty = state->ch1.duty;
++	audio->ch1.envelope.stepTime = GBSerializedAudioEnvelopeGetSquareStepTime(ch1Flags);
++	audio->ch1.envelope.direction = GBSerializedAudioEnvelopeGetSquareDirection(ch1Flags);
++	audio->ch1.envelope.initialVolume = GBSerializedAudioEnvelopeGetSquareInitialVolume(ch1Flags);
++	// The channel only refreshes `sample` on its next duty edge, so the
++	// pre-load value (further clobbered by the io-replay's GBAudioRun calls)
++	// would keep sounding until then. duty/index/currentVolume are all
++	// restored above, so the output sample can be rebuilt exactly.
++	_updateSquareSample(&audio->ch1);
+ 
+ 	LOAD_32LE(ch2Flags, 0, &state->ch2.envelope);
+ 	audio->ch2.envelope.currentVolume = GBSerializedAudioFlagsGetCh2Volume(flags);
+ 	audio->ch2.envelope.dead = GBSerializedAudioFlagsGetCh2Dead(flags);
++	audio->ch2.control.stop = GBSerializedAudioFlagsGetCh2Stop(flags);
+ 	audio->ch2.control.length = GBSerializedAudioEnvelopeGetLength(ch2Flags);
+ 	audio->ch2.envelope.nextStep = GBSerializedAudioEnvelopeGetNextStep(ch2Flags);
+ 	audio->ch2.index = GBSerializedAudioEnvelopeGetDutyIndex(ch2Flags);
+ 	LOAD_32LE(audio->ch2.lastUpdate, 0, &state->ch2.lastUpdate);
+ 	audio->ch2.lastUpdate += mTimingCurrentTime(audio->timing);
++	LOAD_16LE(audio->ch2.control.frequency, 0, &state->ch2.frequency);
++	audio->ch2.envelope.duty = state->ch2.duty;
++	audio->ch2.envelope.stepTime = GBSerializedAudioEnvelopeGetSquareStepTime(ch2Flags);
++	audio->ch2.envelope.direction = GBSerializedAudioEnvelopeGetSquareDirection(ch2Flags);
++	audio->ch2.envelope.initialVolume = GBSerializedAudioEnvelopeGetSquareInitialVolume(ch2Flags);
++	_updateSquareSample(&audio->ch2);
+ 
+ 	audio->ch3.readable = GBSerializedAudioFlagsGetCh3Readable(flags);
+ 	// TODO: Big endian?
+@@ -1099,12 +1160,32 @@ void GBAudioPSGDeserialize(struct GBAudio* audio, const struct GBSerializedPSGSt
+ 	LOAD_16LE(audio->ch3.length, 0, &state->ch3.length);
+ 	LOAD_32LE(audio->ch3.nextUpdate, 0, &state->ch3.nextEvent);
+ 	audio->ch3.nextUpdate += mTimingCurrentTime(audio->timing);
++	LOAD_16LE(ch3Rate, 0, &state->ch3.rate);
++	audio->ch3.rate = GBSerializedAudioCh3RateGetRate(ch3Rate);
++	audio->ch3.stop = GBSerializedAudioCh3RateGetStop(ch3Rate);
++	audio->ch3.enable = GBSerializedAudioCh3RateGetEnable(ch3Rate);
++	audio->ch3.bank = GBSerializedAudioCh3RateGetBank(ch3Rate);
++	audio->ch3.size = GBSerializedAudioCh3RateGetSize(ch3Rate);
++	audio->ch3.volume = GBSerializedAudioFlagsGetCh3Volume(flags);
++	audio->ch3.sample = state->ch1.ch3Sample;
+ 
+ 	LOAD_32LE(ch4Flags, 0, &state->ch4.envelope);
+ 	audio->ch4.envelope.currentVolume = GBSerializedAudioFlagsGetCh4Volume(flags);
+ 	audio->ch4.envelope.dead = GBSerializedAudioFlagsGetCh4Dead(flags);
+ 	audio->ch4.length = GBSerializedAudioEnvelopeGetLength(ch4Flags);
+ 	audio->ch4.envelope.nextStep = GBSerializedAudioEnvelopeGetNextStep(ch4Flags);
++	audio->ch4.ratio = GBSerializedAudioEnvelopeGetNoiseRatio(ch4Flags);
++	audio->ch4.frequency = GBSerializedAudioEnvelopeGetNoiseFrequency(ch4Flags);
++	audio->ch4.power = GBSerializedAudioEnvelopeGetNoisePower(ch4Flags);
++	audio->ch4.envelope.stepTime = GBSerializedAudioEnvelopeGetNoiseStepTime(ch4Flags);
++	audio->ch4.envelope.direction = GBSerializedAudioEnvelopeGetNoiseDirection(ch4Flags);
++	audio->ch4.envelope.initialVolume = GBSerializedAudioEnvelopeGetNoiseInitialVolume(ch4Flags);
++	audio->ch4.stop = GBSerializedAudioEnvelopeGetNoiseStop(ch4Flags);
++	LOAD_16LE(ch4Acc, 0, &state->ch2.ch4NSamples);
++	audio->ch4.nSamples = ch4Acc;
++	LOAD_16LE(ch4Acc, 0, &state->ch2.ch4Samples);
++	audio->ch4.samples = ch4Acc;
++	audio->ch4.sample = state->ch2.ch4Sample;
+ 	LOAD_32LE(audio->ch4.lfsr, 0, &state->ch4.lfsr);
+ 	LOAD_32LE(audio->ch4.lastEvent, 0, &state->ch4.lastEvent);
+ 	LOAD_32LE(when, 0, &state->ch4.nextEvent);
+@@ -1118,8 +1199,6 @@ void GBAudioPSGDeserialize(struct GBAudio* audio, const struct GBSerializedPSGSt
+ 			audio->ch4.lastEvent = currentTime + (when & (cycles - 1)) - cycles;
+ 		}
+ 	}
+-	audio->ch4.nSamples = 0;
+-	audio->ch4.samples = 0;
+ }
+ 
+ void GBAudioSerialize(const struct GBAudio* audio, struct GBSerializedState* state) {
+diff --git a/src/gba/audio.c b/src/gba/audio.c
+index 1e913554ff9b..a0e668058c52 100644
+--- a/src/gba/audio.c
++++ b/src/gba/audio.c
+@@ -443,7 +443,11 @@ void GBAAudioSerialize(const struct GBAAudio* audio, struct GBASerializedState*
+ 		STORE_16(audio->currentSamples[i].left, 0, &state->currentSamples[i].left);
+ 		STORE_16(audio->currentSamples[i].right, 0, &state->currentSamples[i].right);
+ 	}
+-	STORE_32(audio->lastSample, 0, &state->audio.lastSample);
++	// Relative, like every other timing anchor: the serialize-side
++	// negative-cycle rebase can shift the state's clock relative to the
++	// live one, and an absolute timestamp then desyncs the sampling grid
++	// on exactly the saves where the rebase fired.
++	STORE_32(audio->lastSample - mTimingCurrentTime(&audio->p->timing), 0, &state->audio.lastSample);
+ 
+ 	int readA = audio->chA.fifoRead;
+ 	int readB = audio->chB.fifoRead;
+@@ -495,15 +499,12 @@ void GBAAudioSerialize(const struct GBAAudio* audio, struct GBASerializedState*
+ void GBAAudioDeserialize(struct GBAAudio* audio, const struct GBASerializedState* state) {
+ 	GBAudioPSGDeserialize(&audio->psg, &state->audio.psg, &state->audio.flags);
+ 
+-	uint16_t reg;
+-	LOAD_16(reg, GBA_REG_SOUND1CNT_X, state->io);
+-	GBAIOWrite(audio->p, GBA_REG_SOUND1CNT_X, reg & 0x7FFF);
+-	LOAD_16(reg, GBA_REG_SOUND2CNT_HI, state->io);
+-	GBAIOWrite(audio->p, GBA_REG_SOUND2CNT_HI, reg & 0x7FFF);
+-	LOAD_16(reg, GBA_REG_SOUND3CNT_X, state->io);
+-	GBAIOWrite(audio->p, GBA_REG_SOUND3CNT_X, reg & 0x7FFF);
+-	LOAD_16(reg, GBA_REG_SOUND4CNT_HI, state->io);
+-	GBAIOWrite(audio->p, GBA_REG_SOUND4CNT_HI, reg & 0x7FFF);
++	// SOUNDCNT_X raw-loads (no write replay), so restore its decoded
++	// master-enable field explicitly; everything the write handler
++	// would have derived beyond it is serialized elsewhere.
++	uint16_t soundcntX;
++	LOAD_16(soundcntX, GBA_REG_SOUNDCNT_X, state->io);
++	audio->enable = !!(soundcntX & 0x80);
+ 
+ 	LOAD_32(audio->chA.internalSample, 0, &state->audio.internalA);
+ 	LOAD_32(audio->chB.internalSample, 0, &state->audio.internalB);
+@@ -516,6 +517,7 @@ void GBAAudioDeserialize(struct GBAAudio* audio, const struct GBASerializedState
+ 		LOAD_16(audio->currentSamples[i].right, 0, &state->currentSamples[i].right);
+ 	}
+ 	LOAD_32(audio->lastSample, 0, &state->audio.lastSample);
++	audio->lastSample += mTimingCurrentTime(&audio->p->timing);
+ 
+ 	int readA = 0;
+ 	int readB = 0;
+diff --git a/src/gba/cart/gpio.c b/src/gba/cart/gpio.c
+index f714cf85828a..35b6f97fc2e4 100644
+--- a/src/gba/cart/gpio.c
++++ b/src/gba/cart/gpio.c
+@@ -496,6 +496,15 @@ void GBAHardwareSerialize(const struct GBACartridgeHardware* hw, struct GBASeria
+ 
+ 	GBASerializedHWFlags3 flags3 = 0;
+ 	flags3 = GBASerializedHWFlags3SetRtcSioOutput(flags3, hw->rtc.sioOutput);
++	// An explicit scheduled bit plus a signed offset: the legacy load
++	// heuristic ((SIOCNT & 0x0080) && when < 0x20000) both dropped an
++	// overdue completion (a cooperative SIO driver can park a core
++	// mid-event-batch, leaving the offset slightly negative — stored
++	// unsigned it reads back huge) and could conjure a completion that
++	// was never scheduled (a secondary can hold START with none).
++	if (mTimingIsScheduled(&hw->p->timing, &hw->p->sio.completeEvent)) {
++		flags3 = GBASerializedHWFlags3SetSioCompleteScheduled(flags3, 1);
++	}
+ 	state->hw.flags3 = flags3;
+ 
+ 	STORE_32(hw->rtc.bytesRemaining, 0, &state->hw.rtcBytesRemaining);
+@@ -522,7 +531,11 @@ void GBAHardwareSerialize(const struct GBACartridgeHardware* hw, struct GBASeria
+ 	// GBP/SIO stuff is only here for legacy reasons
+ 	flags2 = GBASerializedHWFlags2SetGbpInputsPosted(flags2, hw->p->sio.gbp.inputsPosted);
+ 	flags2 = GBASerializedHWFlags2SetGbpTxPosition(flags2, hw->p->sio.gbp.txPosition);
+-	STORE_32(hw->p->sio.completeEvent.when - mTimingCurrentTime(&hw->p->timing), 0, &state->hw.sioNextEvent);
++	if (GBASerializedHWFlags3GetSioCompleteScheduled(flags3)) {
++		STORE_32(hw->p->sio.completeEvent.when - mTimingCurrentTime(&hw->p->timing), 0, &state->hw.sioNextEvent);
++	} else {
++		STORE_32(0, 0, &state->hw.sioNextEvent);
++	}
+ 
+ 	state->hw.flags2 = flags2;
+ }
+@@ -573,12 +586,16 @@ void GBAHardwareDeserialize(struct GBACartridgeHardware* hw, const struct GBASer
+ 	hw->p->sio.gbp.inputsPosted = GBASerializedHWFlags2GetGbpInputsPosted(state->hw.flags2);
+ 	hw->p->sio.gbp.txPosition = GBASerializedHWFlags2GetGbpTxPosition(state->hw.flags2);
+ 
+-	uint32_t when;
++	int32_t when;
+ 	LOAD_32(when, 0, &state->hw.sioNextEvent);
+ 	if (hw->devices & HW_GB_PLAYER) {
+ 		GBASIOSetDriver(&hw->p->sio, &hw->p->sio.gbp.d);
+ 	}
+-	if ((hw->p->memory.io[GBA_REG(SIOCNT)] & 0x0080) && when < 0x20000) {
++	// See GBAHardwareSerialize: the scheduled bit replaces the legacy
++	// SIOCNT/range heuristic, and the offset is signed so an overdue
++	// completion restores exactly instead of being dropped.
++	mTimingDeschedule(&hw->p->timing, &hw->p->sio.completeEvent);
++	if (GBASerializedHWFlags3GetSioCompleteScheduled(state->hw.flags3)) {
+ 		mTimingSchedule(&hw->p->timing, &hw->p->sio.completeEvent, when);
+ 	}
+ }
+diff --git a/src/gba/io.c b/src/gba/io.c
+index 658036e4c56d..02b2fcd12278 100644
+--- a/src/gba/io.c
++++ b/src/gba/io.c
+@@ -214,7 +214,7 @@ static const int _isRSpecialRegister[GBA_REG(INTERNAL_MAX)] = {
+ 	/* 10 */ 1, 1, 1, 1, 1, 1, 1, 1,
+ 	/* 11 */ 0, 0, 0, 0, 0, 0, 0, 0,
+ 	/*    SIO */
+-	/* 12 */ 1, 1, 1, 1, 0, 0, 0, 0,
++	/* 12 */ 1, 1, 1, 1, 0, 1, 0, 0,
+ 	/* 13 */ 1, 1, 0, 0, 0, 0, 0, 0,
+ 	/* 14 */ 1, 0, 0, 0, 0, 0, 0, 0,
+ 	/* 15 */ 1, 1, 1, 1, 1, 0, 0, 0,
+@@ -244,8 +244,8 @@ static const int _isWSpecialRegister[GBA_REG(INTERNAL_MAX)] = {
+ 	/* 04 */ 0, 0, 0, 0, 0, 0, 0, 0,
+ 	/* 05 */ 0, 0, 0, 0, 0, 0, 0, 0,
+ 	/*    Audio */
+-	/* 06 */ 0, 0, 1, 0, 0, 0, 1, 0,
+-	/* 07 */ 0, 0, 1, 0, 0, 0, 1, 0,
++	/* 06 */ 1, 1, 1, 0, 1, 0, 1, 0,
++	/* 07 */ 1, 0, 1, 0, 1, 0, 1, 0,
+ 	/* 08 */ 0, 0, 1, 0, 0, 0, 0, 0,
+ 	/* 09 */ 1, 1, 1, 1, 1, 1, 1, 1,
+ 	/* 0A */ 1, 1, 1, 1, 0, 0, 0, 0,
+@@ -259,7 +259,7 @@ static const int _isWSpecialRegister[GBA_REG(INTERNAL_MAX)] = {
+ 	/* 10 */ 1, 1, 1, 1, 1, 1, 1, 1,
+ 	/* 11 */ 0, 0, 0, 0, 0, 0, 0, 0,
+ 	/*    SIO */
+-	/* 12 */ 1, 1, 1, 1, 1, 0, 0, 0,
++	/* 12 */ 1, 1, 1, 1, 1, 1, 0, 0,
+ 	/* 13 */ 1, 1, 1, 0, 0, 0, 0, 0,
+ 	/* 14 */ 1, 0, 0, 0, 0, 0, 0, 0,
+ 	/* 15 */ 1, 1, 1, 1, 1, 0, 0, 0,
+@@ -1055,7 +1055,27 @@ void GBAIODeserialize(struct GBA* gba, const struct GBASerializedState* state) {
+ 		}
+ 	}
+ 	gba->sio.siocnt = gba->memory.io[GBA_REG(SIOCNT)];
++	// Restore the derived link mode directly before the RCNT write-back
++	// below re-derives it: _switchMode fires the SIO driver's setMode on
++	// a mode edge, and a loaded state on the other side of a link-mode
++	// switch would hand the driver a spurious edge while the machine is
++	// half-restored (a lockstep driver would touch the shared link
++	// state). Deserialization restores state; it must not emit events.
++	unsigned sioMode = ((gba->memory.io[GBA_REG(RCNT)] & 0xC000) | (gba->memory.io[GBA_REG(SIOCNT)] & 0x3000)) >> 12;
++	if (sioMode < 8) {
++		gba->sio.mode = (enum GBASIOMode) (sioMode & 0x3);
++	} else {
++		gba->sio.mode = (enum GBASIOMode) (sioMode & 0xC);
++	}
+ 	GBASIOWriteRCNT(&gba->sio, gba->memory.io[GBA_REG(RCNT)]);
++	// Outside GPIO mode the write-back keeps the low RCNT bits (the
++	// SC/SD/SI/SO pin mirror the link logic maintains) from the machine
++	// *before* the load. The state stores the live register, so restore
++	// it exactly: a state loaded into a different timeline (netplay join
++	// or resync) must not inherit the old pins.
++	uint16_t rcnt;
++	LOAD_16(rcnt, GBA_REG_RCNT, state->io);
++	gba->sio.rcnt = rcnt;
+ 
+ 	LOAD_32(gba->bus, 0, &state->bus);
+ 	GBADMADeserialize(gba, state);
+diff --git a/src/gba/serialize.c b/src/gba/serialize.c
+index a307a51e751f..b799698b280f 100644
+--- a/src/gba/serialize.c
++++ b/src/gba/serialize.c
+@@ -25,11 +25,29 @@ struct GBABundledState {
+ };
+ 
+ void GBASerialize(struct GBA* gba, struct GBASerializedState* state) {
++	// A core suspended mid-event-batch by a cooperative SIO driver can be
++	// parked with cpu->cycles == cpu->nextEvent < 0, which is a healthy
++	// live state but one GBADeserialize rejects as corrupted. Rebase it
++	// into masterCycles: only the sum masterCycles + cycles (the current
++	// time) and the distance nextEvent - cycles are meaningful, so the
++	// rebased state runs the same instructions and processes the same
++	// events at the same absolute times.
++	int32_t cycles = gba->cpu->cycles;
++	int32_t nextEvent = gba->cpu->nextEvent;
++	int32_t masterCycles = gba->timing.masterCycles;
++	int64_t globalCycles = gba->timing.globalCycles;
++	if (cycles < 0) {
++		masterCycles += cycles;
++		globalCycles += cycles;
++		nextEvent -= cycles;
++		cycles = 0;
++	}
++
+ 	STORE_32(GBASavestateMagic + GBASavestateVersion, 0, &state->versionMagic);
+ 	STORE_32(gba->biosChecksum, 0, &state->biosChecksum);
+ 	STORE_32(gba->romCrc32, 0, &state->romCrc32);
+-	STORE_32(gba->timing.masterCycles, 0, &state->masterCycles);
+-	STORE_64LE(gba->timing.globalCycles, 0, &state->globalCycles);
++	STORE_32(masterCycles, 0, &state->masterCycles);
++	STORE_64LE(globalCycles, 0, &state->globalCycles);
+ 
+ 	if (gba->memory.rom) {
+ 		switch (gba->memory.unl.type) {
+@@ -54,8 +72,8 @@ void GBASerialize(struct GBA* gba, struct GBASerializedState* state) {
+ 	}
+ 	STORE_32(gba->cpu->cpsr.packed, 0, &state->cpu.cpsr.packed);
+ 	STORE_32(gba->cpu->spsr.packed, 0, &state->cpu.spsr.packed);
+-	STORE_32(gba->cpu->cycles, 0, &state->cpu.cycles);
+-	STORE_32(gba->cpu->nextEvent, 0, &state->cpu.nextEvent);
++	STORE_32(cycles, 0, &state->cpu.cycles);
++	STORE_32(nextEvent, 0, &state->cpu.nextEvent);
+ 	for (i = 0; i < 6; ++i) {
+ 		int j;
+ 		for (j = 0; j < 7; ++j) {
+diff --git a/src/gba/sio.c b/src/gba/sio.c
+index 22b79675e796..d89d375ede34 100644
+--- a/src/gba/sio.c
++++ b/src/gba/sio.c
+@@ -163,6 +163,7 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
+ 	int id = 0;
+ 	int connected = 0;
+ 	bool handled = false;
++	bool start = false;
+ 	if (sio->driver) {
+ 		handled = sio->driver->handlesMode(sio->driver, sio->mode);
+ 		if (handled) {
+@@ -176,6 +177,17 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
+ 
+ 	switch (sio->mode) {
+ 	case GBA_SIO_MULTI:
++		/* hanbang 1.4: the parent writing Start=0 while its transfer is still
++		 * running stops it (no completion, no IRQ). MultiSio's init writes
++		 * SIOCNT=0x2000 exactly for this; without it a transfer begun by the
++		 * previous protocol finished later and fired a stale IRQ into the
++		 * freshly initialized library (Four Swords title: host first = hang). */
++		if (!id && connected && GBASIOMultiplayerIsBusy(sio->siocnt) && !GBASIOMultiplayerIsBusy(value)
++		    && mTimingIsScheduled(&sio->p->timing, &sio->completeEvent)) {
++			mTimingDeschedule(&sio->p->timing, &sio->completeEvent);
++			sio->siocnt = GBASIOMultiplayerClearBusy(sio->siocnt);
++			sio->rcnt = GBASIORegisterRCNTFillSc(sio->rcnt);
++		}
+ 		value &= 0xFF83;
+ 		value = GBASIOMultiplayerSetSlave(value, id || !connected);
+ 		value = GBASIOMultiplayerSetId(value, id);
+@@ -197,9 +209,11 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
+ 				sio->p->memory.io[GBA_REG(SIOMULTI2)] = 0xFFFF;
+ 				sio->p->memory.io[GBA_REG(SIOMULTI3)] = 0xFFFF;
+ 				sio->rcnt = GBASIORegisterRCNTClearSc(sio->rcnt);
+-				_startTransfer(sio);
++				start = true;
+ 			} else {
+-				// TODO
++				// In MULTI a child's busy bit is driven by the parent's
++				// clock, not by writes to its own SIOCNT.
++				value = GBASIOMultiplayerClearBusy(value);
+ 			}
+ 		}
+ 		break;
+@@ -210,8 +224,11 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
+ 		if (GBASIONormalGetSc(value)) {
+ 			sio->rcnt = GBASIORegisterRCNTFillSc(sio->rcnt);
+ 		}
+-		if (GBASIONormalIsStart(value) && !GBASIONormalIsStart(sio->siocnt)) {
+-			_startTransfer(sio);
++		if (GBASIONormalIsStart(value) && !GBASIONormalIsStart(sio->siocnt)
++		    && GBASIONormalGetSc(value)) {
++			// An external-clock start only arms the shifter. Without
++			// an incoming clock it must remain busy, with no SIO IRQ.
++			start = true;
+ 		}
+ 		break;
+ 	default:
+@@ -236,6 +253,11 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
+ 		}
+ 	}
+ 	sio->siocnt = value;
++	if (start) {
++		// The driver and the completion timer must use this write's
++		// baud/clock selection, including a mode-and-start write.
++		_startTransfer(sio);
++	}
+ }
+ 
+ uint16_t GBASIOWriteRegister(struct GBASIO* sio, uint32_t address, uint16_t value) {
+diff --git a/src/gba/sio/lockstep.c b/src/gba/sio/lockstep.c
+index 74492ec0a2ec..2952ccb80bde 100644
+--- a/src/gba/sio/lockstep.c
++++ b/src/gba/sio/lockstep.c
+@@ -28,6 +28,7 @@ DECL_BITS(GBASIOLockstepSerializedFlags, Player0Mode, 10, 3);
+ DECL_BITS(GBASIOLockstepSerializedFlags, Player1Mode, 13, 3);
+ DECL_BITS(GBASIOLockstepSerializedFlags, Player2Mode, 16, 3);
+ DECL_BITS(GBASIOLockstepSerializedFlags, Player3Mode, 19, 3);
++DECL_BIT(GBASIOLockstepSerializedFlags, BeforeSioComplete, 22);
+ DECL_BITS(GBASIOLockstepSerializedFlags, TransferMode, 28, 3);
+ DECL_BIT(GBASIOLockstepSerializedFlags, TransferActive, 31);
+ 
+@@ -115,6 +116,18 @@ static void _hardSync(struct GBASIOLockstepCoordinator*, struct GBASIOLockstepPl
+ 
+ static void _lockstepEvent(struct mTiming*, void* context, uint32_t cyclesLate);
+ 
++// Difference between two cycle-counter values, valid across the int32
++// wrap: the counters (mTimingCurrentTime and everything derived from
++// it) advance mod 2^32 and cross the sign boundary ~128 emulated
++// seconds after reset. Naive `a - b >= 0` is signed-overflow UB there —
++// and compilers fold it to a direct `a >= b`, which then fails for an
++// entire half-period, freezing the shared clock. Unsigned subtraction
++// reinterpreted as signed is the same windowed-distance idiom mTiming
++// itself uses.
++static int32_t _cycleDiff(int32_t later, int32_t earlier) {
++	return (int32_t) ((uint32_t) later - (uint32_t) earlier);
++}
++
+ static void _verifyAwake(struct GBASIOLockstepCoordinator* coordinator) {
+ #ifdef NDEBUG
+ 	UNUSED(coordinator);
+@@ -222,7 +235,7 @@ static void GBASIOLockstepDriverReset(struct GBASIODriver* driver) {
+ 			}
+ 		}
+ 		_reconfigPlayers(coordinator);
+-		player->cycleOffset = mTimingCurrentTime(&driver->p->p->timing) - coordinator->cycle;
++		player->cycleOffset = _cycleDiff(mTimingCurrentTime(&driver->p->p->timing), coordinator->cycle);
+ 		if (player->playerId != 0) {
+ 			struct GBASIOLockstepEvent event = {
+ 				.type = SIO_EV_ATTACH,
+@@ -234,7 +247,7 @@ static void GBASIOLockstepDriverReset(struct GBASIODriver* driver) {
+ 	} else {
+ 		MutexLock(&coordinator->mutex);
+ 		player = TableLookup(&coordinator->players, lockstep->lockstepId);
+-		player->cycleOffset = mTimingCurrentTime(&driver->p->p->timing) - coordinator->cycle;
++		player->cycleOffset = _cycleDiff(mTimingCurrentTime(&driver->p->p->timing), coordinator->cycle);
+ 	}
+ 
+ 	if (coordinator->transferActive) {
+@@ -336,10 +349,28 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
+ 	player->otherModes[2] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer2Mode(flags));
+ 	player->otherModes[3] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer3Mode(flags));
+ 
++	// The event may still be scheduled, from the live pre-restore state
++	// or from a caller restoring a driver blob without a core load in
++	// between; scheduling an already-scheduled event corrupts the timing
++	// list, so always deschedule first.
++	mTimingDeschedule(&driver->p->p->timing, &lockstep->event);
+ 	if (GBASIOLockstepSerializedFlagsGetEventScheduled(flags)) {
+ 		int32_t when;
+ 		LOAD_32LE(when, 0, &state->driver.nextEvent);
++		struct mTiming* timing = &driver->p->p->timing;
++		struct mTimingEvent* complete = &driver->p->completeEvent;
++		/* These two events have the same priority. Keep their original
++		 * order when their deadlines coincide, instead of letting the
++		 * order of deserialization choose the winner. */
++		bool beforeComplete = GBASIOLockstepSerializedFlagsIsBeforeSioComplete(flags)
++		    && mTimingIsScheduled(timing, complete) && mTimingUntil(timing, complete) == when;
++		if (beforeComplete) {
++			mTimingDeschedule(timing, complete);
++		}
+ 		mTimingSchedule(&driver->p->p->timing, &lockstep->event, when);
++		if (beforeComplete) {
++			mTimingSchedule(timing, complete, when);
++		}
+ 	}
+ 
+ 	if (GBASIOLockstepSerializedFlagsGetAsleep(flags)) {
+@@ -358,6 +389,7 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
+ 	for (i = 0; i < MAX_LOCKSTEP_EVENTS - 1; ++i) {
+ 		player->buffer[i].next = &player->buffer[i + 1];
+ 	}
++	player->buffer[MAX_LOCKSTEP_EVENTS - 1].next = NULL;
+ 	player->freeList = &player->buffer[0];
+ 	player->queue = NULL;
+ 
+@@ -387,6 +419,9 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
+ 			break;
+ 		}
+ 	}
++	/* The queued and free nodes must be disjoint terminated lists. The
++	 * last queued node otherwise still points into the rebuilt free list. */
++	*lastEvent = NULL;
+ 
+ 	if (player->playerId == 0) {
+ 		LOAD_32LE(coordinator->cycle, 0, &state->coordinator.cycle);
+@@ -425,6 +460,20 @@ static void GBASIOLockstepDriverSaveState(struct GBASIODriver* driver, void** st
+ 	flags = GBASIOLockstepSerializedFlagsSetDataReceived(flags, player->dataReceived);
+ 	flags = GBASIOLockstepSerializedFlagsSetDriverMode(flags, _modeEnumToInt(player->mode));
+ 	flags = GBASIOLockstepSerializedFlagsSetEventScheduled(flags, mTimingIsScheduled(&driver->p->p->timing, &lockstep->event));
++	const struct mTiming* timing = &driver->p->p->timing;
++	const struct mTimingEvent* complete = &driver->p->completeEvent;
++	if (lockstep->event.when == complete->when && mTimingIsScheduled(timing, complete)) {
++		const struct mTimingEvent* event = timing->root ? timing->root : timing->reroot;
++		for (; event; event = event->next) {
++			if (event == complete) {
++				break;
++			}
++			if (event == &lockstep->event) {
++				flags = GBASIOLockstepSerializedFlagsFillBeforeSioComplete(flags);
++				break;
++			}
++		}
++	}
+ 
+ 	flags = GBASIOLockstepSerializedFlagsSetPlayer0Mode(flags, _modeEnumToInt(player->otherModes[0]));
+ 	flags = GBASIOLockstepSerializedFlagsSetPlayer1Mode(flags, _modeEnumToInt(player->otherModes[1]));
+@@ -565,7 +614,7 @@ static bool GBASIOLockstepDriverStart(struct GBASIODriver* driver) {
+ 	struct GBASIOLockstepEvent event = {
+ 		.type = SIO_EV_TRANSFER_START,
+ 		.timestamp = timestamp,
+-		.finishCycle = timestamp + GBASIOTransferCycles(player->mode, player->driver->d.p->siocnt, coordinator->nAttached - 1),
++		.finishCycle = (int32_t) ((uint32_t) timestamp + (uint32_t) GBASIOTransferCycles(player->mode, player->driver->d.p->siocnt, coordinator->nAttached - 1)),
+ 	};
+ 	_enqueueEvent(coordinator, &event, TARGET_SECONDARY);
+ 	GBASIOLockstepCoordinatorWaitOnPlayers(coordinator, player);
+@@ -684,7 +733,7 @@ void GBASIOLockstepCoordinatorDetach(struct GBASIOLockstepCoordinator* coordinat
+ }
+ 
+ int32_t _untilNextSync(struct GBASIOLockstepCoordinator* coordinator, struct GBASIOLockstepPlayer* player) {
+-	int32_t cycle = coordinator->cycle - GBASIOLockstepTime(player);
++	int32_t cycle = _cycleDiff(coordinator->cycle, GBASIOLockstepTime(player));
+ 	if (player->playerId == 0) {
+ 		if (coordinator->nAttached < 2) {
+ 			cycle += UNLOCKED_INTERVAL;
+@@ -697,8 +746,8 @@ int32_t _untilNextSync(struct GBASIOLockstepCoordinator* coordinator, struct GBA
+ 
+ void _advanceCycle(struct GBASIOLockstepCoordinator* coordinator, struct GBASIOLockstepPlayer* player) {
+ 	int32_t newCycle = GBASIOLockstepTime(player);
+-	mASSERT_DEBUG(newCycle - coordinator->cycle >= 0);
+-	coordinator->nextHardSync -= newCycle - coordinator->cycle;
++	mASSERT_DEBUG(_cycleDiff(newCycle, coordinator->cycle) >= 0);
++	coordinator->nextHardSync -= _cycleDiff(newCycle, coordinator->cycle);
+ 	coordinator->cycle = newCycle;
+ }
+ 
+@@ -848,11 +897,13 @@ static void _setData(struct GBASIOLockstepCoordinator* coordinator, uint32_t id,
+ 
+ void _setReady(struct GBASIOLockstepCoordinator* coordinator, struct GBASIOLockstepPlayer* activePlayer, int playerId, enum GBASIOMode mode) {
+ 	activePlayer->otherModes[playerId] = mode;
++	/* hanbang 1.4: SD is a shared line that idles high; a cabled unit that is
++	 * not in multiplayer mode (title/menu: GPIO inputs or normal mode) does not
++	 * pull it low. Requiring every partner to already be in multiplayer mode
++	 * made the parent miss its one-time role check (Nintendo MultiSio: SD=1 &&
++	 * SI=0 -> parent) whenever it entered the link menu first. */
++	UNUSED(coordinator);
+ 	bool ready = true;
+-	int i;
+-	for (i = 0; ready && i < coordinator->nAttached; ++i) {
+-		ready = activePlayer->otherModes[i] == activePlayer->mode;
+-	}
+ 	if (activePlayer->mode == GBA_SIO_MULTI) {
+ 		struct GBASIO* sio = activePlayer->driver->d.p;
+ 		sio->siocnt = GBASIOMultiplayerSetReady(sio->siocnt, ready);
+@@ -889,7 +940,7 @@ void _enqueueEvent(struct GBASIOLockstepCoordinator* coordinator, const struct G
+ 		struct GBASIOLockstepEvent** previous = &player->queue;
+ 		struct GBASIOLockstepEvent* next = player->queue;
+ 		while (next) {
+-			int32_t until = newEvent->timestamp - next->timestamp;
++			int32_t until = _cycleDiff(newEvent->timestamp, next->timestamp);
+ 			if (until < 0) {
+ 				break;
+ 			}
+@@ -902,6 +953,7 @@ void _enqueueEvent(struct GBASIOLockstepCoordinator* coordinator, const struct G
+ }
+ 
+ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) {
++	UNUSED(cyclesLate);
+ 	struct GBASIOLockstepDriver* lockstep = context;
+ 	struct GBASIOLockstepCoordinator* coordinator = lockstep->coordinator;
+ 	MutexLock(&coordinator->mutex);
+@@ -915,7 +967,7 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 		                      player->queue->playerId, player->queue->timestamp);
+ 		wasDetach = true;
+ 	}
+-	if (player->playerId == 0 && GBASIOLockstepTime(player) - coordinator->cycle >= 0) {
++	if (player->playerId == 0 && _cycleDiff(GBASIOLockstepTime(player), coordinator->cycle) >= 0) {
+ 		// We are the clock owner; advance the shared clock. However, if we just became
+ 		// the clock owner (by the previous one disconnecting) we might be slightly
+ 		// behind the shared clock. We should wait a bit if needed in that case.
+@@ -937,7 +989,7 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 		if (!event) {
+ 			break;
+ 		}
+-		if (event->timestamp > GBASIOLockstepTime(player)) {
++		if (_cycleDiff(event->timestamp, GBASIOLockstepTime(player)) > 0) {
+ 			break;
+ 		}
+ 		player->queue = event->next;
+@@ -962,11 +1014,45 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 			GBASIOLockstepCoordinatorAckPlayer(coordinator, player);
+ 			break;
+ 		case SIO_EV_TRANSFER_START:
+-			_setData(coordinator, player->playerId, sio);
+-			nextEvent = event->finishCycle - GBASIOLockstepTime(player) - cyclesLate;
+-			player->driver->d.p->siocnt |= 0x80;
+-			mTimingDeschedule(&sio->p->timing, &sio->completeEvent);
+-			mTimingSchedule(&sio->p->timing, &sio->completeEvent, nextEvent);
++			if (player->playerId == 0 || !coordinator->transferActive) {
++				// The transfer this event announced is already dead. Only
++				// secondaries are ever sent TRANSFER_START; if we are the
++				// clock owner we inherited it from the detach that promoted
++				// us — the same detach (or an abort) that tore the transfer
++				// down. Acting on it would flag a phantom transfer busy,
++				// ack a wait nobody holds (parking us outside the sleep
++				// branch, or falsely acking a newer transfer) — and, for
++				// the clock owner, drive the finishCycle reschedule below
++				// non-positive with no sleep branch to catch it: the same
++				// busy-wait the parking fix exists to prevent.
++				mLOG(GBA_SIO, DEBUG, "Discarding stale transfer start from timestamp %X", event->timestamp);
++				break;
++			}
++			// Attachment alone does not connect a shifter. A unit in
++			// GPIO/another mode must not supply stale data or receive
++			// a phantom completion. Normal mode additionally requires
++			// an armed external-clock receiver.
++			bool participating = player->mode == coordinator->transferMode;
++			if (player->mode == GBA_SIO_NORMAL_8 || player->mode == GBA_SIO_NORMAL_32) {
++				participating = participating && GBASIONormalIsStart(sio->siocnt)
++				                && !GBASIONormalGetSc(sio->siocnt);
++			}
++			if (participating) {
++				_setData(coordinator, player->playerId, sio);
++				// CurrentTime already includes callback lateness. Do not
++				// subtract cyclesLate a second time from an absolute end.
++				nextEvent = _cycleDiff(event->finishCycle, GBASIOLockstepTime(player));
++				sio->siocnt |= 0x80;
++				if (player->mode == GBA_SIO_MULTI) {
++					int i;
++					for (i = 0; i < MAX_GBAS; ++i) {
++						sio->p->memory.io[GBA_REG(SIOMULTI0) + i] = 0xFFFF;
++					}
++					sio->rcnt = GBASIORegisterRCNTClearSc(sio->rcnt);
++				}
++				mTimingDeschedule(&sio->p->timing, &sio->completeEvent);
++				mTimingSchedule(&sio->p->timing, &sio->completeEvent, nextEvent);
++			}
+ 			GBASIOLockstepCoordinatorAckPlayer(coordinator, player);
+ 			break;
+ 		case SIO_EV_MODE_SET:
+@@ -995,12 +1081,23 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 		event->next = player->freeList;
+ 		player->freeList = event;
+ 	}
+-	if (player->queue && player->queue->timestamp - GBASIOLockstepTime(player) < nextEvent) {
+-		nextEvent = player->queue->timestamp - GBASIOLockstepTime(player);
++	if (player->queue && _cycleDiff(player->queue->timestamp, GBASIOLockstepTime(player)) < nextEvent) {
++		nextEvent = _cycleDiff(player->queue->timestamp, GBASIOLockstepTime(player));
+ 	}
+ 
+ 	if (player->playerId != 0 && nextEvent <= LOCKSTEP_INTERVAL) {
+-		if (!player->queue || wasDetach) {
++		// Sleep when there is nothing to do before the next sync point:
++		// the queue is empty (or just a detach echo) — or the player has
++		// fully caught up to the shared clock while its queue head is
++		// still in the future (nextEvent < 1: _untilNextSync <= 0, and
++		// due events were all drained above). The old code busy-waited
++		// in that second case by rescheduling at a non-positive offset,
++		// which relies on another thread advancing the shared clock —
++		// with every core on one thread (mgba-siolink) that never
++		// happens and the timing loop spins forever. Parking is the
++		// correct behavior in both worlds: the clock owner runs,
++		// advances the shared clock, and wakes this player.
++		if (!player->queue || wasDetach || nextEvent < 1) {
+ 			GBASIOLockstepPlayerSleep(player);
+ 			// XXX: Is there a better way to gain sync lock at the beginning?
+ 			if (nextEvent < 4) {
+@@ -1009,14 +1106,31 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 			_verifyAwake(coordinator);
+ 		}
+ 	}
++
++	if (nextEvent < 1) {
++		// A non-positive reschedule refires this event at the same
++		// timestamp: with every linked core driven from one thread,
++		// nothing else can advance the shared clock, so the timing
++		// loop spins on this event forever. Asserting instead turns a
++		// recoverable protocol hiccup into an abort of a live session.
++		// Log and clamp: the frame completes, and the host's stall
++		// guards or cross-peer state checks take it from there. The
++		// log budget is coordinator state — per link session, not per
++		// process — so a fresh link always gets its own 32 lines.
++		if (coordinator->underflows < 32) {
++			++coordinator->underflows;
++			mLOG(GBA_SIO, ERROR, "Lockstep reschedule underflow (%i) for player %i; clamping to one interval",
++			     nextEvent, player->playerId);
++		}
++		nextEvent = LOCKSTEP_INTERVAL;
++	}
+ 	MutexUnlock(&coordinator->mutex);
+ 
+-	mASSERT_DEBUG(nextEvent > 0);
+ 	mTimingSchedule(timing, &lockstep->event, nextEvent);
+ }
+ 
+ int32_t GBASIOLockstepTime(struct GBASIOLockstepPlayer* player) {
+-	return mTimingCurrentTime(&player->driver->d.p->p->timing) - player->cycleOffset;
++	return _cycleDiff(mTimingCurrentTime(&player->driver->d.p->p->timing), player->cycleOffset);
+ }
+ 
+ void GBASIOLockstepCoordinatorWaitOnPlayers(struct GBASIOLockstepCoordinator* coordinator, struct GBASIOLockstepPlayer* player) {
+diff --git a/src/gba/video.c b/src/gba/video.c
+index 28f072ec0b88..1a5f719d20ea 100644
+--- a/src/gba/video.c
++++ b/src/gba/video.c
+@@ -35,7 +35,7 @@ static void GBAVideoDummyRendererPutPixels(struct GBAVideoRenderer* renderer, si
+ 
+ static void _startHblank(struct mTiming*, void* context, uint32_t cyclesLate);
+ static void _startHdraw(struct mTiming*, void* context, uint32_t cyclesLate);
+-static unsigned _calculateStallMask(struct GBA* gba, unsigned dispcnt);
++static unsigned _calculateStallMask(unsigned dispcnt, const uint16_t* bgcnt);
+ 
+ MGBA_EXPORT const int GBAVideoObjSizes[16][2] = {
+ 	{ 8, 8 },
+@@ -158,7 +158,7 @@ void _startHdraw(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+ 
+ 	if (video->vcount < GBA_VIDEO_VERTICAL_PIXELS) {
+ 		unsigned dispcnt = video->p->memory.io[GBA_REG(DISPCNT)];
+-		video->stallMask = _calculateStallMask(video->p, dispcnt);
++		video->stallMask = _calculateStallMask(dispcnt, &video->p->memory.io[GBA_REG(BG0CNT)]);
+ 	}
+ 
+ 	GBARegisterDISPSTAT dispstat = video->p->memory.io[GBA_REG(DISPSTAT)];
+@@ -243,7 +243,7 @@ uint16_t GBAVideoWriteDISPSTAT(struct GBAVideo* video, uint16_t value) {
+ 	return dispstat;
+ }
+ 
+-static unsigned _calculateStallMask(struct GBA* gba, unsigned dispcnt) {
++static unsigned _calculateStallMask(unsigned dispcnt, const uint16_t* bgcnt) {
+ 	unsigned mask = 0;
+ 
+ 	if (GBARegisterDISPCNTIsForcedBlank(dispcnt)) {
+@@ -253,28 +253,28 @@ static unsigned _calculateStallMask(struct GBA* gba, unsigned dispcnt) {
+ 	switch (GBARegisterDISPCNTGetMode(dispcnt)) {
+ 	case 0:
+ 		if (GBARegisterDISPCNTIsBg0Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG0CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[0])) {
+ 				mask |= GBA_VSTALL_T8(0);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(0);
+ 			}
+ 		}
+ 		if (GBARegisterDISPCNTIsBg1Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG1CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[1])) {
+ 				mask |= GBA_VSTALL_T8(1);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(1);
+ 			}
+ 		}
+ 		if (GBARegisterDISPCNTIsBg2Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG2CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[2])) {
+ 				mask |= GBA_VSTALL_T8(2);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(2);
+ 			}
+ 		}
+ 		if (GBARegisterDISPCNTIsBg3Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG3CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[3])) {
+ 				mask |= GBA_VSTALL_T8(3);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(3);
+@@ -283,14 +283,14 @@ static unsigned _calculateStallMask(struct GBA* gba, unsigned dispcnt) {
+ 		break;
+ 	case 1:
+ 		if (GBARegisterDISPCNTIsBg0Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG0CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[0])) {
+ 				mask |= GBA_VSTALL_T8(0);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(0);
+ 			}
+ 		}
+ 		if (GBARegisterDISPCNTIsBg1Enable(dispcnt)) {
+-			if (GBARegisterBGCNTIs256Color(gba->memory.io[GBA_REG(BG1CNT)])) {
++			if (GBARegisterBGCNTIs256Color(bgcnt[1])) {
+ 				mask |= GBA_VSTALL_T8(1);
+ 			} else {
+ 				mask |= GBA_VSTALL_T4(1);
+@@ -449,6 +449,10 @@ void GBAVideoSerialize(const struct GBAVideo* video, struct GBASerializedState*
+ 	} else if (video->event.callback == _startHblank) {
+ 		flags = GBASerializedVideoFlagsSetMode(flags, 2);
+ 	}
++	/* VRAM contention is latched at the start of Hdraw. It cannot be
++	 * reconstructed from registers changed later in the scanline. */
++	STORE_32(video->stallMask, 0, &state->video.stallMask);
++	flags = GBASerializedVideoFlagsFillStallMaskSaved(flags);
+ 	STORE_32(flags, 0, &state->video.flags);
+ 	STORE_32(video->frameCounter, 0, &state->video.frameCounter);
+ }
+@@ -484,12 +488,27 @@ void GBAVideoDeserialize(struct GBAVideo* video, const struct GBASerializedState
+ 		break;
+ 	case 2:
+ 		video->event.callback = _startHblank;
+-		video->stallMask = _calculateStallMask(video->p, state->io[GBA_REG(DISPCNT)]);
+ 		break;
+ 	case 3:
+ 		video->event.callback = _startHdraw;
+ 		break;
+ 	}
++	if (GBASerializedVideoFlagsIsStallMaskSaved(flags)) {
++		LOAD_32(video->stallMask, 0, &state->video.stallMask);
++	} else {
++		/* Legacy states have no latch. Use saved registers, not the live
++		 * timeline (GBAIODeserialize has not run yet), and never introduce
++		 * display contention during VBlank or HBlank. */
++		uint16_t vcount, dispcnt, bgcnt[4];
++		LOAD_16(vcount, GBA_REG_VCOUNT, state->io);
++		LOAD_16(dispcnt, GBA_REG_DISPCNT, state->io);
++		for (i = 0; i < 4; ++i) {
++			LOAD_16(bgcnt[i], GBA_REG_BG0CNT + i * 2, state->io);
++		}
++		if (video->event.callback == _startHblank && vcount < GBA_VIDEO_VERTICAL_PIXELS) {
++			video->stallMask = _calculateStallMask(dispcnt, bgcnt);
++		}
++	}
+ 	uint32_t when;
+ 	if (state->versionMagic < 0x01000007) {
+ 		// This field was moved in v7
+diff --git a/src/platform/libretro/dual/hb_ownsave.h b/src/platform/libretro/dual/hb_ownsave.h
+new file mode 100644
+index 000000000000..97082443012c
+--- /dev/null
++++ b/src/platform/libretro/dual/hb_ownsave.h
+@@ -0,0 +1,729 @@
++/* 두 대 코어 공통 — 손님 '각자 자기 세이브'(4판, 10/21)
++ *
++ * 방장(--host): /tmp/hb_ownsave/request 를 30장마다 보고, 레트로아크가 대기 중이고 아무도 안 붙었을 때
++ *   한 번만 2P 세이브를 바꾼 뒤 /tmp/hb_ownsave/ack 를 남긴다. 표(16바이트)·장 번호는 상태에 들어가 손님에게 간다.
++ * 손님(--connect): 실행 명령에 --connect 가 있고, 손님 도우미(hb_ownsave.py)가 막 남긴
++ *   /tmp/hb_ownsave/intent(거래 폴더 · 표 · 롬 CRC · 시각)가 맞을 때만 그 거래에 묶인다.
++ *   - 레트로아크는 손님의 1P 세이브를 읽지도 쓰지도 않는다(RETRO_MEMORY_SAVE_RAM 크기 0).
++ *     .netplay 폴더를 못 만들어 레트로아크가 평소 저장 폴더로 돌아가도 원본 .srm 을 덮지 않는다.
++ *   - 기기 레트로아크 기록(stderr)은 에뮬 실행기의 파이프라 파일로 읽을 수 없다. 그래서 이 코어 안에서
++ *     stderr 를 그대로 넘겨주는 작은 스레드가 줄을 보며 '2 플레이어로 입장했습니다'(영어 'You have joined as
++ *     player 2')를 확인한다. 2P 가 아니거나(3P·관전) 게임을 나왔으면 끝까지 '되쓰기 안 함'.
++ *   - 확인된 2P 일 때만: 2P 세이브가 바뀐 뒤 300장(약 5초, 되감기 최대 범위보다 훨씬 김) 그대로면
++ *     카드 거래 폴더에 checkpoint.bin, 정상 종료 때 export.bin(+램 /tmp/hb_ownsave/export)을 남긴다.
++ * 손님·방장 모두 상태에는 표 · 크기 힌트 · 장 번호만 들어간다(표가 있을 때만 상태판 3).
++ *
++ * 1.5 짝 게임(다른 판끼리, GBA 만): 방장 요청이 HBQ4(= HBQ3 + 2P 롬 CRC · 경로)면 그 롬을 이 기기에서 읽어
++ *   CRC 가 같을 때만 2P 게임기를 그 롬으로 바꾸고 손님 세이브를 넣는다(다르면 /tmp/hb_ownsave/reject 에 거절).
++ *   손님 쪽 거래 · 되쓰기의 게임 CRC 는 2P 롬 CRC(hb_own_p2crc, 짝이 아니면 콘텐츠 CRC 그대로).
++ *
++ * 1.6 싱글팩(2P 팩 없음, hb_nocart): 2P 게임기에 팩이 없어 손님 세이브를 넣을 곳이 없다.
++ *   방장: HBQ3 는 세이브를 넣지 않고 받음 확인(ack)만 — 손님 도우미(5판)가 기다리거나 '못 보냄' 알림 없이 바로 같이하기.
++ *         표는 상태에 넣지 않음(손님 코어가 무엇에 묶여도 되쓰기 조건이 안 됨). HBQ4(짝)는 거절 5 → 손님은 바로 혼자 하기.
++ *   손님: intent 에 묶지 않음(거래 · 중간 저장 · 끝 되쓰기 없음). 1P 세이브는 지금처럼 읽지도 쓰지도 않음.
++ */
++#ifndef HB_OWNSAVE_H
++#define HB_OWNSAVE_H
++#include <dirent.h>
++#include <errno.h>
++#include <poll.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdint.h>
++#include <time.h>
++#include "hb_storage.h"
++#include "hb_romfile.h"
++
++#define HB_OWN_DIR "/tmp/hb_ownsave"
++#define HB_OWN_MAX 131072u
++#define HB_OWN_STABLE 300u          /* 2P 세이브가 이 장 수만큼 그대로여야 중간 저장 */
++#define HB_OWN_INTENT_AGE 180       /* 보낸 뒤 이 초 안에 켠 손님만 거래에 묶음 */
++#define HB_OWN_PACKET_HEAD 44u
++
++static uint8_t hb_own_token[16];
++static uint32_t hb_own_crc, hb_own_kind, hb_own_max, hb_own_save_hint;
++/* 1.5 짝 게임: 코어가 hb_own_init 앞에 정함(2P 가 다른 롬이면 켬 · 그 롬 CRC) */
++static bool hb_pair_on;
++static uint32_t hb_pair_crc, hb_own_p2crc;
++/* 1.6 싱글팩: 코어가 hb_own_init 앞에 정함(2P 를 팩 없이 켰음) */
++static bool hb_nocart;
++static unsigned hb_own_countdown;
++static bool hb_own_applied, hb_own_guest, hb_own_p2_skip_logged;
++static uint8_t hb_generation[8];
++/* 손님 거래 */
++static char hb_tx[4096];
++static uint8_t hb_tx_token[16];
++static uint32_t hb_own_frame, hb_change_frame;
++static uint8_t hb_seen[HB_OWN_MAX], hb_written[HB_OWN_MAX];
++static size_t hb_seen_size, hb_written_size;
++static bool hb_seen_valid;
++/* 레트로아크 기록 넘겨주기(손님 거래가 있을 때만 켬) */
++static int hb_tee_rd = -1, hb_tee_saved = -1;
++static pthread_t hb_tee_thread;
++static bool hb_tee_on;
++static volatile int hb_tee_stop;
++static int hb_role;                 /* 0 모름 · 2 = 2P 확인 · -1 = 2P 아님(관전 · 다른 번호 · 나감 · 오류) */
++static char hb_tee_line[1024];
++static size_t hb_tee_used;
++static bool hb_tee_overflow;
++/* 코어의 기록 함수(레트로아크 기록 → 기기 es_launch_stderr.log). 스레드에서는 부르지 않는다. */
++static void (*hb_logger)(enum retro_log_level, const char *, ...);
++static int hb_role_logged;
++static bool hb_token_logged;
++#define HB_LOG(level, ...) do { if (hb_logger) hb_logger(level, __VA_ARGS__); } while (0)
++
++static uint32_t hb_u32(const uint8_t *p)
++{
++   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++      ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static void hb_put32(uint8_t *p, uint32_t value)
++{
++   unsigned i;
++   for (i = 0; i < 4; i++) p[i] = (uint8_t)(value >> (8 * i));
++}
++
++static uint64_t hb_millis(void)
++{
++   struct timespec t;
++   if (clock_gettime(CLOCK_MONOTONIC, &t)) return 0;
++   return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
++}
++
++static bool hb_has_token(void)
++{
++   unsigned i;
++   for (i = 0; i < sizeof(hb_own_token); i++)
++      if (hb_own_token[i]) return true;
++   return false;
++}
++
++static bool hb_atomic(const char *name, const void *data, size_t size)
++{
++   char path[512];
++   if ((size_t)snprintf(path, sizeof(path), HB_OWN_DIR "/%s", name) >= sizeof(path)) return false;
++   return hb_store_path(path, (const uint8_t *)data, size);
++}
++
++static int hb_role_get(void)
++{
++   return __atomic_load_n(&hb_role, __ATOMIC_SEQ_CST);
++}
++
++static void hb_role_set(int value)
++{
++   /* -1 은 끝까지 유지(한 번이라도 2P 가 아니었으면 되쓰기 안 함) */
++   if (value == 2) {
++      int expected = 0;
++      __atomic_compare_exchange_n(&hb_role, &expected, 2, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++   } else {
++      __atomic_store_n(&hb_role, -1, __ATOMIC_SEQ_CST);
++   }
++}
++
++static bool hb_starts(const char *text, const char *prefix)
++{
++   return !strncmp(text, prefix, strlen(prefix));
++}
++
++/* 레트로아크 1.22.2 넷플레이 문구(영어 · 한국어). 다른 사람 문구('<이름> 사용자가 …', '<이름> has joined …')는 보지 않는다. */
++static void hb_role_parse(const char *line)
++{
++   const char *m = strstr(line, "[Netplay] ");
++   unsigned player = 0;
++   int end = 0;
++   if (!m) return;
++   m += strlen("[Netplay] ");
++   if ((sscanf(m, "You have joined as player %u%n", &player, &end) == 1 && end > 0) ||
++       (sscanf(m, "%u 플레이어로 입장했습니다%n", &player, &end) == 1 && end > 0)) {
++      hb_role_set(player == 2 ? 2 : -1);
++      return;
++   }
++   if (hb_starts(m, "You have left the game") || hb_starts(m, "게임을 나왔습니다") ||
++       hb_starts(m, "You have joined with input devices") ||
++       (strstr(m, "입력장치로 접속했습니다") && !strstr(m, "사용자가")) ||
++       hb_starts(m, "There are no free player slots") || hb_starts(m, "여유 플레이어 슬롯이 없습니다") ||
++       hb_starts(m, "The input devices requested are not available") ||
++       hb_starts(m, "입력장치 요청을 사용할 수 없습니다") ||
++       hb_starts(m, "Cannot switch to play mode") || hb_starts(m, "플레이 모드로 전환하지 못했습니다") ||
++       hb_starts(m, "You do not have permission to play") || hb_starts(m, "플레이 권한이 없습니다"))
++      hb_role_set(-1);
++}
++
++static void hb_tee_feed(const char *data, size_t size)
++{
++   size_t i;
++   for (i = 0; i < size; i++) {
++      if (data[i] == '\n') {
++         hb_tee_line[hb_tee_used] = 0;
++         if (!hb_tee_overflow) hb_role_parse(hb_tee_line);
++         hb_tee_used = 0;
++         hb_tee_overflow = false;
++      } else if (hb_tee_used + 1 < sizeof(hb_tee_line)) {
++         hb_tee_line[hb_tee_used++] = data[i];
++      } else {
++         hb_tee_overflow = true;   /* 아주 긴 줄은 넷플레이 문구가 아니다 — 버림 */
++      }
++   }
++}
++
++/* stderr 로 들어온 것을 원래 대상(에뮬 실행기 파이프 · 시험 기록 파일)에 그대로 넘기며 줄을 본다.
++ * 비정상으로 끝나야 하면 먼저 stderr 를 원래대로 돌려 레트로아크가 막히지 않게 한다. */
++static void *hb_tee_main(void *arg)
++{
++   char buf[4096];
++   sigset_t set;
++   bool broken = false;
++   (void)arg;
++   sigemptyset(&set);
++   sigaddset(&set, SIGPIPE);
++   pthread_sigmask(SIG_BLOCK, &set, NULL);
++   for (;;) {
++      struct pollfd p;
++      int r;
++      ssize_t n;
++      p.fd = hb_tee_rd;
++      p.events = POLLIN;
++      p.revents = 0;
++      r = poll(&p, 1, 100);
++      if (r < 0) {
++         if (errno == EINTR) continue;
++         broken = true;
++         break;
++      }
++      if (r == 0) {
++         if (hb_tee_stop) break;
++         continue;
++      }
++      n = read(hb_tee_rd, buf, sizeof(buf));
++      if (n < 0) {
++         if (errno == EINTR || errno == EAGAIN) continue;
++         broken = true;
++         break;
++      }
++      if (n == 0) break;
++      hb_write_all(hb_tee_saved, (const uint8_t *)buf, (size_t)n);
++      hb_tee_feed(buf, (size_t)n);
++   }
++   if (broken) {
++      dup2(hb_tee_saved, 2);
++      hb_role_set(-1);
++   }
++   return NULL;
++}
++
++static void hb_tee_start(void)
++{
++   int fds[2], saved, flags;
++   if (hb_tee_on) return;
++   if (pipe(fds)) return;
++   fcntl(fds[0], F_SETFD, FD_CLOEXEC);
++   fcntl(fds[1], F_SETFD, FD_CLOEXEC);
++   saved = fcntl(2, F_DUPFD, 3);
++   if (saved < 0) {
++      close(fds[0]);
++      close(fds[1]);
++      return;
++   }
++   fcntl(saved, F_SETFD, FD_CLOEXEC);
++   flags = fcntl(fds[0], F_GETFL);
++   if (flags >= 0) fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
++   fflush(stderr);
++   hb_tee_rd = fds[0];
++   hb_tee_saved = saved;
++   hb_tee_stop = 0;
++   hb_tee_used = 0;
++   hb_tee_overflow = false;
++   if (dup2(fds[1], 2) < 0) {
++      close(saved);
++      close(fds[0]);
++      close(fds[1]);
++      hb_tee_rd = hb_tee_saved = -1;
++      return;
++   }
++   close(fds[1]);
++   if (pthread_create(&hb_tee_thread, NULL, hb_tee_main, NULL)) {
++      dup2(saved, 2);
++      close(saved);
++      close(fds[0]);
++      hb_tee_rd = hb_tee_saved = -1;
++      return;
++   }
++   hb_tee_on = true;
++}
++
++/* 남은 기록까지 넘기고 읽은 뒤 stderr 를 원래대로 */
++static void hb_tee_stop_now(void)
++{
++   if (!hb_tee_on) return;
++   fflush(stderr);
++   dup2(hb_tee_saved, 2);
++   hb_tee_stop = 1;
++   pthread_join(hb_tee_thread, NULL);
++   close(hb_tee_rd);
++   close(hb_tee_saved);
++   hb_tee_rd = hb_tee_saved = -1;
++   hb_tee_on = false;
++}
++
++static bool hb_own_inode(unsigned long inode)
++{
++   DIR *dir = opendir("/proc/self/fd");
++   struct dirent *entry;
++   bool found = false;
++   if (!dir) return false;
++   while ((entry = readdir(dir))) {
++      char path[300], value[128];
++      unsigned long candidate = 0;
++      ssize_t n;
++      snprintf(path, sizeof(path), "/proc/self/fd/%s", entry->d_name);
++      n = readlink(path, value, sizeof(value) - 1);
++      if (n <= 0) continue;
++      value[n] = 0;
++      if (sscanf(value, "socket:[%lu]", &candidate) == 1 && candidate == inode) {
++         found = true;
++         break;
++      }
++   }
++   closedir(dir);
++   return found;
++}
++
++static bool hb_host_waiting(unsigned port)
++{
++   const char *tables[2] = { "/proc/net/tcp", "/proc/net/tcp6" };
++   bool listening = false;
++   unsigned i;
++   for (i = 0; i < 2; i++) {
++      char line[1024];
++      FILE *f = fopen(tables[i], "r");
++      if (!f) {
++         if (!i) return false;
++         continue;
++      }
++      while (fgets(line, sizeof(line), f)) {
++         char local[80], remote[80], *colon;
++         unsigned state, lport;
++         unsigned long inode;
++         if (sscanf(line, "%*u: %79s %79s %x %*s %*s %*s %*s %*s %lu",
++                    local, remote, &state, &inode) != 4) continue;
++         colon = strrchr(local, ':');
++         if (!colon || sscanf(colon + 1, "%x", &lport) != 1 || lport != port) continue;
++         /* TIME_WAIT 는 이미 끝난 연결. 접속 중·접속 시도 중이면 거절 */
++         if (state != 0x0A && state != 0x06) {
++            fclose(f);
++            return false;
++         }
++         if (state == 0x0A && hb_own_inode(inode)) listening = true;
++      }
++      fclose(f);
++   }
++   return listening;
++}
++
++/* 넷플레이 손님 표시(hb_direct 감시가 쓴 pid) — 메뉴로 붙은 손님도 2P 칸·1P 세이브를 안 쓰게 */
++static void hb_guest_check(void)
++{
++   unsigned pid = 0;
++   FILE *f = fopen(HB_OWN_DIR "/guest", "r");
++   if (!f) return;
++   if (fscanf(f, "%u", &pid) == 1 && pid == (unsigned)getpid()) hb_own_guest = true;
++   fclose(f);
++}
++
++/* 실행 명령에 --connect(넷플레이 손님)가 있는지 */
++static bool hb_launched_as_guest(void)
++{
++   char command[8192];
++   int fd, i;
++   ssize_t n;
++   bool connect = false;
++
++   fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
++   if (fd >= 0) {
++      n = read(fd, command, sizeof(command) - 1);
++      close(fd);
++      if (n > 0) {
++         command[n] = 0;
++         for (i = 0; i < n;) {
++            const char *arg = command + i;
++            if (!strcmp(arg, "--connect") || !strncmp(arg, "--connect=", 10) || !strcmp(arg, "-C"))
++               connect = true;
++            i += (int)strlen(arg) + 1;
++         }
++      }
++   }
++   return connect;
++}
++
++static void hb_local_init(void)
++{
++   uint8_t intent[4200];
++   struct stat st;
++   int fd;
++   ssize_t n;
++   uint64_t when;
++   int64_t age;
++
++   if (!hb_launched_as_guest()) return;
++   hb_own_guest = true;
++   if (hb_nocart) {
++      /* 1.6 싱글팩: 2P 에 팩(세이브)이 없어 이 판 2P 진행은 내 세이브가 아님 — 보낸 거래가 있어도 묶지 않음 */
++      HB_LOG(RETRO_LOG_INFO, "각자 세이브: 2P 팩 없음(싱글팩) — 거래에 묶지 않음(중간 저장 · 끝 되쓰기 없음)");
++      return;
++   }
++
++   /* intent: "HBI3" 표[16] CRC[4] 기종[4] 초[8] 거래 폴더 "\n" */
++   fd = open(HB_OWN_DIR "/intent", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
++   if (fd < 0) {
++      HB_LOG(RETRO_LOG_INFO, "각자 세이브: 보낸 세이브 없음 — 보통 손님(1P 세이브는 읽지도 쓰지도 않음)");
++      return;
++   }
++   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 38 || st.st_size >= (off_t)sizeof(intent)) {
++      close(fd);
++      HB_LOG(RETRO_LOG_WARN, "각자 세이브: intent 형식 오류 — 보통 손님");
++      return;
++   }
++   n = read(fd, intent, sizeof(intent) - 1);
++   close(fd);
++   if (n != st.st_size || n < 38 || memcmp(intent, "HBI3", 4) ||
++       hb_u32(intent + 20) != hb_own_p2crc || hb_u32(intent + 24) != hb_own_kind) {
++      HB_LOG(RETRO_LOG_WARN, "각자 세이브: intent 의 롬 CRC · 기종이 다름 — 보통 손님");
++      return;
++   }
++   when = (uint64_t)hb_u32(intent + 28) | ((uint64_t)hb_u32(intent + 32) << 32);
++   age = (int64_t)time(NULL) - (int64_t)when;
++   if (age < -5 || age > HB_OWN_INTENT_AGE) {
++      HB_LOG(RETRO_LOG_WARN, "각자 세이브: intent 가 오래됨(%lld초) — 보통 손님", (long long)age);
++      return;
++   }
++   intent[n] = 0;
++   if (intent[n - 1] != '\n') return;
++   intent[n - 1] = 0;
++   if (intent[36] != '/' || strstr((const char *)intent + 36, "/../") || strstr((const char *)intent + 36, "/./") ||
++       strlen((const char *)intent + 36) + 32 >= sizeof(hb_tx))
++      return;
++   memcpy(hb_tx_token, intent + 4, 16);
++   snprintf(hb_tx, sizeof(hb_tx), "%s", (const char *)intent + 36);
++   hb_tee_start();
++   HB_LOG(RETRO_LOG_INFO, "각자 세이브: 보낸 거래에 묶임(표 %02x%02x%02x%02x…) · 기록 보기 %s",
++          hb_tx_token[0], hb_tx_token[1], hb_tx_token[2], hb_tx_token[3], hb_tee_on ? "켬" : "못 켬(되쓰기 안 함)");
++}
++
++static void hb_own_init(const void *rom, size_t size, uint32_t kind, uint32_t maximum)
++{
++   const uint8_t *p = (const uint8_t *)rom;
++   uint32_t crc = 0xffffffffu;
++   char capability[160], generation[17];
++   int random_fd;
++   size_t i;
++   unsigned bit;
++
++   hb_tee_stop_now();
++   memset(hb_own_token, 0, sizeof(hb_own_token));
++   hb_own_applied = hb_own_guest = hb_own_p2_skip_logged = false;
++   hb_p2_backed_up = false;
++   hb_own_save_hint = 0;
++   hb_own_countdown = 1;
++   hb_own_kind = kind;
++   hb_own_max = maximum;
++   hb_tx[0] = 0;
++   memset(hb_tx_token, 0, sizeof(hb_tx_token));
++   __atomic_store_n(&hb_role, 0, __ATOMIC_SEQ_CST);
++   hb_own_frame = hb_change_frame = 0;
++   hb_role_logged = 0;
++   hb_token_logged = false;
++   hb_seen_valid = false;
++   hb_seen_size = hb_written_size = 0;
++   for (i = 0; i < size; i++) {
++      crc ^= p[i];
++      for (bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
++   }
++   hb_own_crc = ~crc;
++   hb_own_p2crc = hb_pair_on ? hb_pair_crc : hb_own_crc;
++   memset(hb_generation, 0, sizeof(hb_generation));
++   random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
++   if (random_fd >= 0) {
++      if (read(random_fd, hb_generation, sizeof(hb_generation)) != (ssize_t)sizeof(hb_generation))
++         memset(hb_generation, 0, sizeof(hb_generation));
++      close(random_fd);
++   }
++   hb_local_init();
++   if (!maximum || maximum > HB_OWN_MAX) return;
++   if (mkdir(HB_OWN_DIR, 0700) && errno != EEXIST) return;
++   for (i = 0; i < 8; i++) snprintf(generation + 2 * i, 3, "%02x", hb_generation[i]);
++   snprintf(capability, sizeof(capability), "HBO3 %u %u %u %u %s\n",
++            (unsigned)getpid(), hb_own_crc, maximum, kind, generation);
++   hb_atomic("core", capability, strlen(capability));
++   /* 1.5: 짝 게임 요청(HBQ4)을 알아듣는 코어 표시(GBA 만) — 옛 코어 방장에게는 짝 요청을 보내지 않게 */
++   if (kind == 1) {
++      snprintf(capability, sizeof(capability), "HBP5 %u %s\n", (unsigned)getpid(), generation);
++      hb_atomic("pair", capability, strlen(capability));
++   }
++}
++
++/* 짝 요청 거절: 요청을 지우고 표 · 까닭 번호를 남김(손님 도우미가 바로 알 수 있게) */
++#define HB_PAIR_READ 1      /* 2P 롬을 못 읽음 */
++#define HB_PAIR_CRC 2       /* 2P 롬 CRC 가 손님 것과 다름 */
++#define HB_PAIR_SAME 3      /* 2P 롬이 1P 와 같은 롬(짝 아님) */
++#define HB_PAIR_APPLY 4     /* 2P 게임기를 새 롬으로 못 켬 */
++#define HB_PAIR_NOCART 5    /* 1.6: 방장 2P 가 팩 없음(싱글팩) — 짝 롬을 끼울 수 없음 */
++static void hb_pair_reject(const uint8_t *token, uint32_t why, const char *path, const char *detail)
++{
++   uint8_t reject[24];
++   unlink(HB_OWN_DIR "/request");
++   memcpy(reject, "HBR4", 4);
++   memcpy(reject + 4, token, 16);
++   hb_put32(reject + 20, why);
++   hb_atomic("reject", reject, sizeof(reject));
++   HB_LOG(RETRO_LOG_WARN, "짝 게임 요청 거절(%u %s): %s", (unsigned)why, detail, path);
++}
++
++/* 방장: 30장마다 받은 세이브 요청 확인 → 한 번만 2P 세이브 교체
++ * HBQ3 = 머리 52 + 세이브. HBQ4(1.5 짝) = 머리 52 + 2P 롬 CRC[4] 경로 길이[4] 0[4] + 경로 + 세이브. */
++static void hb_own_poll(bool enabled, bool (*apply)(const uint8_t *, size_t),
++                        bool (*apply_pair)(const uint8_t *, size_t, void *, size_t, uint32_t))
++{
++   uint8_t header[64], *data;
++   char path[1024];
++   uint32_t size, port, p2crc = 0, pathlen = 0, head = 52;
++   uint64_t expires;
++   struct stat st;
++   int fd;
++   ssize_t n;
++   unsigned i;
++   bool token_ok = false, pair;
++   void *rom = NULL;
++   size_t romSize = 0;
++   if (!enabled || --hb_own_countdown) return;
++   hb_own_countdown = 30;
++   hb_guest_check();
++   if (hb_own_applied || hb_own_guest) return;
++   fd = open(HB_OWN_DIR "/request", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++   if (fd < 0) return;
++   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 52 ||
++       st.st_size > (off_t)(64 + sizeof(path) + HB_OWN_MAX)) {
++      close(fd);
++      return;
++   }
++   n = read(fd, header, 52);
++   pair = n == 52 && !memcmp(header, "HBQ4", 4);
++   if (n != 52 || (memcmp(header, "HBQ3", 4) && !pair) ||
++       memcmp(header + 44, hb_generation, 8) ||
++       hb_u32(header + 4) != (unsigned)getpid() || hb_u32(header + 8) != hb_own_crc) {
++      close(fd);
++      return;
++   }
++   if (pair) {
++      if (!apply_pair || read(fd, header + 52, 12) != 12) {
++         close(fd);
++         return;
++      }
++      p2crc = hb_u32(header + 52);
++      pathlen = hb_u32(header + 56);
++      if (pathlen < 2 || pathlen >= sizeof(path) || hb_u32(header + 60) ||
++          read(fd, path, pathlen) != (ssize_t)pathlen) {
++         close(fd);
++         return;
++      }
++      path[pathlen] = 0;
++      if (strlen(path) != pathlen || path[0] != '/') {
++         close(fd);
++         return;
++      }
++      head = 64 + pathlen;
++   }
++   size = hb_u32(header + 12);
++   port = hb_u32(header + 16);
++   expires = hb_u32(header + 20) | ((uint64_t)hb_u32(header + 24) << 32);
++   for (i = 28; i < 44; i++) if (header[i]) token_ok = true;
++   if (!token_ok || size > hb_own_max || st.st_size != (off_t)head + (off_t)size || port > 65534 ||
++       !port || !hb_millis() || hb_millis() > expires || !hb_host_waiting(port)) {
++      close(fd);
++      return;
++   }
++   data = (uint8_t *)malloc(size ? size : 1);
++   if (!data) {
++      close(fd);
++      return;
++   }
++   n = size ? read(fd, data, size) : 0;
++   close(fd);
++   if (hb_nocart) {
++      /* 1.6 싱글팩 방장: 2P 에 팩이 없어 세이브를 넣지 않음. 짝 요청은 바로 거절(손님 혼자 하기),
++       * 보통 요청은 대기 중일 때 받음 확인만(표 · 크기 힌트는 상태에 안 넣음 → 손님 되쓰기 조건이 안 됨) */
++      if (pair) {
++         hb_pair_reject(header + 28, HB_PAIR_NOCART, path, "방장 2P 팩 없음(싱글팩)");
++      } else if (n == (ssize_t)size && hb_millis() <= expires && hb_host_waiting(port)) {
++         uint8_t ack[20];
++         unlink(HB_OWN_DIR "/request");
++         hb_own_applied = true;
++         memcpy(ack, "HBA3", 4);
++         memcpy(ack + 4, header + 28, 16);
++         hb_atomic("ack", ack, sizeof(ack));
++         HB_LOG(RETRO_LOG_INFO, "2P 팩 없음(싱글팩): 손님 세이브 %u 바이트는 넣지 않고 받음 확인만 — 손님은 바로 같이하기",
++                (unsigned)size);
++      }
++      free(data);
++      return;
++   }
++   if (pair && n == (ssize_t)size) {
++      /* 롬 읽기(몇십 ms)는 마지막 대기 확인보다 앞에서 */
++      uint32_t romCrc = 0;
++      const char *why = "";
++      rom = hb_rom_load(path, &romSize, &romCrc, &why);
++      if (!rom) {
++         hb_pair_reject(header + 28, HB_PAIR_READ, path, why);
++         free(data);
++         return;
++      }
++      if (romCrc != p2crc || romCrc == hb_own_crc) {
++         char detail[64];
++         snprintf(detail, sizeof(detail), "손님 %08x · 이 기기 %08x", (unsigned)p2crc, (unsigned)romCrc);
++         hb_pair_reject(header + 28, romCrc != p2crc ? HB_PAIR_CRC : HB_PAIR_SAME, path, detail);
++         mappedMemoryFree(rom, romSize);
++         free(data);
++         return;
++      }
++   }
++   if (n == (ssize_t)size && hb_millis() <= expires && hb_host_waiting(port)) {
++      bool applied;
++      /* 레트로아크의 같은 실행 스레드 안: 접속 처리보다 앞선 한 번만 바꾼다. */
++      unlink(HB_OWN_DIR "/request");
++      if (pair) {
++         applied = apply_pair(data, size, rom, romSize, p2crc);   /* 성공하면 롬은 코어 것 */
++         if (!applied) {
++            mappedMemoryFree(rom, romSize);
++            hb_pair_reject(header + 28, HB_PAIR_APPLY, path, "2P 게임기 켜기 실패");
++         }
++         rom = NULL;
++      } else {
++         applied = apply(data, size);
++      }
++      if (applied) {
++         uint8_t ack[20];
++         memcpy(hb_own_token, header + 28, 16);
++         hb_own_save_hint = size;
++         hb_own_applied = true;
++         hb_own_frame = 0;
++         memcpy(ack, "HBA3", 4);
++         memcpy(ack + 4, hb_own_token, 16);
++         hb_atomic("ack", ack, sizeof(ack));
++      }
++   }
++   if (rom) mappedMemoryFree(rom, romSize);   /* 짝 롬을 읽었지만 그새 대기가 끝남 */
++   free(data);
++}
++
++/* 손님 거래 폴더에 묶음 하나: 머리 44 + 세이브 + SHA-256 32
++ * 머리 = 종류[4] CRC[4] 기종[4] 크기[4] 표[16] 장[4] 역할(2)[4] 세이브 CRC32[4] */
++static bool hb_packet(const char *name, const char *magic, const uint8_t *save, size_t size, uint32_t frame)
++{
++   uint8_t *packet;
++   char path[4160];
++   bool ok;
++   if (!hb_tx[0] || !save || !size || size > HB_OWN_MAX) return false;
++   packet = (uint8_t *)malloc(HB_OWN_PACKET_HEAD + size + 32);
++   if (!packet) return false;
++   memcpy(packet, magic, 4);
++   hb_put32(packet + 4, hb_own_p2crc);   /* 짝이면 손님 자기 게임(2P 롬) CRC */
++   hb_put32(packet + 8, hb_own_kind);
++   hb_put32(packet + 12, (uint32_t)size);
++   memcpy(packet + 16, hb_own_token, 16);
++   hb_put32(packet + 32, frame);
++   hb_put32(packet + 36, 2);
++   hb_put32(packet + 40, hb_crc32(save, size));
++   memcpy(packet + HB_OWN_PACKET_HEAD, save, size);
++   hb_sha256(packet, HB_OWN_PACKET_HEAD + size, packet + HB_OWN_PACKET_HEAD + size);
++   ok = (size_t)snprintf(path, sizeof(path), "%s/%s.bin", hb_tx, name) < sizeof(path) &&
++        hb_store_path(path, packet, HB_OWN_PACKET_HEAD + size + 32);
++   if (!strcmp(name, "export"))
++      ok = hb_atomic("export", packet, HB_OWN_PACKET_HEAD + size + 32) || ok;   /* 카드가 실패해도 램 사본으로 종료 훅이 살림 */
++   free(packet);
++   return ok;
++}
++
++static bool hb_own_eligible(void)
++{
++   return hb_has_token() && hb_tx[0] && hb_own_guest &&
++          !memcmp(hb_own_token, hb_tx_token, 16) && hb_role_get() == 2;
++}
++
++/* 손님 정상 종료: 기록 줄을 끝까지 읽은 뒤, 확인된 2P 면 2P 세이브를 내보낸다 */
++static void hb_own_export(const uint8_t *save, size_t size)
++{
++   hb_tee_stop_now();
++   if (!hb_tx[0]) return;
++   if (!hb_own_eligible() || !save || !size || size > HB_OWN_MAX) {
++      HB_LOG(RETRO_LOG_INFO, "각자 세이브: 종료 — 이 판은 되쓰지 않음(%s)",
++             !hb_has_token() ? "방장 표 없음" : memcmp(hb_own_token, hb_tx_token, 16) ? "받은 표가 보낸 거래와 다름" :
++             hb_role_get() == 2 ? "2P 세이브 없음" : hb_role_get() < 0 ? "2P 아님(관전 · 3P · 나감)" : "2P 확인 못 함");
++      return;
++   }
++   if (hb_packet("export", "HBE3", save, size, hb_own_frame))
++      HB_LOG(RETRO_LOG_INFO, "각자 세이브: 종료 2P 세이브 %u바이트 남김(장 %u)", (unsigned)size, hb_own_frame);
++   else
++      HB_LOG(RETRO_LOG_ERROR, "각자 세이브: 종료 2P 세이브 남기기 실패: %s", hb_tx);
++}
++
++/* 매 장 끝(방장 · 손님 같음): 표가 있으면 장 번호를 센다(상태에 들어가므로 두 기기가 똑같이).
++ * 확인된 2P 손님만, 바뀐 2P 세이브가 HB_OWN_STABLE 장 그대로면 카드에 중간 저장. */
++static void hb_own_tick(const uint8_t *save, size_t size)
++{
++   int role;
++   if (!hb_has_token()) return;
++   hb_own_frame++;
++   if (!hb_tx[0] || !hb_own_guest) return;
++   role = hb_role_get();
++   if (role != hb_role_logged) {
++      hb_role_logged = role;
++      if (role == 2)
++         HB_LOG(RETRO_LOG_INFO, "각자 세이브: 넷플레이 2P 확인 — 이 판 2P 진행을 내 세이브로 남김");
++      else
++         HB_LOG(RETRO_LOG_WARN, "각자 세이브: 2P 아님(관전 · 3P · 나감) — 이 판은 되쓰지 않음");
++   }
++   if (!hb_token_logged && memcmp(hb_own_token, hb_tx_token, 16)) {
++      hb_token_logged = true;
++      HB_LOG(RETRO_LOG_WARN, "각자 세이브: 받은 상태의 표가 보낸 거래와 다름 — 되쓰지 않음");
++   }
++   if (!hb_own_eligible() || !save || !size || size > HB_OWN_MAX) return;
++   if (!hb_seen_valid) {
++      /* 2P 확인 뒤 첫 장: 받은 세이브를 기준으로 삼는다(바뀐 것이 없으면 중간 저장 안 함) */
++      memcpy(hb_seen, save, size);
++      memcpy(hb_written, save, size);
++      hb_seen_size = hb_written_size = size;
++      hb_seen_valid = true;
++      hb_change_frame = hb_own_frame;
++      return;
++   }
++   if (size != hb_seen_size || memcmp(hb_seen, save, size)) {
++      memcpy(hb_seen, save, size);
++      hb_seen_size = size;
++      hb_change_frame = hb_own_frame;
++      return;
++   }
++   if (hb_own_frame - hb_change_frame < HB_OWN_STABLE) return;
++   if (hb_written_size == size && !memcmp(hb_written, save, size)) return;
++   if (hb_packet("checkpoint", "HBC3", save, size, hb_change_frame)) {
++      memcpy(hb_written, save, size);
++      hb_written_size = size;
++      HB_LOG(RETRO_LOG_INFO, "각자 세이브: 2P 중간 저장 %u바이트(장 %u에 바뀜)", (unsigned)size, hb_change_frame);
++   } else {
++      HB_LOG(RETRO_LOG_ERROR, "각자 세이브: 2P 중간 저장 실패 — 300장 뒤 다시: %s", hb_tx);
++      hb_change_frame = hb_own_frame;   /* 카드 쓰기 실패: 300장 뒤 다시 */
++   }
++}
++
++/* 상태 불러오기(넷플레이 되감기 포함): 장 번호를 상태 값으로. 바뀐 장 이전으로 돌아가면 다시 셈. */
++static void hb_own_restored(uint32_t frame)
++{
++   hb_own_frame = frame;
++   if (frame < hb_change_frame) hb_change_frame = frame;
++}
++
++static void hb_own_deinit(void)
++{
++   hb_tee_stop_now();
++}
++#endif
+diff --git a/src/platform/libretro/dual/hb_romfile.h b/src/platform/libretro/dual/hb_romfile.h
+new file mode 100644
+index 000000000000..0eca9ab82721
+--- /dev/null
++++ b/src/platform/libretro/dual/hb_romfile.h
+@@ -0,0 +1,204 @@
++/* GBA 두 대 코어 1.5 — 2P 짝 롬 읽기(10/21)
++ *
++ * 낱개 .gba 파일, 또는 .gba 가 정확히 하나 든 ZIP(저장 · deflate)만 읽는다. hb_ownsave.py rom_crc 와 같은 규칙.
++ * ZIP 은 안 항목의 CRC32 를 풀어낸 내용으로 다시 확인한다. 돌려주는 CRC 는 풀어낸 롬 전체의 CRC32
++ * (= ZIP 항목 CRC = 레트로아크 · hb_ownsave 가 보는 값).
++ * 압축 풀기는 mGBA 에 들어 있는 zlib(src/third-party/zlib) 의 inflate 만 쓴다(코어 밖으로 이름을 내보내지 않음).
++ */
++#ifndef HB_ROMFILE_H
++#define HB_ROMFILE_H
++/* mGBA 자체 crc32(src/util/crc32.c)와 이름이 겹치지 않게 zlib 이름에 z_ 를 붙임(CMake 에서 zlib 파일도 같은 정의) */
++#ifndef Z_PREFIX
++#define Z_PREFIX
++#endif
++#include "../../../third-party/zlib/zlib.h"
++
++#define HB_ROM_MAX (32u * 1024u * 1024u)          /* GBA 롬 최대(32MB) */
++#define HB_ROM_FILE_MAX (HB_ROM_MAX + 4u * 1024u * 1024u)
++
++static uint32_t hb_rd16(const uint8_t *p)
++{
++   return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++static uint32_t hb_rd32(const uint8_t *p)
++{
++   return hb_rd16(p) | (hb_rd16(p + 2) << 16);
++}
++
++static bool hb_ends_gba(const char *name, size_t len)
++{
++   return len > 4 && name[len - 4] == '.' && (name[len - 3] | 0x20) == 'g' &&
++      (name[len - 2] | 0x20) == 'b' && (name[len - 1] | 0x20) == 'a';
++}
++
++/* 보통 파일만, 크기 한도 안에서 통째로 */
++static uint8_t *hb_rom_read_file(const char *path, size_t *size, const char **why)
++{
++   struct stat st;
++   uint8_t *data;
++   size_t got = 0;
++   int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++   if (fd < 0) {
++      *why = "파일 없음";
++      return NULL;
++   }
++   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > (off_t)HB_ROM_FILE_MAX) {
++      close(fd);
++      *why = "보통 파일이 아니거나 크기 초과";
++      return NULL;
++   }
++   data = (uint8_t *)malloc((size_t)st.st_size);
++   if (!data) {
++      close(fd);
++      *why = "메모리 부족";
++      return NULL;
++   }
++   while (got < (size_t)st.st_size) {
++      ssize_t n = read(fd, data + got, (size_t)st.st_size - got);
++      if (n < 0 && errno == EINTR) continue;
++      if (n <= 0) break;
++      got += (size_t)n;
++   }
++   close(fd);
++   if (got != (size_t)st.st_size) {
++      free(data);
++      *why = "읽기 실패";
++      return NULL;
++   }
++   *size = got;
++   return data;
++}
++
++/* 성공하면 anonymousMemoryMap 으로 잡은 롬(mappedMemoryFree(롬, *romSize) 로 풀기) */
++static void *hb_rom_load(const char *path, size_t *romSize, uint32_t *romCrc, const char **why)
++{
++   size_t fileSize = 0, usize = 0;
++   uint8_t *file;
++   void *rom = NULL;
++   *why = "";
++   file = hb_rom_read_file(path, &fileSize, why);
++   if (!file) return NULL;
++   if (fileSize >= 4 && hb_rd32(file) == 0x04034b50u) {
++      size_t eocd, min, cd, cdEnd, p, local, start;
++      uint32_t entries, k, found = 0, method = 0, flags = 0, crc = 0, csize = 0, loff = 0;
++      if (fileSize < 22) {
++         *why = "ZIP 이 너무 짧음";
++         goto fail;
++      }
++      min = fileSize > 22 + 65535 ? fileSize - 22 - 65535 : 0;
++      for (eocd = fileSize - 22;; --eocd) {
++         if (hb_rd32(file + eocd) == 0x06054b50u) break;
++         if (eocd == min) {
++            *why = "ZIP 끝 기록 없음";
++            goto fail;
++         }
++      }
++      entries = hb_rd16(file + eocd + 10);
++      cd = hb_rd32(file + eocd + 16);
++      cdEnd = cd + hb_rd32(file + eocd + 12);
++      if (cd > eocd || cdEnd > eocd || cdEnd < cd) {
++         *why = "ZIP 목록 위치 오류";
++         goto fail;
++      }
++      for (p = cd, k = 0; k < entries; ++k) {
++         uint32_t nameLen, extraLen, commentLen;
++         const char *name;
++         if (p + 46 > cdEnd || hb_rd32(file + p) != 0x02014b50u) {
++            *why = "ZIP 목록 형식 오류";
++            goto fail;
++         }
++         nameLen = hb_rd16(file + p + 28);
++         extraLen = hb_rd16(file + p + 30);
++         commentLen = hb_rd16(file + p + 32);
++         if (p + 46 + nameLen > cdEnd) {
++            *why = "ZIP 이름 길이 오류";
++            goto fail;
++         }
++         name = (const char *)file + p + 46;
++         if (nameLen && name[nameLen - 1] != '/' && hb_ends_gba(name, nameLen)) {
++            ++found;
++            flags = hb_rd16(file + p + 8);
++            method = hb_rd16(file + p + 10);
++            crc = hb_rd32(file + p + 16);
++            csize = hb_rd32(file + p + 20);
++            usize = hb_rd32(file + p + 24);
++            loff = hb_rd32(file + p + 42);
++         }
++         p += 46 + nameLen + extraLen + commentLen;
++      }
++      if (found != 1) {
++         *why = "ZIP 안 .gba 가 정확히 하나가 아님";
++         goto fail;
++      }
++      if ((flags & 1) || !usize || usize > HB_ROM_MAX || (method != 0 && method != 8)) {
++         *why = "ZIP 항목이 암호 · 크기 · 압축 방식 오류";
++         goto fail;
++      }
++      local = loff;
++      if (local + 30 > fileSize || hb_rd32(file + local) != 0x04034b50u) {
++         *why = "ZIP 항목 머리 오류";
++         goto fail;
++      }
++      start = local + 30 + hb_rd16(file + local + 26) + hb_rd16(file + local + 28);
++      if (start > fileSize || csize > fileSize - start) {
++         *why = "ZIP 항목 길이 오류";
++         goto fail;
++      }
++      rom = anonymousMemoryMap(usize);
++      if (!rom) {
++         *why = "메모리 부족";
++         goto fail;
++      }
++      if (method == 0) {
++         if (csize != usize) {
++            *why = "ZIP 저장 항목 크기 오류";
++            goto fail;
++         }
++         memcpy(rom, file + start, usize);
++      } else {
++         z_stream z;
++         int r;
++         memset(&z, 0, sizeof(z));
++         if (inflateInit2(&z, -MAX_WBITS) != Z_OK) {
++            *why = "압축 풀기 준비 실패";
++            goto fail;
++         }
++         z.next_in = file + start;
++         z.avail_in = csize;
++         z.next_out = (Bytef *)rom;
++         z.avail_out = (uInt)usize;
++         r = inflate(&z, Z_FINISH);
++         inflateEnd(&z);
++         if (r != Z_STREAM_END || z.total_out != usize) {
++            *why = "압축 풀기 실패";
++            goto fail;
++         }
++      }
++      if ((uint32_t)crc32(0L, (const Bytef *)rom, (uInt)usize) != crc) {
++         *why = "ZIP 항목 CRC 불일치(손상)";
++         goto fail;
++      }
++   } else {
++      if (!hb_ends_gba(path, strlen(path)) || fileSize > HB_ROM_MAX) {
++         *why = ".gba · .zip 이 아니거나 크기 초과";
++         goto fail;
++      }
++      usize = fileSize;
++      rom = anonymousMemoryMap(usize);
++      if (!rom) {
++         *why = "메모리 부족";
++         goto fail;
++      }
++      memcpy(rom, file, usize);
++   }
++   free(file);
++   *romSize = usize;
++   *romCrc = (uint32_t)crc32(0L, (const Bytef *)rom, (uInt)usize);
++   return rom;
++fail:
++   if (rom) mappedMemoryFree(rom, usize);
++   free(file);
++   return NULL;
++}
++#endif
+diff --git a/src/platform/libretro/dual/hb_storage.h b/src/platform/libretro/dual/hb_storage.h
+new file mode 100644
+index 000000000000..f80a082a4eee
+--- /dev/null
++++ b/src/platform/libretro/dual/hb_storage.h
+@@ -0,0 +1,217 @@
++/* 두 대 코어 공통 — 카드·램 파일 쓰기(자기 세이브 4판, 10/21)
++ *
++ * 지키는 것
++ * - 기존 파일을 직접 열어 잘라 쓰지 않는다. 같은 폴더의 고정 임시 이름(<이름>.hbtmp)에 쓰고
++ *   fsync → 다시 읽어 확인 → 이름 바꾸기 → 최종 파일 fsync·다시 읽어 확인 → 폴더 동기화.
++ * - 이름 바꾸기에 실패하면 원본은 그대로 두고, 완전한 새 내용이 든 임시 파일만 남긴다.
++ *   임시 이름이 고정이라 실패가 되풀이돼도 파일이 쌓이지 않는다(다음 쓰기가 덮음).
++ * - 폴더 fsync 가 '지원 안 함'(EINVAL·ENOTSUP·EOPNOTSUPP·ENOSYS)일 때만 syncfs 로 대신한다.
++ *   EIO·ENOSPC·EROFS 같은 진짜 오류는 실패로 돌려준다.
++ */
++#ifndef HB_STORAGE_H
++#define HB_STORAGE_H
++#include <errno.h>
++#include <fcntl.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#ifndef O_CLOEXEC
++#define O_CLOEXEC 0
++#endif
++
++static uint32_t hb_crc32(const void *data, size_t size)
++{
++   const uint8_t *p = (const uint8_t *)data;
++   uint32_t crc = ~0u;
++   unsigned bit;
++   while (size--) {
++      crc ^= *p++;
++      for (bit = 0; bit < 8; bit++)
++         crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
++   }
++   return ~crc;
++}
++
++static uint32_t hb_rotr(uint32_t n, unsigned b)
++{
++   return (n >> b) | (n << (32 - b));
++}
++
++/* SHA-256(FIPS 180-4). 내보내기 묶음 머리까지 해시해 표·역할·크기 손상도 거절한다. */
++static void hb_sha256(const uint8_t *data, size_t size, uint8_t out[32])
++{
++   static const uint32_t k[64] = {
++      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
++      0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
++      0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
++      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
++      0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
++      0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
++      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
++      0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
++   };
++   uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
++                    0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
++   size_t padded = (size + 9 + 63) & ~(size_t)63, at;
++   unsigned i;
++   for (at = 0; at < padded; at += 64) {
++      uint8_t block[64];
++      uint32_t w[64], a, b, c, d, e, f, g, v;
++      for (i = 0; i < 64; i++) {
++         size_t n = at + i;
++         block[i] = n < size ? data[n] : n == size ? 0x80 : 0;
++         if (n >= padded - 8)
++            block[i] = (uint8_t)(((uint64_t)size * 8) >> (8 * (padded - 1 - n)));
++      }
++      for (i = 0; i < 16; i++)
++         w[i] = ((uint32_t)block[4*i] << 24) | ((uint32_t)block[4*i+1] << 16) |
++                ((uint32_t)block[4*i+2] << 8) | block[4*i+3];
++      for (i = 16; i < 64; i++)
++         w[i] = w[i-16] + (hb_rotr(w[i-15],7) ^ hb_rotr(w[i-15],18) ^ (w[i-15] >> 3)) +
++                w[i-7] + (hb_rotr(w[i-2],17) ^ hb_rotr(w[i-2],19) ^ (w[i-2] >> 10));
++      a = h[0]; b = h[1]; c = h[2]; d = h[3]; e = h[4]; f = h[5]; g = h[6]; v = h[7];
++      for (i = 0; i < 64; i++) {
++         uint32_t t1 = v + (hb_rotr(e,6) ^ hb_rotr(e,11) ^ hb_rotr(e,25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
++         uint32_t t2 = (hb_rotr(a,2) ^ hb_rotr(a,13) ^ hb_rotr(a,22)) + ((a & b) ^ (a & c) ^ (b & c));
++         v = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++      }
++      h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += v;
++   }
++   for (i = 0; i < 32; i++)
++      out[i] = (uint8_t)(h[i / 4] >> (24 - 8 * (i % 4)));
++}
++
++static bool hb_write_all(int fd, const uint8_t *data, size_t size)
++{
++   size_t at = 0;
++   while (at < size) {
++      ssize_t n = write(fd, data + at, size - at);
++      if (n < 0 && errno == EINTR) continue;
++      if (n <= 0) return false;
++      at += (size_t)n;
++   }
++   return true;
++}
++
++/* 폴더 동기화: '지원 안 함'만 syncfs 로 대신하고 진짜 오류는 실패 */
++static bool hb_sync_dir(const char *path)
++{
++   int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), rc, code;
++   if (fd < 0) return false;
++   rc = fsync(fd);
++   code = errno;
++   if (rc && (code == EINVAL || code == ENOTSUP || code == EOPNOTSUPP || code == ENOSYS)) {
++#ifdef SYS_syncfs
++      rc = (int)syscall(SYS_syncfs, fd);
++#endif
++   }
++   close(fd);
++   return rc == 0;
++}
++
++static bool hb_file_equal(const char *path, const uint8_t *data, size_t size)
++{
++   struct stat st;
++   uint8_t buf[4096];
++   size_t at = 0;
++   int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
++   if (fd < 0) return false;
++   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != (uint64_t)size) {
++      close(fd);
++      return false;
++   }
++   while (at < size) {
++      size_t count = size - at < sizeof(buf) ? size - at : sizeof(buf);
++      ssize_t n = read(fd, buf, count);
++      if (n < 0 && errno == EINTR) continue;
++      if (n <= 0 || memcmp(buf, data + at, (size_t)n)) {
++         close(fd);
++         return false;
++      }
++      at += (size_t)n;
++   }
++   close(fd);
++   return true;
++}
++
++static bool hb_store_path(const char *path, const uint8_t *data, size_t size)
++{
++   char temp[4160], parent[4160], *slash;
++   int fd;
++   bool ok;
++   if (!path || (size_t)snprintf(temp, sizeof(temp), "%s.hbtmp", path) >= sizeof(temp) ||
++       (size_t)snprintf(parent, sizeof(parent), "%s", path) >= sizeof(parent))
++      return false;
++   slash = strrchr(parent, '/');
++   if (!slash || slash == parent) return false;
++   *slash = 0;
++   fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
++   if (fd < 0) return false;
++   ok = hb_write_all(fd, data, size);
++   if (fsync(fd)) ok = false;
++   if (close(fd)) ok = false;
++   if (!ok || !hb_file_equal(temp, data, size)) {
++      /* 덜 쓴 임시 파일은 쓸모가 없다. 원본은 손대지 않았다. */
++      unlink(temp);
++      return false;
++   }
++   if (rename(temp, path))
++      return false;   /* 원본 그대로 + 완전한 새 내용(임시 파일) 보존 */
++   fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++   if (fd < 0) return false;
++   ok = fsync(fd) == 0;
++   close(fd);
++   return ok && hb_file_equal(path, data, size) && hb_sync_dir(parent);
++}
++
++/* 방장 2P 칸(.p2.srm · .p2.sav): 이번 실행에서 처음 바꾸기 전에 지금 파일을 <이름>.bak 으로 한 번 남긴다.
++ * 백업을 못 남기면 바꾸지 않는다. */
++static bool hb_p2_backed_up;
++static bool hb_p2_store(const char *path, const uint8_t *data, size_t size)
++{
++   char backup[4160];
++   if (!hb_p2_backed_up) {
++      struct stat st;
++      int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
++      if (fd >= 0) {
++         uint8_t *old;
++         ssize_t n;
++         size_t at = 0;
++         if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > 262144) {
++            close(fd);
++            return false;
++         }
++         old = (uint8_t *)malloc(st.st_size ? (size_t)st.st_size : 1);
++         if (!old) {
++            close(fd);
++            return false;
++         }
++         while (at < (size_t)st.st_size) {
++            n = read(fd, old + at, (size_t)st.st_size - at);
++            if (n < 0 && errno == EINTR) continue;
++            if (n <= 0) break;
++            at += (size_t)n;
++         }
++         close(fd);
++         if (at != (size_t)st.st_size ||
++             (size_t)snprintf(backup, sizeof(backup), "%s.bak", path) >= sizeof(backup) ||
++             !hb_store_path(backup, old, at)) {
++            free(old);
++            return false;
++         }
++         free(old);
++      } else if (errno != ENOENT) {
++         return false;
++      }
++      hb_p2_backed_up = true;
++   }
++   return hb_store_path(path, data, size);
++}
++#endif
+diff --git a/src/platform/libretro/dual/libretro_dual.c b/src/platform/libretro/dual/libretro_dual.c
+new file mode 100644
+index 000000000000..dff2a791bcee
+--- /dev/null
++++ b/src/platform/libretro/dual/libretro_dual.c
+@@ -0,0 +1,1709 @@
++/* Copyright (c) 2013-2026 Jeffrey Pfau
++ * Copyright (c) 2026 hanbang (mGBA Dual frontend)
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/* mGBA Dual: two GBA instances of the same ROM in ONE libretro core,
++ * connected by mGBA's lockstep SIO driver (link cable).
++ *
++ * - mgba_dual_link is read only at content load (on by default). Off creates
++ *   only player 1, without a link driver, and keeps the normal .srm interface.
++ * - Both cores are stepped cooperatively on one thread: the lockstep user's
++ *   sleep/wake only flip a flag, and retro_run interleaves run-loop slices of
++ *   whichever core is awake until core 0 finishes one video frame (the same
++ *   scheme as tangobattle/mgba-rollback). The whole link is therefore a
++ *   deterministic function of the two joypads, which is exactly what plain
++ *   RetroArch netplay (input sync + rollback) needs.
++ * - Port 0 drives core 0 (player 1 / host), port 1 drives core 1 (player 2 /
++ *   guest). The "mgba_dual_screen" option only picks whose picture and sound
++ *   are output; it never touches emulation state.
++ * - Player 1's save is RETRO_MEMORY_SAVE_RAM (the normal .srm). Player 2's
++ *   save lives in <save dir>/<rom>.p2.srm, written by this core (never in 2P
++ *   mode, where the save belongs to the host).
++ * - retro_serialize stores both cores, both lockstep driver blobs (player 0's
++ *   blob carries the coordinator), both save buffers, and the few pieces of
++ *   state that mGBA's savestate encodes lossily (audio FIFO countdown, DMA
++ *   control), in a fixed-size, zero-filled layout. */
++
++#include "../libretro.h"
++#include "../libretro-audio.h"
++#include "../libretro-vfs.h"
++
++#include <mgba-util/common.h>
++
++#include <stddef.h>
++
++#include <mgba/core/core.h>
++#include <mgba/core/lockstep.h>
++#include <mgba/core/log.h>
++#include <mgba/core/version.h>
++#include <mgba/gba/core.h>
++#include <mgba/gba/interface.h>
++#include <mgba/internal/gba/gba.h>
++#include <mgba/internal/gba/io.h>
++#include <mgba/internal/gba/serialize.h>
++#include <mgba/internal/gba/sio/lockstep.h>
++#include <mgba-util/audio-buffer.h>
++#include <mgba-util/memory.h>
++#include <mgba-util/vfs.h>
++
++#include <stdio.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#ifndef _WIN32
++#include <unistd.h>
++#endif
++
++#define DUAL_PLAYERS 2
++/* 1.4(10/21) = 1.3-os4(4판) + 링크 박자: SD 는 상대가 내리지 않으면 1 · 부모가 전송 중에
++ * 시작 비트 0 을 쓰면 그 전송을 멈춤. 두 대 상태는 판 칸에 DUAL_STATE_LINK14 를 넣어
++ * 1.3 코어가 거절하게 함(판이 섞인 넷플레이가 몰래 어긋나지 않게). */
++/* 1.5(10/21) = 1.4.1 + 짝 게임: 2P 게임기가 다른 판(짝) 롬을 쓸 수 있음. 손님은 /tmp/hb_dual_p2rom,
++ * 방장은 손님 세이브 요청(HBQ4)의 2P 롬. 짝일 때만 상태 판 칸에 DUAL_STATE_PAIR15 + 2P 롬 CRC
++ * (짝이 아니면 상태 · 동작이 1.4.1 과 바이트까지 같음). */
++/* 1.6(10/21) = 1.5 + 싱글팩(팩 하나로 여럿이): 게임별 코어 옵션 mgba_dual_p2_nocart = enabled 이면 2P 게임기를
++ * 팩 없이(롬 없이) 진짜 바이오스로 켬 → 바이오스가 방장(1P)에게서 프로그램을 받아 돌림(멀티부트).
++ * 바이오스를 못 쓰면(파일 없음 · use_bios 꺼짐) 2P 를 팩으로 켜고 기록만 남김. 그때만 상태 판 칸에
++ * DUAL_STATE_NOCART16 — 1.5 이하 · 팩 있는 2P 와는 서로 거절(몰래 어긋나지 않게). 2P 에 팩이 없으니
++ * 손님 세이브는 넣지 않고(받음 확인만) · 2P 칸(.p2.srm) · 손님 되쓰기도 없음. 옵션이 꺼져 있으면(기본) 1.5 와 바이트까지 같음. */
++#define DUAL_VERSION "1.6-os4"
++#define DUAL_WIDTH GBA_VIDEO_HORIZONTAL_PIXELS
++#define DUAL_HEIGHT GBA_VIDEO_VERTICAL_PIXELS
++#define DUAL_AUDIO_CHUNK 1024
++#define DUAL_SAVE_SIZE GBA_SIZE_FLASH1M
++/* Upper bound on run-loop slices per frame; a 2-player link peaks around
++ * 1.6K (mgba-rollback measurement), so this only trips on a broken state. */
++#define DUAL_MAX_SLICES 100000
++/* Fixed RTC (2004-01-01 00:00 UTC + emulated time): netplay peers must agree. */
++#define DUAL_RTC_EPOCH_MS 1072915200000LL
++
++#define DUAL_STATE_MAGIC 0x31444748 /* "HGD1" */
++#define DUAL_STATE_VERSION 1
++#define DUAL_STATE_LINK14 0x100
++/* 1.5: 2P 가 짝 롬인 두 대 상태. 머리 reserved[6] = 2P 롬 CRC. 1.4.1 이하는 이 판 칸을 거절하고,
++ * 1.5 는 짝 여부 · 2P 롬 CRC 가 다른 상태를 거절(서로 다른 짝끼리 몰래 어긋나지 않게). */
++#define DUAL_STATE_PAIR15 0x200
++#define DUAL_PAIR_CRC_AT 24 /* header->reserved 안 바이트 위치 */
++/* 1.6: 2P 가 팩 없이 바이오스로 켜진 두 대 상태. 1.5 이하는 남는 판 칸 때문에 거절하고,
++ * 1.6 은 팩 없음 여부가 다른 상태를 거절. */
++#define DUAL_STATE_NOCART16 0x400
++#include "hb_ownsave.h"
++
++/* Extra memory ids for test harnesses (RetroArch never asks for these). */
++#define DUAL_MEMORY_STATS 0x4844
++#define DUAL_MEMORY_WRAM 0x4810 /* + player */
++#define DUAL_MEMORY_IWRAM 0x4820 /* + player */
++#define DUAL_MEMORY_SAVE 0x4830 /* + player */
++#define DUAL_MEMORY_FRAME 0x4840 /* + player, RGB565 240x160 */
++
++struct DualUser {
++	struct mLockstepUser d;
++	int index;
++};
++
++/* Link diagnostics (not part of the savestate). */
++struct DualStats {
++	uint32_t magic;
++	uint32_t version;
++	uint32_t frames;
++	uint32_t slicesLastFrame;
++	uint32_t slicesMax;
++	uint32_t stalls;
++	struct {
++		int32_t playerId;
++		int32_t mode;
++		uint32_t modeSets;
++		uint32_t starts;
++		uint32_t multiDone;
++		uint32_t multiFromPartner;
++		uint32_t normalDone;
++		uint32_t sleeps;
++		uint32_t frameCounter;
++		uint16_t lastMulti[4];
++		uint32_t lastNormal;
++	} p[DUAL_PLAYERS];
++};
++
++struct DualPlayer {
++	struct mCore* core;
++	struct GBASIOLockstepDriver driver;
++	struct DualUser user;
++	struct mCoreCallbacks callbacks;
++	struct GBASIOLockstepPlayer* link; /* lockstep's own record: link->asleep is the truth */
++	bool saveUpdated;
++	mColor* videoBuffer;
++	mColor* frameBuffer;
++	uint8_t* save;
++	/* Original lockstep driver entry points (wrapped for diagnostics) */
++	void (*setMode)(struct GBASIODriver*, enum GBASIOMode);
++	bool (*start)(struct GBASIODriver*);
++	void (*finishMultiplayer)(struct GBASIODriver*, uint16_t data[4]);
++	uint8_t (*finishNormal8)(struct GBASIODriver*);
++	uint32_t (*finishNormal32)(struct GBASIODriver*);
++};
++
++struct DualExtra {
++	struct {
++		uint32_t fifo[GBA_AUDIO_FIFO_SIZE];
++		int32_t write;
++		int32_t read;
++		int32_t internalRemaining;
++		int32_t reserved;
++	} fifo[2];
++	struct {
++		uint32_t reg;
++		int32_t cycles;
++		int32_t sourceOffset;
++		int32_t destOffset;
++	} dma[4];
++	uint32_t reserved[8];
++};
++
++struct DualStateHeader {
++	uint32_t magic;
++	uint32_t version;
++	uint32_t players;
++	uint32_t coreStateSize;
++	uint32_t driverStateSize;
++	uint32_t saveSize;
++	uint32_t extraSize;
++	uint32_t reserved[9];
++};
++
++static retro_environment_t environCallback;
++static retro_video_refresh_t videoCallback;
++static retro_audio_sample_batch_t audioCallback;
++static retro_input_poll_t inputPollCallback;
++static retro_input_state_t inputCallback;
++static retro_log_printf_t logCallback;
++
++static struct DualPlayer players[DUAL_PLAYERS];
++static struct GBASIOLockstepCoordinator coordinator;
++static struct DualStats stats;
++static struct mLogger logger;
++static struct mLogFilter logFilter;
++static struct LibretroAudioConverter audioConverter;
++static int16_t audioSamples[DUAL_AUDIO_CHUNK * 2];
++static int16_t audioOut[DUAL_AUDIO_CHUNK * 2 * 2];
++static void* romData;
++static size_t romSize;
++static bool gameLoaded;
++static bool linkOn = true;
++static bool useBitmasks;
++static bool renderBoth;
++static int screenPlayer;
++static int screenOption;
++static size_t coreStateSize;
++static size_t driverStateSize;
++static char p2SavePath[PATH_MAX];
++static uint8_t* p2SaveWritten;
++static size_t p2SaveWrittenSize;
++static FILE* traceFile;
++static bool biosLoaded;
++/* 1.5 짝 게임: 2P 게임기 롬(없으면 1P 와 같은 롬) · 2P 를 다시 만들 때 쓰는 켤 때 설정 */
++static void* p2RomData;
++static size_t p2RomSize;
++static uint32_t p2RomCrc;
++static char biosPathSaved[PATH_MAX];
++static bool biosPathValid;
++static struct mCoreOptions optsSaved;
++/* 1.6 싱글팩: 이번 실행에서 2P 게임기가 팩 없이 바이오스로 켜졌는지(켤 때 한 번 정함) */
++static bool p2NoCart;
++
++/* Trace-only netplay check: hashes of the states this core produced (and
++ * received). Loading anything else is a state that came over the network:
++ * one at netplay join, one more for every CRC resync (= a desync). */
++#define DUAL_SEEN_STATES 256
++static uint64_t seenStates[DUAL_SEEN_STATES];
++static unsigned seenNext;
++static unsigned outsideLoads;
++
++static int _activePlayers(void) {
++	return linkOn ? DUAL_PLAYERS : 1;
++}
++
++static const int keymap[] = {
++	RETRO_DEVICE_ID_JOYPAD_A,
++	RETRO_DEVICE_ID_JOYPAD_B,
++	RETRO_DEVICE_ID_JOYPAD_SELECT,
++	RETRO_DEVICE_ID_JOYPAD_START,
++	RETRO_DEVICE_ID_JOYPAD_RIGHT,
++	RETRO_DEVICE_ID_JOYPAD_LEFT,
++	RETRO_DEVICE_ID_JOYPAD_UP,
++	RETRO_DEVICE_ID_JOYPAD_DOWN,
++	RETRO_DEVICE_ID_JOYPAD_R,
++	RETRO_DEVICE_ID_JOYPAD_L,
++};
++
++static void _log(enum retro_log_level level, const char* fmt, ...) {
++	if (!logCallback) {
++		return;
++	}
++	char message[256];
++	va_list args;
++	va_start(args, fmt);
++	vsnprintf(message, sizeof(message), fmt, args);
++	va_end(args);
++	logCallback(level, "[mGBA Dual] %s\n", message);
++}
++
++static void _coreLog(struct mLogger* log, int category, enum mLogLevel level, const char* format, va_list args) {
++	UNUSED(log);
++	char message[160];
++	vsnprintf(message, sizeof(message), format, args);
++	if (traceFile && level == mLOG_DEBUG) {
++		fprintf(traceFile, "f=%u log %s: %s\n", stats.frames, mLogCategoryName(category), message);
++		return;
++	}
++	if (!logCallback) {
++		return;
++	}
++	enum retro_log_level retroLevel = RETRO_LOG_INFO;
++	switch (level) {
++	case mLOG_FATAL:
++	case mLOG_ERROR:
++		retroLevel = RETRO_LOG_ERROR;
++		break;
++	case mLOG_WARN:
++		retroLevel = RETRO_LOG_WARN;
++		break;
++	default:
++		break;
++	}
++	logCallback(retroLevel, "%s: %s\n", mLogCategoryName(category), message);
++}
++
++/* --- lockstep user: cooperative, only flips a flag --- */
++
++/* The lockstep driver force-exits a sleeping core's run slice by itself
++ * (cpu->nextEvent = 0 + GBAInterrupt); retro_run then skips it while
++ * players[i].link->asleep is set. Nothing has to block here. */
++static void _userSleep(struct mLockstepUser* user) {
++	struct DualUser* u = (struct DualUser*) user;
++	++stats.p[u->index].sleeps;
++}
++
++static void _userWake(struct mLockstepUser* user) {
++	UNUSED(user);
++}
++
++static int _userRequestedId(struct mLockstepUser* user) {
++	return ((struct DualUser*) user)->index;
++}
++
++static void _userPlayerIdChanged(struct mLockstepUser* user, int id) {
++	struct DualUser* u = (struct DualUser*) user;
++	stats.p[u->index].playerId = id;
++}
++
++/* --- diagnostic wrappers around the lockstep driver --- */
++
++static int _driverIndex(struct GBASIODriver* driver) {
++	return driver == &players[1].driver.d ? 1 : 0;
++}
++
++static void _wrapSetMode(struct GBASIODriver* driver, enum GBASIOMode mode) {
++	int i = _driverIndex(driver);
++	++stats.p[i].modeSets;
++	stats.p[i].mode = mode;
++	if (traceFile) {
++		fprintf(traceFile, "f=%u p%d mode %d\n", stats.frames, i, (int) mode);
++	}
++	players[i].setMode(driver, mode);
++}
++
++static bool _wrapStart(struct GBASIODriver* driver) {
++	int i = _driverIndex(driver);
++	bool started = players[i].start(driver);
++	if (started) {
++		++stats.p[i].starts;
++		if (traceFile) {
++			const uint16_t* io = ((struct GBA*) players[i].core->board)->memory.io;
++			fprintf(traceFile, "f=%u p%d start send=%04X d8=%02X d32=%04X%04X\n", stats.frames, i,
++			        io[GBA_REG(SIOMLT_SEND)], io[GBA_REG(SIODATA8)] & 0xFF,
++			        io[GBA_REG(SIODATA32_HI)], io[GBA_REG(SIODATA32_LO)]);
++		}
++	}
++	return started;
++}
++
++static void _wrapFinishMultiplayer(struct GBASIODriver* driver, uint16_t data[4]) {
++	int i = _driverIndex(driver);
++	players[i].finishMultiplayer(driver, data);
++	++stats.p[i].multiDone;
++	memcpy(stats.p[i].lastMulti, data, sizeof(stats.p[i].lastMulti));
++	if (data[1 - i] != 0xFFFF) {
++		++stats.p[i].multiFromPartner;
++	}
++	if (traceFile) {
++		fprintf(traceFile, "f=%u p%d multi %04X %04X %04X %04X\n", stats.frames, i, data[0], data[1], data[2], data[3]);
++	}
++}
++
++static uint8_t _wrapFinishNormal8(struct GBASIODriver* driver) {
++	int i = _driverIndex(driver);
++	uint8_t data = players[i].finishNormal8(driver);
++	++stats.p[i].normalDone;
++	stats.p[i].lastNormal = data;
++	if (traceFile) {
++		fprintf(traceFile, "f=%u p%d normal8 %02X\n", stats.frames, i, data);
++	}
++	return data;
++}
++
++static uint32_t _wrapFinishNormal32(struct GBASIODriver* driver) {
++	int i = _driverIndex(driver);
++	uint32_t data = players[i].finishNormal32(driver);
++	++stats.p[i].normalDone;
++	stats.p[i].lastNormal = data;
++	if (traceFile) {
++		fprintf(traceFile, "f=%u p%d normal32 %08X\n", stats.frames, i, data);
++	}
++	return data;
++}
++
++/* --- per-core callbacks --- */
++
++/* Core 1 is not frame-aligned with retro_run: keep its last finished frame */
++static void _frameEnded(void* context) {
++	struct DualPlayer* player = context;
++	if (player == &players[1] && (screenPlayer == 1 || renderBoth)) {
++		memcpy(player->frameBuffer, player->videoBuffer, DUAL_WIDTH * DUAL_HEIGHT * sizeof(mColor));
++	}
++}
++
++static void _savedataUpdated(void* context) {
++	struct DualPlayer* player = context;
++	player->saveUpdated = true;
++}
++
++/* --- options --- */
++
++static const char* _getVariable(const char* key) {
++	struct retro_variable var = { .key = key, .value = NULL };
++	if (environCallback && environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
++		return var.value;
++	}
++	return NULL;
++}
++
++static void _readScreenOption(void) {
++	const char* value = _getVariable("mgba_dual_screen");
++	screenOption = (value && strcmp(value, "2P") == 0) ? 1 : 0;
++}
++
++/* Local presentation policy, deliberately outside all serialized state.
++ * Normal playback: one stat per 30 retro_run calls, open only on change.
++ * Also refresh immediately before an actual 2P save write: a guest switch
++ * during the polling interval must not overwrite the host-owned save. */
++#define HB_SCREEN_FILE "/tmp/hb_dual_screen"
++#define HB_SCREEN_POLL_FRAMES 30
++static int screenFilePlayer = -1;
++static unsigned screenFileCountdown;
++static bool screenFileStatValid;
++static struct stat screenFileStat;
++static int screenFileLogged = -2;
++static int screenLogged = -1;
++
++static void screenFileReset(void)
++{
++   screenFilePlayer = -1;
++   screenFileCountdown = HB_SCREEN_POLL_FRAMES;
++   screenFileStatValid = false;
++   screenFileLogged = -2;
++   screenLogged = -1;
++}
++
++static bool screenFileSame(const struct stat *a, const struct stat *b)
++{
++   return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
++      a->st_mode == b->st_mode && a->st_size == b->st_size &&
++      a->st_mtime == b->st_mtime && a->st_ctime == b->st_ctime
++#if defined(__linux__)
++      && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec
++      && a->st_ctim.tv_nsec == b->st_ctim.tv_nsec
++#elif defined(__APPLE__)
++      && a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec
++      && a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec
++#endif
++      ;
++}
++
++static void screenFileRefresh(void)
++{
++   struct stat st;
++   FILE *file;
++   char data[5];
++   size_t size;
++   int fd;
++   if (!linkOn)
++      return;
++   if (stat(HB_SCREEN_FILE, &st) != 0)
++   {
++      screenFilePlayer = -1;
++      screenFileStatValid = false;
++      return;
++   }
++   if (screenFileStatValid && screenFileSame(&st, &screenFileStat))
++      return;
++   screenFileStat = st;
++   screenFileStatValid = true;
++   screenFilePlayer = -1;
++   if (!S_ISREG(st.st_mode) || st.st_size < 2 || st.st_size > 4)
++      return;
++   /* O_NONBLOCK also avoids hanging if a regular file becomes a FIFO
++    * between stat and open. Failed reads are retried at the next poll. */
++   fd = open(HB_SCREEN_FILE, O_RDONLY | O_NONBLOCK);
++   if (fd < 0)
++   {
++      screenFileStatValid = false;
++      return;
++   }
++   file = fdopen(fd, "rb");
++   if (!file)
++   {
++      close(fd);
++      screenFileStatValid = false;
++      return;
++   }
++   size = fread(data, 1, sizeof(data), file);
++   if (ferror(file))
++      screenFileStatValid = false;
++   else if ((size == 2 || (size == 3 && data[2] == '\n') ||
++            (size == 4 && data[2] == '\r' && data[3] == '\n')) &&
++            data[1] == 'P' && (data[0] == '1' || data[0] == '2'))
++      screenFilePlayer = data[0] - '1';
++   fclose(file);
++}
++
++static void screenFileTick(void)
++{
++   if (linkOn && --screenFileCountdown == 0)
++   {
++      screenFileCountdown = HB_SCREEN_POLL_FRAMES;
++      screenFileRefresh();
++   }
++}
++
++static int selectedScreen(void)
++{
++   return linkOn ? (screenFilePlayer >= 0 ? screenFilePlayer : screenOption) : 0;
++}
++
++static void _applyScreen(void) {
++	int newScreen = selectedScreen();
++	if (newScreen != screenPlayer && gameLoaded) {
++		/* Presentation buffers only; these are not part of emulation state. */
++		mAudioBufferClear(players[newScreen].core->getAudioBuffer(players[newScreen].core));
++		audioConverterReset(&audioConverter, players[newScreen].core->audioSampleRate(players[newScreen].core));
++		memcpy(players[newScreen].frameBuffer, players[newScreen].videoBuffer, DUAL_WIDTH * DUAL_HEIGHT * sizeof(mColor));
++	}
++	screenPlayer = newScreen;
++	if (newScreen != screenLogged || screenFilePlayer != screenFileLogged) {
++		_log(RETRO_LOG_INFO, "screen %dP (%s)", newScreen + 1,
++		     !linkOn ? "link off" : screenFilePlayer >= 0 ? HB_SCREEN_FILE : "core option");
++	}
++	screenLogged = newScreen;
++	screenFileLogged = screenFilePlayer;
++}
++
++/* --- player 2 save file (.p2.srm) --- */
++
++static size_t _saveSize(int i) {
++	struct GBA* gba = players[i].core->board;
++	if (gba->memory.savedata.type == GBA_SAVEDATA_AUTODETECT) {
++		return DUAL_SAVE_SIZE;
++	}
++	return GBASavedataSize(&gba->memory.savedata);
++}
++
++static void _loadP2Save(void) {
++	memset(players[1].save, 0xFF, DUAL_SAVE_SIZE);
++	if (!p2SavePath[0]) {
++		return;
++	}
++	FILE* f = fopen(p2SavePath, "rb");
++	if (!f) {
++		_log(RETRO_LOG_INFO, "no 2P save yet: %s", p2SavePath);
++		return;
++	}
++	size_t got = fread(players[1].save, 1, DUAL_SAVE_SIZE, f);
++	fclose(f);
++	_log(RETRO_LOG_INFO, "2P save loaded (%u bytes): %s", (unsigned) got, p2SavePath);
++	p2SaveWrittenSize = got;
++	memcpy(p2SaveWritten, players[1].save, DUAL_SAVE_SIZE);
++}
++
++static void _writeP2Save(bool force) {
++	if (!linkOn || !p2SavePath[0]) {
++		/* 2P (guest) mode: the 2P save belongs to the host device */
++		return;
++	}
++	/* 손님 역할이면(화면 선택과 상관없이) 2P 칸은 방장 기기 것 — 쓰지 않음 */
++	if (hb_own_guest) {
++		return;
++	}
++	/* 손님 자기 세이브가 든 2P: 방장의 2P 칸을 손님 세이브로 바꾸지 않음(손님 기기가 자기 것으로 되씀) */
++	if (hb_own_applied || hb_has_token()) {
++		if (!hb_own_p2_skip_logged) {
++			hb_own_p2_skip_logged = true;
++			_log(RETRO_LOG_INFO, "손님 세이브가 든 2P — 방장 2P 칸은 그대로: %s", p2SavePath);
++		}
++		return;
++	}
++	size_t size = _saveSize(1);
++	if (!force && size == p2SaveWrittenSize && !memcmp(p2SaveWritten, players[1].save, size)) {
++		return;
++	}
++	if (p2SaveWrittenSize == 0) {
++		/* Nothing on disk yet: only create the file once the game wrote something */
++		size_t i;
++		for (i = 0; i < size && players[1].save[i] == 0xFF; ++i);
++		if (i == size) {
++			return;
++		}
++	}
++	screenFileRefresh();
++	if (selectedScreen() == 1) {
++		return;
++	}
++	/* 처음 바꾸기 전 지금 파일을 .bak 으로 한 번 · 임시 파일 확인 뒤 이름 바꾸기.
++	 * 실패하면 원본을 열어 잘라 쓰지 않고 그대로 둔다(다음 저장 때 다시). */
++	if (!hb_p2_store(p2SavePath, players[1].save, size)) {
++		_log(RETRO_LOG_ERROR, "2P save write failed (original kept): %s", p2SavePath);
++		return;
++	}
++	memcpy(p2SaveWritten, players[1].save, size);
++	p2SaveWrittenSize = size;
++	_log(RETRO_LOG_INFO, "2P save written (%u bytes): %s", (unsigned) size, p2SavePath);
++}
++
++static void _setP2SavePath(const struct retro_game_info* game) {
++	p2SavePath[0] = '\0';
++	if (!game->path || !game->path[0]) {
++		return;
++	}
++	const char* base = strrchr(game->path, '/');
++#ifdef _WIN32
++	const char* base2 = strrchr(game->path, '\\');
++	if (base2 > base) {
++		base = base2;
++	}
++#endif
++	base = base ? base + 1 : game->path;
++	char name[PATH_MAX];
++	/* RetroArch names saves after the file inside an archive ("x.zip#y.gba" -> "y") */
++	const char* inner = NULL;
++	const char* hash;
++	for (hash = strchr(base, '#'); hash; hash = strchr(hash + 1, '#')) {
++		size_t at = hash - base;
++		if ((at >= 4 && (!strncasecmp(hash - 4, ".zip", 4) || !strncasecmp(hash - 4, ".apk", 4))) ||
++		    (at >= 3 && !strncasecmp(hash - 3, ".7z", 3))) {
++			inner = hash + 1;
++			break;
++		}
++	}
++	snprintf(name, sizeof(name), "%s", inner && inner[0] ? inner : base);
++	char* dot = strrchr(name, '.');
++	if (dot && dot != name) {
++		*dot = '\0';
++	}
++	const char* dir = NULL;
++	char romDir[PATH_MAX];
++	if (!environCallback(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &dir) || !dir || !dir[0]) {
++		snprintf(romDir, sizeof(romDir), "%.*s", (int) (base - game->path), game->path);
++		dir = romDir;
++	}
++	size_t len = strlen(dir);
++	int written = snprintf(p2SavePath, sizeof(p2SavePath), "%s%s%s.p2.srm", dir, (len && dir[len - 1] != '/') ? "/" : "", name);
++	if (written < 0 || (size_t) written >= sizeof(p2SavePath)) {
++		_log(RETRO_LOG_ERROR, "2P save path too long, 2P save disabled");
++		p2SavePath[0] = '\0';
++	}
++}
++
++/* --- libretro API --- */
++
++unsigned retro_api_version(void) {
++	return RETRO_API_VERSION;
++}
++
++void retro_set_environment(retro_environment_t env) {
++	environCallback = env;
++	libretroVFSInit(env);
++	static const struct retro_variable vars[] = {
++		{ "mgba_dual_link", "Link cable (restart content required); on|off" },
++		{ "mgba_dual_screen", "Screen and sound (host/solo = 1P, guest = 2P); 1P|2P" },
++		{ "mgba_dual_use_bios", "Use BIOS file if found (same on both devices); ON|OFF" },
++		{ "mgba_dual_skip_bios", "Skip BIOS intro (same on both devices); OFF|ON" },
++		/* 1.6 싱글팩: 게임별 .opt 로만 켬(두 기기 같은 값) — 켤 때 한 번 읽음 */
++		{ "mgba_dual_p2_nocart", "2P without cartridge, single-pak link (restart content, same on both devices); disabled|enabled" },
++		{ NULL, NULL },
++	};
++	env(RETRO_ENVIRONMENT_SET_VARIABLES, (void*) vars);
++}
++
++void retro_set_video_refresh(retro_video_refresh_t video) {
++	videoCallback = video;
++}
++
++void retro_set_audio_sample(retro_audio_sample_t audio) {
++	UNUSED(audio);
++}
++
++void retro_set_audio_sample_batch(retro_audio_sample_batch_t audioBatch) {
++	audioCallback = audioBatch;
++}
++
++void retro_set_input_poll(retro_input_poll_t inputPoll) {
++	inputPollCallback = inputPoll;
++}
++
++void retro_set_input_state(retro_input_state_t input) {
++	inputCallback = input;
++}
++
++void retro_get_system_info(struct retro_system_info* info) {
++	info->need_fullpath = false;
++	info->valid_extensions = "gba";
++	info->library_version = DUAL_VERSION " (mGBA 7a12d6d4)";
++	/* 넷플레이 버전 칸은 끝 문자 포함 32바이트 — 넘으면 빌드가 멈춤 */
++	typedef char hb_version_fits_netplay[(sizeof(DUAL_VERSION " (mGBA 7a12d6d4)") <= 32) ? 1 : -1];
++	(void)sizeof(hb_version_fits_netplay);
++	info->library_name = "mGBA Dual";
++	info->block_extract = false;
++}
++
++void retro_get_system_av_info(struct retro_system_av_info* info) {
++	info->geometry.base_width = DUAL_WIDTH;
++	info->geometry.base_height = DUAL_HEIGHT;
++	info->geometry.max_width = DUAL_WIDTH;
++	info->geometry.max_height = DUAL_HEIGHT;
++	info->geometry.aspect_ratio = DUAL_WIDTH / (double) DUAL_HEIGHT;
++	info->timing.fps = GBA_ARM7TDMI_FREQUENCY / (double) VIDEO_TOTAL_LENGTH;
++	info->timing.sample_rate = GBA_OUTPUT_RATE;
++}
++
++void retro_init(void) {
++	enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
++	environCallback(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
++
++#define DESC(PORT, ID, NAME) { PORT, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_ ## ID, NAME }
++#define PORT_DESCS(PORT) \
++	DESC(PORT, A, "A"), DESC(PORT, B, "B"), DESC(PORT, SELECT, "Select"), DESC(PORT, START, "Start"), \
++	DESC(PORT, RIGHT, "Right"), DESC(PORT, LEFT, "Left"), DESC(PORT, UP, "Up"), DESC(PORT, DOWN, "Down"), \
++	DESC(PORT, R, "R"), DESC(PORT, L, "L")
++	struct retro_input_descriptor inputDescriptors[] = {
++		PORT_DESCS(0),
++		PORT_DESCS(1),
++		{ 0 }
++	};
++#undef PORT_DESCS
++#undef DESC
++	environCallback(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, &inputDescriptors);
++	useBitmasks = environCallback(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL);
++
++	struct retro_log_callback log;
++	logCallback = environCallback(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log) ? log.log : NULL;
++
++	mLogFilterInit(&logFilter);
++	logFilter.defaultLevels = mLOG_FATAL | mLOG_ERROR | mLOG_WARN;
++	const char* trace = getenv("MGBA_DUAL_TRACE");
++	if (trace && trace[0]) {
++		traceFile = fopen(trace, "w");
++		if (traceFile) {
++			mLogFilterSet(&logFilter, "gba.sio", mLOG_FATAL | mLOG_ERROR | mLOG_WARN | mLOG_DEBUG);
++		}
++	}
++	const char* both = getenv("MGBA_DUAL_RENDER_BOTH");
++	renderBoth = both && both[0] == '1';
++	logger.log = _coreLog;
++	logger.filter = &logFilter;
++	mLogSetDefaultLogger(&logger);
++}
++
++void retro_deinit(void) {
++	hb_own_deinit();
++	mLogSetDefaultLogger(NULL);
++	if (traceFile) {
++		fclose(traceFile);
++		traceFile = NULL;
++	}
++	mLogFilterDeinit(&logFilter);
++}
++
++static bool _setupPlayer(int i, const char* biosPath, const struct mCoreOptions* opts) {
++	struct DualPlayer* player = &players[i];
++	struct mCore* core = GBACoreCreate();
++	if (!core) {
++		return false;
++	}
++	player->core = core;
++	mCoreInitConfig(core, NULL);
++	core->init(core);
++	mCoreConfigLoadDefaults(&core->config, opts);
++	mCoreConfigSetDefaultValue(&core->config, "idleOptimization", "remove");
++	mCoreLoadConfig(core);
++
++	player->videoBuffer = calloc(DUAL_WIDTH * DUAL_HEIGHT, sizeof(mColor));
++	player->frameBuffer = calloc(DUAL_WIDTH * DUAL_HEIGHT, sizeof(mColor));
++	player->save = anonymousMemoryMap(DUAL_SAVE_SIZE);
++	if (!player->videoBuffer || !player->frameBuffer || !player->save) {
++		return false;
++	}
++	memset(player->save, 0xFF, DUAL_SAVE_SIZE);
++	core->setVideoBuffer(core, player->videoBuffer, DUAL_WIDTH);
++
++	/* 1.6 싱글팩: 2P 는 팩(롬) 없이 진짜 바이오스로. 바이오스를 먼저 넣어 보고, 못 넣으면 팩으로 켬(기록만).
++	 * 롬을 안 넣으면 mGBA 의 카트 자리는 실제 GBA 처럼 열린 버스(롬 크기 0)이고, 롬 영역 쓰기는 무시됨. */
++	bool noCart = i == 1 && p2NoCart;
++	if (noCart) {
++		struct VFile* bios = biosPath && opts->useBios ? VFileOpen(biosPath, O_RDONLY) : NULL;
++		if (bios && core->loadBIOS(core, bios, 0) && ((struct GBA*) core->board)->memory.fullBios) {
++			biosLoaded = true;
++		} else {
++			if (bios && !((struct GBA*) core->board)->biosVf) {
++				bios->close(bios);
++			}
++			_log(RETRO_LOG_WARN, "2P 팩 없음: 바이오스를 못 넣음 — 2P 를 팩으로 켬(싱글팩 같이하기 안 됨)");
++			p2NoCart = false;
++			noCart = false;
++		}
++	}
++	if (!noCart) {
++		/* Both cores read the same ROM image; mGBA copies on write if a game ever writes ROM
++		 * (1.5: 짝 게임이면 2P 만 짝 롬) */
++		struct VFile* rom = (i == 1 && p2RomData) ? VFileFromMemory(p2RomData, p2RomSize) : VFileFromMemory(romData, romSize);
++		if (!rom || !core->loadROM(core, rom)) {
++			return false;
++		}
++		if (biosPath && opts->useBios) {
++			struct VFile* bios = VFileOpen(biosPath, O_RDONLY);
++			if (bios && core->loadBIOS(core, bios, 0)) {
++				biosLoaded = true;
++			} else if (bios) {
++				bios->close(bios);
++			}
++		}
++	}
++	core->rtc.override = RTC_FAKE_EPOCH;
++	core->rtc.value = DUAL_RTC_EPOCH_MS;
++
++	player->callbacks.context = player;
++	player->callbacks.videoFrameEnded = _frameEnded;
++	player->callbacks.savedataUpdated = _savedataUpdated;
++	core->addCoreCallbacks(core, &player->callbacks);
++
++	if (linkOn) {
++		/* Link cable: cooperative lockstep user + driver, wrapped for diagnostics */
++		player->user.index = i;
++		player->user.d.sleep = _userSleep;
++		player->user.d.wake = _userWake;
++		player->user.d.requestedId = _userRequestedId;
++		player->user.d.playerIdChanged = _userPlayerIdChanged;
++		GBASIOLockstepDriverCreate(&player->driver, &player->user.d);
++		player->setMode = player->driver.d.setMode;
++		player->start = player->driver.d.start;
++		player->finishMultiplayer = player->driver.d.finishMultiplayer;
++		player->finishNormal8 = player->driver.d.finishNormal8;
++		player->finishNormal32 = player->driver.d.finishNormal32;
++		player->driver.d.setMode = _wrapSetMode;
++		player->driver.d.start = _wrapStart;
++		player->driver.d.finishMultiplayer = _wrapFinishMultiplayer;
++		player->driver.d.finishNormal8 = _wrapFinishNormal8;
++		player->driver.d.finishNormal32 = _wrapFinishNormal32;
++		GBASIOLockstepCoordinatorAttach(&coordinator, &player->driver);
++		core->setPeripheral(core, mPERIPH_GBA_LINK_PORT, &player->driver.d);
++		player->link = TableLookup(&coordinator.players, player->driver.lockstepId);
++		if (!player->link) {
++			return false;
++		}
++	}
++
++	/* Same order as mgba-rollback: attach, then reset, one core after the other */
++	core->reset(core);
++	if (i == 1 && p2RomData && !((struct GBA*) core->board)->memory.biosPrefetch) {
++		/* 1.5 짝 게임: 게임 중에 새로 만든 2P 는 BIOS 열린 버스 값이 0 인데, mGBA 는 상태의 이 칸이 0 이면
++		 * 읽지 않고 지금 값을 둔다(serialize.c). 그대로면 막 만든 2P 상태로 되감을 때 앞 값이 남아 어긋남
++		 * → 실제 GBA 가 켜진 뒤의 값으로 둠(짝이 아니면 이 줄을 지나지 않음) */
++		((struct GBA*) core->board)->memory.biosPrefetch = 0xE129F000;
++	}
++	if (noCart && !((struct GBA*) core->board)->memory.biosPrefetch) {
++		/* 1.6 싱글팩: 팩 없는 2P 는 바이오스 안에서만 돌다가(받기 끝날 때까지) 처음 바이오스를 벗어날 때
++		 * 이 값이 정해짐. 0 인 상태로 되감으면 mGBA 가 읽지 않고 지금 값을 둠(serialize.c) → 1.5 짝 게임과 같은
++		 * 까닭으로 상태 대조가 어긋남. 켜진 뒤의 값으로 둠(바이오스 안에서는 이 값을 읽는 일이 없어 동작은 같음). */
++		((struct GBA*) core->board)->memory.biosPrefetch = 0xE129F000;
++	}
++	struct VFile* save = VFileFromMemory(player->save, DUAL_SAVE_SIZE);
++	if (!save || !core->loadSave(core, save)) {
++		return false;
++	}
++	if (noCart) {
++		/* 팩이 없으니 세이브 칩도 없음(세이브 영역 읽기 = 0xFF, 쓰기 무시) — 2P 세이브는 늘 비어 있음 */
++		GBASavedataForceType(&((struct GBA*) core->board)->memory.savedata, GBA_SAVEDATA_FORCE_NONE);
++	}
++	return true;
++}
++
++static void _freePlayers(void) {
++	int i;
++	for (i = DUAL_PLAYERS - 1; i >= 0; --i) {
++		struct DualPlayer* player = &players[i];
++		if (player->core) {
++			mCoreConfigDeinit(&player->core->config);
++			player->core->deinit(player->core);
++			player->core = NULL;
++		}
++		free(player->videoBuffer);
++		free(player->frameBuffer);
++		if (player->save) {
++			mappedMemoryFree(player->save, DUAL_SAVE_SIZE);
++		}
++		memset(player, 0, sizeof(*player));
++	}
++	GBASIOLockstepCoordinatorDeinit(&coordinator);
++	if (romData) {
++		mappedMemoryFree(romData, romSize);
++		romData = NULL;
++	}
++	if (p2SaveWritten) {
++		mappedMemoryFree(p2SaveWritten, DUAL_SAVE_SIZE);
++		p2SaveWritten = NULL;
++	}
++	if (p2RomData) {
++		mappedMemoryFree(p2RomData, p2RomSize);
++		p2RomData = NULL;
++	}
++	p2RomSize = 0;
++	p2RomCrc = 0;
++	hb_pair_on = false;
++	p2NoCart = false;
++	hb_nocart = false;
++}
++
++/* 1.5 손님: /tmp/hb_dual_p2rom(한 줄 = 2P 롬 경로, ZIP 이면 안의 .gba 하나)이 있으면 2P 게임기에 그 롬.
++ * 손님 도우미(hb_joinask)가 방장 받음 확인 뒤 막 쓴 파일만: 실행 명령에 --connect · 180초 안. */
++#define HB_P2ROM_FILE "/tmp/hb_dual_p2rom"
++#define HB_P2ROM_AGE 180
++static void _p2RomFromFile(void) {
++	struct stat st;
++	char line[1100];
++	if (stat(HB_P2ROM_FILE, &st) != 0) {
++		return;
++	}
++	if (!hb_launched_as_guest()) {
++		_log(RETRO_LOG_INFO, "2P 짝 롬 파일이 있지만 넷플레이 손님(--connect)이 아님 — 무시");
++		return;
++	}
++	long long age = (long long) time(NULL) - (long long) st.st_mtime;
++	if (!S_ISREG(st.st_mode) || st.st_size < 2 || st.st_size >= (off_t) sizeof(line) || age < -5 || age > HB_P2ROM_AGE) {
++		_log(RETRO_LOG_WARN, "2P 짝 롬 파일 형식 오류 · 오래됨(%lld초) — 무시", age);
++		return;
++	}
++	int fd = open(HB_P2ROM_FILE, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++	if (fd < 0) {
++		return;
++	}
++	ssize_t n = read(fd, line, sizeof(line) - 1);
++	close(fd);
++	if (n < 2) {
++		return;
++	}
++	line[n] = '\0';
++	if (line[n - 1] == '\n') {
++		line[--n] = '\0';
++		if (n && line[n - 1] == '\r') {
++			line[--n] = '\0';
++		}
++	}
++	if (n < 2 || line[0] != '/' || strlen(line) != (size_t) n || strchr(line, '\n') || strchr(line, '\r')) {
++		_log(RETRO_LOG_WARN, "2P 짝 롬 파일 내용 오류 — 무시");
++		return;
++	}
++	const char* why = "";
++	size_t size = 0;
++	uint32_t crc = 0;
++	void* rom = hb_rom_load(line, &size, &crc, &why);
++	if (!rom) {
++		_log(RETRO_LOG_ERROR, "2P 짝 롬을 못 읽음(%s): %s — 같은 롬으로 켬(방장 짝 상태는 거절됨)", why, line);
++		return;
++	}
++	if (crc == (uint32_t) crc32(0L, (const Bytef*) romData, (uInt) romSize)) {
++		_log(RETRO_LOG_INFO, "2P 짝 롬이 1P 와 같은 롬 — 보통 두 대로 켬: %s", line);
++		mappedMemoryFree(rom, size);
++		return;
++	}
++	p2RomData = rom;
++	p2RomSize = size;
++	p2RomCrc = crc;
++	_log(RETRO_LOG_INFO, "2P 짝 롬: %s (CRC %08x, %u 바이트)", line, (unsigned) crc, (unsigned) size);
++}
++
++
++/* 1P의 CPU와 저장은 그대로 두고 케이블과 2P 전원만 다시 켠다. */
++static bool _ownSaveApply(const uint8_t* data, size_t size) {
++    int i;
++    if (!linkOn || size > DUAL_SAVE_SIZE) return false;
++    if (size && size != 512 && size != 8192 && size != 32768 &&
++        size != 65536 && size != 131072) return false;
++    for (i = 0; i < 2; i++) {
++        struct GBA* gba = players[i].core->board;
++        players[i].core->setPeripheral(players[i].core, mPERIPH_GBA_LINK_PORT, NULL);
++        mTimingDeschedule(&gba->timing, &gba->sio.completeEvent);
++        gba->sio.siocnt &= ~0x80;
++        gba->memory.io[GBA_REG_SIOCNT >> 1] = gba->sio.siocnt;
++    }
++    GBASIOLockstepCoordinatorDeinit(&coordinator);
++    GBASIOLockstepCoordinatorInit(&coordinator);
++    memset(players[1].save, 0xFF, DUAL_SAVE_SIZE);
++    memcpy(players[1].save, data, size);
++    players[1].core->reset(players[1].core);
++    for (i = 0; i < 2; i++) {
++        players[i].driver.lockstepId = 0;
++        GBASIOLockstepCoordinatorAttach(&coordinator, &players[i].driver);
++        players[i].core->setPeripheral(players[i].core, mPERIPH_GBA_LINK_PORT, &players[i].driver.d);
++        players[i].link = TableLookup(&coordinator.players, players[i].driver.lockstepId);
++    }
++    players[1].saveUpdated = false;
++    memset(players[1].frameBuffer, 0, DUAL_WIDTH * DUAL_HEIGHT * sizeof(mColor));
++    _log(RETRO_LOG_INFO, "손님 자기 세이브 받음: %u 바이트, 2P 전원과 케이블 초기화", (unsigned)size);
++    return true;
++}
++
++static void _freePlayer(int i) {
++	struct DualPlayer* player = &players[i];
++	if (player->core) {
++		mCoreConfigDeinit(&player->core->config);
++		player->core->deinit(player->core);
++	}
++	free(player->videoBuffer);
++	free(player->frameBuffer);
++	if (player->save) {
++		mappedMemoryFree(player->save, DUAL_SAVE_SIZE);
++	}
++	memset(player, 0, sizeof(*player));
++}
++
++/* 1.5 방장 짝 게임: 1P 의 CPU · 저장은 그대로, 2P 게임기를 짝 롬으로 처음부터 다시 만들고(손님 기기가
++ * 켤 때 만드는 것과 같은 _setupPlayer) 손님 세이브를 넣는다. 성공하면 rom 은 코어 것. */
++static bool _ownSaveApplyPair(const uint8_t* data, size_t size, void* rom, size_t romBytes, uint32_t crc) {
++	int i;
++	if (!linkOn || size > DUAL_SAVE_SIZE || !rom || !romBytes) {
++		return false;
++	}
++	if (size && size != 512 && size != 8192 && size != 32768 && size != 65536 && size != 131072) {
++		return false;
++	}
++	struct VFile* probe = VFileFromMemory(rom, romBytes);
++	bool isRom = probe && GBAIsROM(probe);
++	if (probe) {
++		probe->close(probe);
++	}
++	if (!isRom) {
++		_log(RETRO_LOG_ERROR, "짝 롬이 GBA 롬이 아님 — 2P 그대로");
++		return false;
++	}
++	for (i = 0; i < 2; i++) {
++		struct GBA* gba = players[i].core->board;
++		players[i].core->setPeripheral(players[i].core, mPERIPH_GBA_LINK_PORT, NULL);
++		mTimingDeschedule(&gba->timing, &gba->sio.completeEvent);
++		gba->sio.siocnt &= ~0x80;
++		gba->memory.io[GBA_REG_SIOCNT >> 1] = gba->sio.siocnt;
++	}
++	GBASIOLockstepCoordinatorDeinit(&coordinator);
++	GBASIOLockstepCoordinatorInit(&coordinator);
++	_freePlayer(1);
++	void* oldRom = p2RomData;
++	size_t oldRomSize = p2RomSize;
++	p2RomData = rom;
++	p2RomSize = romBytes;
++	/* 켤 때와 같은 순서: 1P 케이블 먼저, 그다음 2P 를 만들며 케이블 */
++	players[0].driver.lockstepId = 0;
++	GBASIOLockstepCoordinatorAttach(&coordinator, &players[0].driver);
++	players[0].core->setPeripheral(players[0].core, mPERIPH_GBA_LINK_PORT, &players[0].driver.d);
++	players[0].link = TableLookup(&coordinator.players, players[0].driver.lockstepId);
++	bool ok = _setupPlayer(1, biosPathValid ? biosPathSaved : NULL, &optsSaved);
++	if (!ok) {
++		/* 거의 없는 일(메모리 부족): 2P 를 원래 롬으로 다시 만들어 코어는 계속 돌게 */
++		_log(RETRO_LOG_ERROR, "짝 롬으로 2P 게임기를 못 켬 — 원래 롬으로 되돌림");
++		if (players[1].core) {
++			players[1].core->setPeripheral(players[1].core, mPERIPH_GBA_LINK_PORT, NULL);
++		}
++		_freePlayer(1);
++		players[0].core->setPeripheral(players[0].core, mPERIPH_GBA_LINK_PORT, NULL);
++		GBASIOLockstepCoordinatorDeinit(&coordinator);
++		GBASIOLockstepCoordinatorInit(&coordinator);
++		players[0].driver.lockstepId = 0;
++		GBASIOLockstepCoordinatorAttach(&coordinator, &players[0].driver);
++		players[0].core->setPeripheral(players[0].core, mPERIPH_GBA_LINK_PORT, &players[0].driver.d);
++		players[0].link = TableLookup(&coordinator.players, players[0].driver.lockstepId);
++		p2RomData = oldRom;
++		p2RomSize = oldRomSize;
++		if (!_setupPlayer(1, biosPathValid ? biosPathSaved : NULL, &optsSaved)) {
++			_log(RETRO_LOG_ERROR, "2P 게임기를 다시 켜지 못함");
++		}
++		return false;
++	}
++	if (oldRom) {
++		mappedMemoryFree(oldRom, oldRomSize);
++	}
++	p2RomCrc = crc;
++	memcpy(players[1].save, data, size);
++	players[1].saveUpdated = false;
++	/* 방장 2P 칸(<1P 롬>.p2.srm)은 이 판에서 읽지도 쓰지도 않음(2P 가 다른 게임) */
++	p2SavePath[0] = '\0';
++	hb_pair_on = true;
++	hb_pair_crc = crc;
++	hb_own_p2crc = crc;
++	_log(RETRO_LOG_INFO, "짝 게임: 2P 롬 바꿈(CRC %08x, %u 바이트) · 손님 세이브 %u 바이트 · 2P 처음부터",
++	     (unsigned) crc, (unsigned) romBytes, (unsigned) size);
++	return true;
++}
++
++bool retro_load_game(const struct retro_game_info* game) {
++	if (!game || !game->data || !game->size) {
++		_log(RETRO_LOG_ERROR, "needs the ROM in memory");
++		return false;
++	}
++	memset(players, 0, sizeof(players));
++	memset(&stats, 0, sizeof(stats));
++	memset(seenStates, 0, sizeof(seenStates));
++	seenNext = 0;
++	outsideLoads = 0;
++	biosLoaded = false;
++	stats.magic = 0x54534448; /* "HDST" */
++	stats.version = 1;
++	stats.p[0].playerId = -1;
++	stats.p[1].playerId = -1;
++
++	romSize = game->size;
++	romData = anonymousMemoryMap(romSize);
++	if (!romData) {
++		return false;
++	}
++	memcpy(romData, game->data, romSize);
++
++	struct mCoreOptions opts = {
++		.useBios = true,
++		.skipBios = false,
++		.volume = 0x100,
++	};
++	const char* value = _getVariable("mgba_dual_use_bios");
++	if (value) {
++		opts.useBios = strcmp(value, "ON") == 0;
++	}
++	value = _getVariable("mgba_dual_skip_bios");
++	if (value) {
++		opts.skipBios = strcmp(value, "ON") == 0;
++	}
++	value = _getVariable("mgba_dual_link");
++	linkOn = !(value && strcmp(value, "off") == 0);
++	_readScreenOption();
++	screenFileReset();
++	screenFileRefresh();
++	_applyScreen();
++
++	const char* sysDir = NULL;
++	char biosPath[PATH_MAX];
++	const char* bios = NULL;
++	if (environCallback(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &sysDir) && sysDir) {
++		snprintf(biosPath, sizeof(biosPath), "%s%s%s", sysDir, PATH_SEP, "gba_bios.bin");
++		bios = biosPath;
++	}
++
++	/* 1.5: 2P 를 다시 만들 때(짝 게임 방장) 켤 때와 같은 바이오스 · 설정을 쓰도록 남겨 둠 */
++	biosPathValid = bios != NULL;
++	snprintf(biosPathSaved, sizeof(biosPathSaved), "%s", bios ? bios : "");
++	optsSaved = opts;
++	hb_pair_on = false;
++	hb_logger = _log;
++	/* 1.6 싱글팩: 켤 때 한 번(게임별 .opt). 케이블이 켜져 있고 바이오스를 쓸 수 있을 때만 — 아니면 기록만 */
++	p2NoCart = false;
++	value = _getVariable("mgba_dual_p2_nocart");
++	if (value && strcmp(value, "enabled") == 0) {
++		if (!linkOn) {
++			_log(RETRO_LOG_INFO, "2P 팩 없음 옵션: 케이블 꺼짐(혼자) — 쓰지 않음");
++		} else if (!bios || !opts.useBios) {
++			_log(RETRO_LOG_WARN, "2P 팩 없음 옵션: 바이오스 %s — 2P 를 팩으로 켬(싱글팩 같이하기 안 됨)",
++			     opts.useBios ? "폴더 없음" : "끔(mgba_dual_use_bios)");
++		} else {
++			p2NoCart = true;
++		}
++	}
++	hb_nocart = false;
++	if (linkOn && !p2NoCart) {
++		_p2RomFromFile();
++	}
++
++	GBASIOLockstepCoordinatorInit(&coordinator);
++	p2SaveWritten = linkOn ? anonymousMemoryMap(DUAL_SAVE_SIZE) : NULL;
++	if (linkOn && !p2SaveWritten) {
++		_freePlayers();
++		return false;
++	}
++	p2SaveWrittenSize = 0;
++	int i;
++	for (i = 0; i < _activePlayers(); ++i) {
++		if (!_setupPlayer(i, bios, &opts)) {
++			_log(RETRO_LOG_ERROR, "could not set up GBA #%d", i + 1);
++			_freePlayers();
++			return false;
++		}
++	}
++	hb_pair_on = p2RomData != NULL;
++	hb_pair_crc = p2RomCrc;
++	/* 1.6: 2P 를 실제로 팩 없이 켰을 때만(바이오스를 못 넣어 팩으로 켰으면 보통 두 대) */
++	hb_nocart = linkOn && p2NoCart;
++	hb_own_init(game->data, game->size, 1, linkOn ? DUAL_SAVE_SIZE : 0);
++	p2SavePath[0] = '\0';
++	if (linkOn) {
++		_setP2SavePath(game);
++		if (p2NoCart) {
++			/* 싱글팩: 2P 에 팩(세이브)이 없음 — 2P 칸(<롬>.p2.srm)은 읽지도 쓰지도 않음 */
++			p2SavePath[0] = '\0';
++			_log(RETRO_LOG_INFO, "2P 팩 없음: 2P 게임기를 롬 없이 바이오스로 켬(싱글팩 받기) — 2P 칸 · 손님 되쓰기 없음");
++		} else if (p2RomData) {
++			/* 짝 게임 손님: 2P 는 방장 상태로 받음 — 1P 롬 이름의 2P 칸은 읽지도 쓰지도 않음 */
++			p2SavePath[0] = '\0';
++		} else {
++			_loadP2Save();
++		}
++	}
++
++	void* state = NULL;
++	size_t size = 0;
++	coreStateSize = players[0].core->stateSize(players[0].core);
++	if (linkOn) {
++		players[0].driver.d.saveState(&players[0].driver.d, &state, &size);
++	}
++	free(state);
++	driverStateSize = size;
++
++	audioConverterReset(&audioConverter, players[screenPlayer].core->audioSampleRate(players[screenPlayer].core));
++	gameLoaded = true;
++	_log(RETRO_LOG_INFO, "loaded: %d GBA(s), link %s, screen %dP, BIOS %s, state %u bytes",
++	     _activePlayers(), linkOn ? "on" : "off", screenPlayer + 1, biosLoaded ? "file" : "built-in (HLE)", (unsigned) retro_serialize_size());
++	return true;
++}
++
++bool retro_load_game_special(unsigned game_type, const struct retro_game_info* info, size_t num_info) {
++	UNUSED(game_type);
++	UNUSED(info);
++	UNUSED(num_info);
++	return false;
++}
++
++void retro_unload_game(void) {
++	if (!gameLoaded) {
++		return;
++	}
++	/* 저장 종류 판별 전 빠른 종료는 보냈던 원본 길이를 지킨다. */
++	size_t ownSize = linkOn ? _saveSize(1) : 0;
++	if (linkOn && ((struct GBA*)players[1].core->board)->memory.savedata.type == GBA_SAVEDATA_AUTODETECT
++	    && hb_own_save_hint && hb_own_save_hint <= ownSize) ownSize = hb_own_save_hint;
++	hb_own_export(linkOn ? players[1].save : NULL, ownSize);
++	_writeP2Save(false);
++	gameLoaded = false;
++	_freePlayers();
++}
++
++void retro_reset(void) {
++	int i;
++	for (i = 0; i < _activePlayers(); ++i) {
++		players[i].core->reset(players[i].core);
++	}
++}
++
++static uint16_t _readKeys(unsigned port) {
++	uint16_t keys = 0;
++	size_t i;
++	if (useBitmasks) {
++		int16_t mask = inputCallback(port, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
++		for (i = 0; i < sizeof(keymap) / sizeof(*keymap); ++i) {
++			keys |= ((mask >> keymap[i]) & 1) << i;
++		}
++	} else {
++		for (i = 0; i < sizeof(keymap) / sizeof(*keymap); ++i) {
++			keys |= (!!inputCallback(port, RETRO_DEVICE_JOYPAD, 0, keymap[i])) << i;
++		}
++	}
++	return keys;
++}
++
++/* Interleave run-loop slices of the awake cores until core 0 ends a frame.
++ * Identical on every peer: it only depends on emulation state. */
++static void _runLinkedFrame(void) {
++	struct mCore* reference = players[0].core;
++	uint32_t target = reference->frameCounter(reference) + 1;
++	unsigned slices = 0;
++	while (reference->frameCounter(reference) != target) {
++		bool progressed = false;
++		int i;
++		for (i = 0; i < _activePlayers(); ++i) {
++			if (players[i].link->asleep) {
++				continue;
++			}
++			if (i == 0 && reference->frameCounter(reference) == target) {
++				continue;
++			}
++			players[i].core->runLoop(players[i].core);
++			progressed = true;
++			++slices;
++		}
++		if (!progressed || slices > DUAL_MAX_SLICES) {
++			if (stats.stalls < 8) {
++				_log(RETRO_LOG_ERROR, "link stalled (%s) at frame %u", progressed ? "slice limit" : "both asleep", stats.frames);
++			}
++			++stats.stalls;
++			break;
++		}
++	}
++	stats.slicesLastFrame = slices;
++	if (slices > stats.slicesMax) {
++		stats.slicesMax = slices;
++	}
++}
++
++static void _outputAudio(bool enabled) {
++	int i;
++	for (i = 0; i < _activePlayers(); ++i) {
++		struct mAudioBuffer* buffer = players[i].core->getAudioBuffer(players[i].core);
++		if (i != screenPlayer) {
++			mAudioBufferClear(buffer);
++			continue;
++		}
++		unsigned rate = players[i].core->audioSampleRate(players[i].core);
++		if (rate != audioConverter.inputRate) {
++			audioConverterReset(&audioConverter, rate);
++		}
++		while (true) {
++			size_t read = mAudioBufferRead(buffer, audioSamples, DUAL_AUDIO_CHUNK);
++			if (!read) {
++				break;
++			}
++			if (!enabled) {
++				continue;
++			}
++			size_t produced = audioConverterProcess(&audioConverter, audioSamples, read, audioOut);
++			if (produced) {
++				audioCallback(audioOut, produced);
++			}
++		}
++	}
++}
++
++void retro_run(void) {
++	hb_own_poll(linkOn, _ownSaveApply, _ownSaveApplyPair);
++	inputPollCallback();
++	bool updated = false;
++	if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated) {
++		_readScreenOption();
++	}
++
++	screenFileTick();
++	_applyScreen();
++
++	int av = RETRO_AV_ENABLE_VIDEO | RETRO_AV_ENABLE_AUDIO;
++	if (!environCallback(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av)) {
++		av = RETRO_AV_ENABLE_VIDEO | RETRO_AV_ENABLE_AUDIO;
++	}
++	bool videoOn = av & RETRO_AV_ENABLE_VIDEO;
++
++	int i;
++	for (i = 0; i < _activePlayers(); ++i) {
++		struct mCore* core = players[i].core;
++		core->setKeys(core, _readKeys(i));
++		/* Rendering is invisible to emulation and not serialized: only draw what is shown */
++		bool draw = renderBoth || (videoOn && i == screenPlayer);
++		((struct GBA*) core->board)->video.frameskipCounter = draw ? 0 : 0x10000;
++	}
++
++	if (linkOn) {
++		_runLinkedFrame();
++	} else {
++		players[0].core->runFrame(players[0].core);
++	}
++	++stats.frames;
++	for (i = 0; i < _activePlayers(); ++i) {
++		stats.p[i].frameCounter = players[i].core->frameCounter(players[i].core);
++	}
++
++	if (videoOn) {
++		const mColor* frame = screenPlayer == 0 ? players[0].videoBuffer : players[1].frameBuffer;
++		videoCallback(frame, DUAL_WIDTH, DUAL_HEIGHT, DUAL_WIDTH * sizeof(mColor));
++	} else {
++		videoCallback(NULL, DUAL_WIDTH, DUAL_HEIGHT, DUAL_WIDTH * sizeof(mColor));
++	}
++	_outputAudio(av & RETRO_AV_ENABLE_AUDIO);
++
++	if (linkOn && players[1].saveUpdated) {
++		players[1].saveUpdated = false;
++		_writeP2Save(false);
++	}
++	players[0].saveUpdated = false;
++	/* 손님 자기 세이브: 장 번호(상태에 들어감) · 확인된 2P 의 중간 저장 */
++	if (linkOn) {
++		size_t ownSize = _saveSize(1);
++		if (((struct GBA*) players[1].core->board)->memory.savedata.type == GBA_SAVEDATA_AUTODETECT
++		    && hb_own_save_hint && hb_own_save_hint <= ownSize) {
++			ownSize = hb_own_save_hint;
++		}
++		hb_own_tick(players[1].save, ownSize);
++	}
++}
++
++/* --- savestates --- */
++
++static size_t _playerStateSize(void) {
++	return coreStateSize + driverStateSize + DUAL_SAVE_SIZE + sizeof(struct DualExtra);
++}
++
++size_t retro_serialize_size(void) {
++	if (!gameLoaded) {
++		return 0;
++	}
++	return sizeof(struct DualStateHeader) + _activePlayers() * _playerStateSize();
++}
++
++static void _saveExtra(struct GBA* gba, struct DualExtra* extra) {
++	const struct GBAAudioFIFO* fifos[2] = { &gba->audio.chA, &gba->audio.chB };
++	int i, j;
++	for (i = 0; i < 2; ++i) {
++		for (j = 0; j < GBA_AUDIO_FIFO_SIZE; ++j) {
++			STORE_32LE(fifos[i]->fifo[j], 0, &extra->fifo[i].fifo[j]);
++		}
++		STORE_32LE(fifos[i]->fifoWrite, 0, &extra->fifo[i].write);
++		STORE_32LE(fifos[i]->fifoRead, 0, &extra->fifo[i].read);
++		STORE_32LE(fifos[i]->internalRemaining, 0, &extra->fifo[i].internalRemaining);
++	}
++	for (i = 0; i < 4; ++i) {
++		const struct GBADMA* dma = &gba->memory.dma[i];
++		STORE_32LE(dma->reg, 0, &extra->dma[i].reg);
++		STORE_32LE(dma->cycles, 0, &extra->dma[i].cycles);
++		STORE_32LE(dma->sourceOffset, 0, &extra->dma[i].sourceOffset);
++		STORE_32LE(dma->destOffset, 0, &extra->dma[i].destOffset);
++	}
++}
++
++static void _loadExtra(struct GBA* gba, const struct DualExtra* extra) {
++	struct GBAAudioFIFO* fifos[2] = { &gba->audio.chA, &gba->audio.chB };
++	int i, j;
++	for (i = 0; i < 2; ++i) {
++		for (j = 0; j < GBA_AUDIO_FIFO_SIZE; ++j) {
++			LOAD_32LE(fifos[i]->fifo[j], 0, &extra->fifo[i].fifo[j]);
++		}
++		int32_t value;
++		LOAD_32LE(value, 0, &extra->fifo[i].write);
++		fifos[i]->fifoWrite = value;
++		LOAD_32LE(value, 0, &extra->fifo[i].read);
++		fifos[i]->fifoRead = value;
++		LOAD_32LE(value, 0, &extra->fifo[i].internalRemaining);
++		fifos[i]->internalRemaining = value;
++	}
++	for (i = 0; i < 4; ++i) {
++		struct GBADMA* dma = &gba->memory.dma[i];
++		uint32_t reg;
++		LOAD_32LE(reg, 0, &extra->dma[i].reg);
++		dma->reg = reg;
++		LOAD_32LE(dma->cycles, 0, &extra->dma[i].cycles);
++		int32_t value;
++		LOAD_32LE(value, 0, &extra->dma[i].sourceOffset);
++		dma->sourceOffset = value;
++		LOAD_32LE(value, 0, &extra->dma[i].destOffset);
++		dma->destOffset = value;
++	}
++}
++
++static uint64_t _hashState(const void* data, size_t size) {
++	const uint8_t* bytes = data;
++	uint64_t hash = 0xCBF29CE484222325ULL;
++	size_t i;
++	for (i = 0; i < size; ++i) {
++		hash = (hash ^ bytes[i]) * 0x100000001B3ULL;
++	}
++	return hash;
++}
++
++static void _rememberState(uint64_t hash) {
++	seenStates[seenNext] = hash;
++	seenNext = (seenNext + 1) % DUAL_SEEN_STATES;
++}
++
++static bool _stateSeen(uint64_t hash) {
++	unsigned i;
++	for (i = 0; i < DUAL_SEEN_STATES; ++i) {
++		if (seenStates[i] == hash) {
++			return true;
++		}
++	}
++	return false;
++}
++
++bool retro_serialize(void* data, size_t size) {
++	size_t total = retro_serialize_size();
++	if (!total || size < total) {
++		return false;
++	}
++	/* Zero first: mGBA leaves reserved and unused fields untouched, and
++	 * netplay compares CRCs of the whole buffer between peers */
++	memset(data, 0, total);
++	struct DualStateHeader* header = data;
++	STORE_32LE(DUAL_STATE_MAGIC, 0, &header->magic);
++	bool pair = linkOn && p2RomData;
++	bool noCart = linkOn && p2NoCart;
++	STORE_32LE((hb_has_token() ? 3 : DUAL_STATE_VERSION) | (linkOn ? DUAL_STATE_LINK14 : 0) | (pair ? DUAL_STATE_PAIR15 : 0)
++	           | (noCart ? DUAL_STATE_NOCART16 : 0), 0, &header->version);
++	memcpy(header->reserved, hb_own_token, 16);
++	hb_put32((uint8_t*)header->reserved + 16, hb_own_save_hint);
++	hb_put32((uint8_t*)header->reserved + 20, hb_has_token() ? hb_own_frame : 0);
++	if (pair) {
++		hb_put32((uint8_t*)header->reserved + DUAL_PAIR_CRC_AT, p2RomCrc);
++	}
++	STORE_32LE(_activePlayers(), 0, &header->players);
++	STORE_32LE(coreStateSize, 0, &header->coreStateSize);
++	STORE_32LE(driverStateSize, 0, &header->driverStateSize);
++	STORE_32LE(DUAL_SAVE_SIZE, 0, &header->saveSize);
++	STORE_32LE(sizeof(struct DualExtra), 0, &header->extraSize);
++
++	uint8_t* cursor = (uint8_t*) data + sizeof(*header);
++	int i;
++	for (i = 0; i < _activePlayers(); ++i) {
++		struct DualPlayer* player = &players[i];
++		if (!player->core->saveState(player->core, cursor)) {
++			return false;
++		}
++		if (linkOn) {
++			/* 1.4.1: 출력용 소리 샘플(currentSamples)은 게임 진행에 안 쓰이는데 되감기 뒤 다시 그린 값이
++			 * 몇 칸 달라질 수 있어(매지컬 베케이션 12_A) 넷플레이 상태 대조를 흔듦 → 두 대 상태에서는 0 */
++			memset(cursor + offsetof(struct GBASerializedState, currentSamples), 0,
++			       sizeof(((struct GBASerializedState*) 0)->currentSamples));
++		}
++		cursor += coreStateSize;
++
++		if (linkOn) {
++			void* blob = NULL;
++			size_t blobSize = 0;
++			player->driver.d.saveState(&player->driver.d, &blob, &blobSize);
++			if (!blob || blobSize != driverStateSize) {
++				free(blob);
++				return false;
++			}
++			memcpy(cursor, blob, blobSize);
++			free(blob);
++			cursor += driverStateSize;
++		}
++
++		memcpy(cursor, player->save, DUAL_SAVE_SIZE);
++		cursor += DUAL_SAVE_SIZE;
++
++		_saveExtra(player->core->board, (struct DualExtra*) cursor);
++		cursor += sizeof(struct DualExtra);
++	}
++	if (traceFile) {
++		_rememberState(_hashState(data, total));
++	}
++	return true;
++}
++
++bool retro_unserialize(const void* data, size_t size) {
++	size_t total = retro_serialize_size();
++	if (!total || size < total) {
++		return false;
++	}
++	if (traceFile) {
++		uint64_t hash = _hashState(data, total);
++		if (!_stateSeen(hash)) {
++			++outsideLoads;
++			_rememberState(hash);
++			fprintf(traceFile, "f=%u state from outside #%u (netplay join or CRC resync)\n", stats.frames, outsideLoads);
++			fflush(traceFile);
++			_log(RETRO_LOG_INFO, "state from outside #%u at frame %u (netplay join or CRC resync)", outsideLoads, stats.frames);
++		}
++	}
++	const struct DualStateHeader* header = data;
++	uint32_t value;
++	LOAD_32LE(value, 0, &header->magic);
++	if (value != DUAL_STATE_MAGIC) {
++		_log(RETRO_LOG_ERROR, "not an mGBA Dual state");
++		return false;
++	}
++	LOAD_32LE(value, 0, &header->version);
++	if (!!(value & DUAL_STATE_LINK14) != linkOn) {
++		/* 두 대 상태인데 1.4 표시가 없음 = 1.3 이하 코어가 만든 상태(넷플레이 상대가 옛 판) */
++		_log(RETRO_LOG_ERROR, "state from a different link-timing version (1.3 vs 1.4); update both devices");
++		return false;
++	}
++	/* 1.5: 짝 게임 상태는 같은 2P 짝 롬을 켠 쪽만 읽음(짝 아닌 상태 ↔ 짝 코어도 서로 거절) */
++	bool pair = linkOn && p2RomData;
++	if (!!(value & DUAL_STATE_PAIR15) != pair) {
++		_log(RETRO_LOG_ERROR, "%s", pair ? "state is not a pair-game state (2P ROM differs); both sides must use the same pair"
++		                                 : "pair-game state (2P has another ROM); load the same pair or update both devices to 1.5");
++		return false;
++	}
++	if (pair && hb_u32((const uint8_t*)header->reserved + DUAL_PAIR_CRC_AT) != p2RomCrc) {
++		_log(RETRO_LOG_ERROR, "pair-game state with a different 2P ROM (CRC %08x, mine %08x)",
++		     (unsigned) hb_u32((const uint8_t*)header->reserved + DUAL_PAIR_CRC_AT), (unsigned) p2RomCrc);
++		return false;
++	}
++	/* 1.6: 2P 팩 없음(싱글팩) 상태는 2P 를 팩 없이 켠 쪽만 읽음(1.5 · 팩 있는 2P 와 서로 거절) */
++	bool noCart = linkOn && p2NoCart;
++	if (!!(value & DUAL_STATE_NOCART16) != noCart) {
++		_log(RETRO_LOG_ERROR, "%s", noCart ? "state has a 2P cartridge; both sides need mgba_dual_p2_nocart (and the BIOS)"
++		                                   : "2P-without-cartridge (single-pak) state; set mgba_dual_p2_nocart on both devices (1.6)");
++		return false;
++	}
++	value &= ~(DUAL_STATE_LINK14 | DUAL_STATE_PAIR15 | DUAL_STATE_NOCART16);
++	if (value != DUAL_STATE_VERSION && value != 2 && value != 3) {
++		return false;
++	}
++	LOAD_32LE(value, 0, &header->players);
++	if (value != (uint32_t) _activePlayers()) {
++		_log(RETRO_LOG_ERROR, "state link mode differs; reload content with matching mgba_dual_link");
++		return false;
++	}
++	LOAD_32LE(value, 0, &header->saveSize);
++	if (value != DUAL_SAVE_SIZE) {
++		return false;
++	}
++	LOAD_32LE(value, 0, &header->extraSize);
++	if (value != sizeof(struct DualExtra)) {
++		return false;
++	}
++	LOAD_32LE(value, 0, &header->coreStateSize);
++	if (value != coreStateSize) {
++		return false;
++	}
++	LOAD_32LE(value, 0, &header->driverStateSize);
++	if (value != driverStateSize) {
++		return false;
++	}
++
++	uint32_t ownVersion;
++	LOAD_32LE(ownVersion, 0, &header->version);
++	ownVersion &= ~(DUAL_STATE_LINK14 | DUAL_STATE_PAIR15 | DUAL_STATE_NOCART16);
++	if (ownVersion >= 2 && hb_u32((const uint8_t*)header->reserved + 16) > DUAL_SAVE_SIZE) return false;
++	const uint8_t* base = (const uint8_t*) data + sizeof(*header);
++	size_t stride = _playerStateSize();
++	int i;
++	/* 1) cores: a core load rebuilds its timing list */
++	for (i = 0; i < _activePlayers(); ++i) {
++		const uint8_t* cursor = base + i * stride;
++		if (!players[i].core->loadState(players[i].core, cursor)) {
++			_log(RETRO_LOG_ERROR, "GBA #%d state rejected", i + 1);
++			return false;
++		}
++	}
++	/* 2) save memory, exactness extras */
++	for (i = 0; i < _activePlayers(); ++i) {
++		const uint8_t* cursor = base + i * stride + coreStateSize + driverStateSize;
++		memcpy(players[i].save, cursor, DUAL_SAVE_SIZE);
++		_loadExtra(players[i].core->board, (const struct DualExtra*) (cursor + DUAL_SAVE_SIZE));
++	}
++	/* 3) lockstep drivers re-schedule into the rebuilt timing lists
++	 *    (player 0's blob also restores the shared coordinator) */
++	for (i = 0; linkOn && i < DUAL_PLAYERS; ++i) {
++		const uint8_t* cursor = base + i * stride + coreStateSize;
++		if (!players[i].driver.d.loadState(&players[i].driver.d, cursor, driverStateSize)) {
++			_log(RETRO_LOG_ERROR, "link state %d rejected", i + 1);
++			return false;
++		}
++	}
++	memset(hb_own_token, 0, 16);
++	hb_own_save_hint = 0;
++	if (ownVersion >= 2) {
++		memcpy(hb_own_token, header->reserved, 16);
++		hb_own_save_hint = hb_u32((const uint8_t*)header->reserved + 16);
++	}
++	hb_own_restored(ownVersion == 3 ? hb_u32((const uint8_t*)header->reserved + 20) : 0);
++	return true;
++}
++
++void retro_cheat_reset(void) {
++}
++
++void retro_cheat_set(unsigned index, bool enabled, const char* code) {
++	UNUSED(index);
++	UNUSED(enabled);
++	UNUSED(code);
++}
++
++unsigned retro_get_region(void) {
++	return RETRO_REGION_NTSC;
++}
++
++void retro_set_controller_port_device(unsigned port, unsigned device) {
++	UNUSED(port);
++	UNUSED(device);
++}
++
++void* retro_get_memory_data(unsigned id) {
++	if (!gameLoaded) {
++		return NULL;
++	}
++	struct GBA* gba0 = players[0].core->board;
++	if (!linkOn && (id == DUAL_MEMORY_WRAM + 1 || id == DUAL_MEMORY_IWRAM + 1
++	    || id == DUAL_MEMORY_SAVE + 1 || id == DUAL_MEMORY_FRAME + 1)) {
++		return NULL;
++	}
++	switch (id) {
++	case RETRO_MEMORY_SAVE_RAM:
++		return hb_own_guest ? NULL : players[0].save;
++	case RETRO_MEMORY_SYSTEM_RAM:
++		return gba0->memory.wram;
++	case RETRO_MEMORY_VIDEO_RAM:
++		return gba0->video.renderer->vram;
++	case DUAL_MEMORY_STATS:
++		return &stats;
++	case DUAL_MEMORY_WRAM:
++	case DUAL_MEMORY_WRAM + 1:
++		return ((struct GBA*) players[id - DUAL_MEMORY_WRAM].core->board)->memory.wram;
++	case DUAL_MEMORY_IWRAM:
++	case DUAL_MEMORY_IWRAM + 1:
++		return ((struct GBA*) players[id - DUAL_MEMORY_IWRAM].core->board)->memory.iwram;
++	case DUAL_MEMORY_SAVE:
++	case DUAL_MEMORY_SAVE + 1:
++		return players[id - DUAL_MEMORY_SAVE].save;
++	case DUAL_MEMORY_FRAME:
++		return players[0].videoBuffer;
++	case DUAL_MEMORY_FRAME + 1:
++		return players[1].frameBuffer;
++	default:
++		return NULL;
++	}
++}
++
++size_t retro_get_memory_size(unsigned id) {
++	if (!gameLoaded) {
++		return 0;
++	}
++	if (!linkOn && (id == DUAL_MEMORY_WRAM + 1 || id == DUAL_MEMORY_IWRAM + 1
++	    || id == DUAL_MEMORY_SAVE + 1 || id == DUAL_MEMORY_FRAME + 1)) {
++		return 0;
++	}
++	switch (id) {
++	case RETRO_MEMORY_SAVE_RAM:
++		return hb_own_guest ? 0 : _saveSize(0);
++	case RETRO_MEMORY_SYSTEM_RAM:
++		return GBA_SIZE_EWRAM;
++	case RETRO_MEMORY_VIDEO_RAM:
++		return GBA_SIZE_VRAM;
++	case DUAL_MEMORY_STATS:
++		return sizeof(stats);
++	case DUAL_MEMORY_WRAM:
++	case DUAL_MEMORY_WRAM + 1:
++		return GBA_SIZE_EWRAM;
++	case DUAL_MEMORY_IWRAM:
++	case DUAL_MEMORY_IWRAM + 1:
++		return GBA_SIZE_IWRAM;
++	case DUAL_MEMORY_SAVE:
++	case DUAL_MEMORY_SAVE + 1:
++		return _saveSize(id - DUAL_MEMORY_SAVE);
++	case DUAL_MEMORY_FRAME:
++	case DUAL_MEMORY_FRAME + 1:
++		return DUAL_WIDTH * DUAL_HEIGHT * sizeof(mColor);
++	default:
++		return 0;
++	}
++}

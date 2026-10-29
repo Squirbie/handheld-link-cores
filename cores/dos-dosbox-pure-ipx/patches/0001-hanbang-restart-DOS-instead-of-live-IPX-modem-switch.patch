@@ -1,0 +1,52 @@
+From 308cfebde068e82ab18fe377e7946f2a3a64e34a Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Tue, 20 Oct 2026 00:18:05 +0900
+Subject: [PATCH] hanbang: restart DOS instead of live IPX/modem switch on
+ netplay start
+
+DBP_EnableNetwork (called from the netpacket start callback) used to either
+call retro_reset from inside the frontend's netplay callback (a DOS program
+ran for less than 10 seconds) or re-create the "ipx" and "serial" sections
+while the DOSBox thread was paused mid-frame. On RG35XX devices (KNULLI,
+RetroArch 1.22.2) both paths crashed RetroArch with SIGSEGV in some sessions.
+
+Now a running DOS gets dbp_state = DBPSTATE_REBOOT, so retro_run restarts it
+at its top (same path as option changes needing a restart) and init_dosbox
+enables IPX/modem before the DOSBox thread starts. Booted OS images keep the
+0.9.9 live switch. If DOSBox is shut down (control == NULL) only the flag is
+set (0.9.9 would dereference NULL there).
+
+---
+ dosbox_pure_libretro.cpp | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/dosbox_pure_libretro.cpp b/dosbox_pure_libretro.cpp
+index 8f949c1..998f79a 100644
+--- a/dosbox_pure_libretro.cpp
++++ b/dosbox_pure_libretro.cpp
+@@ -1687,8 +1687,20 @@ void DBP_EnableNetwork()
+ 	dbp_use_network = true;
+ 
+ 	extern const char* RunningProgram;
+-	bool running_dos_game = (dbp_had_game_running && strcmp(RunningProgram, "BOOT"));
+-	if (running_dos_game && DBP_GetTicks() < 10000) { DBP_ForceReset(); return; }
++	// hanbang 2026-10-19 (Hanbang pack, RG35XX/KNULLI): do not switch IPX/modem on under a running DOS.
++	// 0.9.9 either called retro_reset from inside the frontend's netplay start callback (a game ran < 10 s)
++	// or re-created the "ipx" and "serial" sections while the DOSBox thread was paused mid-frame.
++	// On the devices both crashed RetroArch (SIGSEGV) in some sessions (after a failed IPXSETUP check,
++	// or IPXSETUP started right after netplay start). Instead request a full DOS restart (same path as
++	// option changes that need a restart, done at the top of retro_run) and let init_dosbox enable the
++	// network before the DOSBox thread starts. A booted OS image ("BOOT") keeps the 0.9.9 live switch.
++	if (dbp_state == DBPSTATE_SHUTDOWN || !control) return; // enabled by init_dosbox on the next start
++	if (dbp_state != DBPSTATE_BOOT && strcmp(RunningProgram, "BOOT"))
++	{
++		log_cb(RETRO_LOG_INFO, "[DOSBOX] hanbang: network requested (state %d, program %s) - restarting DOS with IPX/modem\n", (int)dbp_state, RunningProgram);
++		if (dbp_state != DBPSTATE_EXITED) dbp_state = DBPSTATE_REBOOT;
++		return;
++	}
+ 	retro_set_visibility("dosbox_pure_modem", true);
+ 
+ 	bool pauseThread = (dbp_state != DBPSTATE_BOOT && dbp_state != DBPSTATE_SHUTDOWN);
+-- 
+2.53.0
+

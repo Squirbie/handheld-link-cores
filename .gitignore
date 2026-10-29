@@ -1,0 +1,7 @@
+# Prebuilt cores (.so) and binaries are published in Releases only
+*.so
+*.so.*
+dsperate
+.DS_Store
+._*
+__pycache__/

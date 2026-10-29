@@ -1,0 +1,60 @@
+KNULLI configgen patch for the Join / Solo prompt and ES-lobby guests (part of handheld-link-cores)
+SPDX-License-Identifier: GPL-3.0-or-later
+Target: /usr/lib/python3.12/site-packages/configgen/emulatorlauncher.py, stock md5 96581451043c1ba63ff799c9d59f0bda
+Apply on the device:  mount -o remount,rw / && patch -p1 -d / < emulatorlauncher.patch && knulli-save-overlay
+Undo:                 patch -R -p1 -d / < emulatorlauncher.patch && knulli-save-overlay
+
+--- a/usr/lib/python3.12/site-packages/configgen/emulatorlauncher.py
++++ b/usr/lib/python3.12/site-packages/configgen/emulatorlauncher.py
+@@ -69,6 +69,19 @@
+     if args.core is not None:
+         system.config["core"] = args.core
+         system.config["core-forced"] = True
++        # hb_lobbycore: a guest joining from the ES netplay lobby gets "-core <system default>" (e.g. mame078plus, mgba),
++        # which overrides the per-game core line (patched mame2003_plus, mgba_dual, gpsp ...), so host and guest would run
++        # different cores. For a netplay client, prefer this game's own core line from knulli.conf (the host uses it too).
++        if args.netplaymode == "client" and romConfiguration is not None:
++            try:
++                _hbkey = f'{systemName}["{os.path.basename(romConfiguration)}"].core='
++                with open('/userdata/system/knulli.conf', encoding='utf-8', errors='ignore') as _hbf:
++                    _hbpg = [l.strip()[len(_hbkey):] for l in _hbf if l.startswith(_hbkey)]
++                if _hbpg and _hbpg[-1] and _hbpg[-1] != args.core:
++                    eslog.info(f"hb_lobbycore: client core {args.core} -> {_hbpg[-1]} (game line)")
++                    system.config["core"] = _hbpg[-1]
++            except Exception as _hbe:
++                eslog.error(f"hb_lobbycore: {_hbe}")
+     debugDisplay = system.config.copy()
+     if "retroachievements.password" in debugDisplay:
+         debugDisplay["retroachievements.password"] = "***"
+@@ -194,6 +207,31 @@
+         # run a script before emulator starts
+         callExternalScripts(SYSTEM_SCRIPTS, "gameStart", [systemName, system.config['emulator'], effectiveCore, effectiveRom])
+         callExternalScripts(USER_SCRIPTS, "gameStart", [systemName, system.config['emulator'], effectiveCore, effectiveRom])
++        # hb_joinask: when the 'Join / Solo' prompt (hb_joinask.py, run from the gameStart hook) picked Join, start as a netplay guest
++        if args.netplaymode is None and os.path.exists('/tmp/hb_joinask.json'):
++            try:
++                import json as _hbj
++                with open('/tmp/hb_joinask.json') as _hbf:
++                    _hbr = _hbj.load(_hbf)
++                os.unlink('/tmp/hb_joinask.json')
++                # paired versions: json rom = the host's game A, launched = the ROM started here (B) -> join with content A
++                # (the dual core reads the P2 ROM B from /tmp/hb_dual_p2rom)
++                _hbpair = bool(_hbr.get('pair')) and str(_hbr.get('launched')) == str(effectiveRom) and os.path.isfile(str(_hbr.get('rom')))
++                if _hbr.get('ip') and (str(_hbr.get('rom')) == str(effectiveRom) or _hbpair):
++                    system.config["netplay.mode"] = "client"
++                    system.config["netplay.server.ip"] = str(_hbr['ip'])
++                    system.config["netplay.server.port"] = str(_hbr.get('port') or 55435)
++                    eslog.info(f"hb_joinask: client {_hbr['ip']}:{system.config['netplay.server.port']}")
++                    if _hbpair:
++                        rom = str(_hbr['rom'])
++                        eslog.info(f"hb_joinask: pair content {rom} (launched {effectiveRom})")
++                        if _hbr.get('core'):   # paired guest core: this session only; the gameStop hook sees the same name
++                            system.config["emulator"] = "libretro"
++                            system.config["core"] = str(_hbr['core'])
++                            effectiveCore = str(_hbr['core'])
++                            eslog.info(f"hb_joinask: pair core {effectiveCore}")
++            except Exception as _hbe:
++                eslog.error(f"hb_joinask: {_hbe}")
+ 
+         # run the emulator
+         from .utils.evmapy import evmapy

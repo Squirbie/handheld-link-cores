@@ -1,0 +1,367 @@
+Subject: Libretro dual: add load-time link off with only one GBA
+Series-Step: 12/19 (mgba_dual 1.6-os4)
+Origin: hanbang (this project)
+요약: 코어 옵션 mgba_dual_link(콘텐츠를 켤 때 한 번 읽음, 기본 on). off 이면 GBA 한 대만 만들고 연결 드라이버 없이 보통 .srm 세이브를 씀.
+
+mgba_dual_link is read only at content load (on by default). Off creates only player 1, without a link driver, and
+keeps the normal .srm interface. Version string 1.1-rbfix.
+
+---
+diff --git a/src/platform/libretro/dual/libretro_dual.c b/src/platform/libretro/dual/libretro_dual.c
+index b972f50124db..5f054428b762 100644
+--- a/src/platform/libretro/dual/libretro_dual.c
++++ b/src/platform/libretro/dual/libretro_dual.c
+@@ -8,6 +8,8 @@
+ /* mGBA Dual: two GBA instances of the same ROM in ONE libretro core,
+  * connected by mGBA's lockstep SIO driver (link cable).
+  *
++ * - mgba_dual_link is read only at content load (on by default). Off creates
++ *   only player 1, without a link driver, and keeps the normal .srm interface.
+  * - Both cores are stepped cooperatively on one thread: the lockstep user's
+  *   sleep/wake only flip a flag, and retro_run interleaves run-loop slices of
+  *   whichever core is awake until core 0 finishes one video frame (the same
+@@ -51,7 +53,7 @@
+ #endif
+ 
+ #define DUAL_PLAYERS 2
+-#define DUAL_VERSION "1.0"
++#define DUAL_VERSION "1.1-rbfix"
+ #define DUAL_WIDTH GBA_VIDEO_HORIZONTAL_PIXELS
+ #define DUAL_HEIGHT GBA_VIDEO_VERTICAL_PIXELS
+ #define DUAL_AUDIO_CHUNK 1024
+@@ -164,6 +166,7 @@ static int16_t audioOut[DUAL_AUDIO_CHUNK * 2 * 2];
+ static void* romData;
+ static size_t romSize;
+ static bool gameLoaded;
++static bool linkOn = true;
+ static bool useBitmasks;
+ static bool renderBoth;
+ static int screenPlayer;
+@@ -183,6 +186,10 @@ static uint64_t seenStates[DUAL_SEEN_STATES];
+ static unsigned seenNext;
+ static unsigned outsideLoads;
+ 
++static int _activePlayers(void) {
++	return linkOn ? DUAL_PLAYERS : 1;
++}
++
+ static const int keymap[] = {
+ 	RETRO_DEVICE_ID_JOYPAD_A,
+ 	RETRO_DEVICE_ID_JOYPAD_B,
+@@ -350,7 +357,7 @@ static const char* _getVariable(const char* key) {
+ 
+ static void _readScreenOption(void) {
+ 	const char* value = _getVariable("mgba_dual_screen");
+-	int newScreen = (value && strcmp(value, "2P") == 0) ? 1 : 0;
++	int newScreen = (linkOn && value && strcmp(value, "2P") == 0) ? 1 : 0;
+ 	if (newScreen != screenPlayer && gameLoaded) {
+ 		mAudioBufferClear(players[newScreen].core->getAudioBuffer(players[newScreen].core));
+ 		audioConverterReset(&audioConverter, players[newScreen].core->audioSampleRate(players[newScreen].core));
+@@ -415,7 +422,7 @@ static void _syncPath(const char* path) {
+ }
+ 
+ static void _writeP2Save(bool force) {
+-	if (screenPlayer == 1 || !p2SavePath[0]) {
++	if (!linkOn || screenPlayer == 1 || !p2SavePath[0]) {
+ 		/* 2P (guest) mode: the 2P save belongs to the host device */
+ 		return;
+ 	}
+@@ -505,6 +512,7 @@ void retro_set_environment(retro_environment_t env) {
+ 	environCallback = env;
+ 	libretroVFSInit(env);
+ 	static const struct retro_variable vars[] = {
++		{ "mgba_dual_link", "Link cable (restart content required); on|off" },
+ 		{ "mgba_dual_screen", "Screen and sound (host/solo = 1P, guest = 2P); 1P|2P" },
+ 		{ "mgba_dual_use_bios", "Use BIOS file if found (same on both devices); ON|OFF" },
+ 		{ "mgba_dual_skip_bios", "Skip BIOS intro (same on both devices); OFF|ON" },
+@@ -641,28 +649,30 @@ static bool _setupPlayer(int i, const char* biosPath, const struct mCoreOptions*
+ 	player->callbacks.savedataUpdated = _savedataUpdated;
+ 	core->addCoreCallbacks(core, &player->callbacks);
+ 
+-	/* Link cable: cooperative lockstep user + driver, wrapped for diagnostics */
+-	player->user.index = i;
+-	player->user.d.sleep = _userSleep;
+-	player->user.d.wake = _userWake;
+-	player->user.d.requestedId = _userRequestedId;
+-	player->user.d.playerIdChanged = _userPlayerIdChanged;
+-	GBASIOLockstepDriverCreate(&player->driver, &player->user.d);
+-	player->setMode = player->driver.d.setMode;
+-	player->start = player->driver.d.start;
+-	player->finishMultiplayer = player->driver.d.finishMultiplayer;
+-	player->finishNormal8 = player->driver.d.finishNormal8;
+-	player->finishNormal32 = player->driver.d.finishNormal32;
+-	player->driver.d.setMode = _wrapSetMode;
+-	player->driver.d.start = _wrapStart;
+-	player->driver.d.finishMultiplayer = _wrapFinishMultiplayer;
+-	player->driver.d.finishNormal8 = _wrapFinishNormal8;
+-	player->driver.d.finishNormal32 = _wrapFinishNormal32;
+-	GBASIOLockstepCoordinatorAttach(&coordinator, &player->driver);
+-	core->setPeripheral(core, mPERIPH_GBA_LINK_PORT, &player->driver.d);
+-	player->link = TableLookup(&coordinator.players, player->driver.lockstepId);
+-	if (!player->link) {
+-		return false;
++	if (linkOn) {
++		/* Link cable: cooperative lockstep user + driver, wrapped for diagnostics */
++		player->user.index = i;
++		player->user.d.sleep = _userSleep;
++		player->user.d.wake = _userWake;
++		player->user.d.requestedId = _userRequestedId;
++		player->user.d.playerIdChanged = _userPlayerIdChanged;
++		GBASIOLockstepDriverCreate(&player->driver, &player->user.d);
++		player->setMode = player->driver.d.setMode;
++		player->start = player->driver.d.start;
++		player->finishMultiplayer = player->driver.d.finishMultiplayer;
++		player->finishNormal8 = player->driver.d.finishNormal8;
++		player->finishNormal32 = player->driver.d.finishNormal32;
++		player->driver.d.setMode = _wrapSetMode;
++		player->driver.d.start = _wrapStart;
++		player->driver.d.finishMultiplayer = _wrapFinishMultiplayer;
++		player->driver.d.finishNormal8 = _wrapFinishNormal8;
++		player->driver.d.finishNormal32 = _wrapFinishNormal32;
++		GBASIOLockstepCoordinatorAttach(&coordinator, &player->driver);
++		core->setPeripheral(core, mPERIPH_GBA_LINK_PORT, &player->driver.d);
++		player->link = TableLookup(&coordinator.players, player->driver.lockstepId);
++		if (!player->link) {
++			return false;
++		}
+ 	}
+ 
+ 	/* Same order as mgba-rollback: attach, then reset, one core after the other */
+@@ -737,6 +747,8 @@ bool retro_load_game(const struct retro_game_info* game) {
+ 	if (value) {
+ 		opts.skipBios = strcmp(value, "ON") == 0;
+ 	}
++	value = _getVariable("mgba_dual_link");
++	linkOn = !(value && strcmp(value, "off") == 0);
+ 	_readScreenOption();
+ 
+ 	const char* sysDir = NULL;
+@@ -748,30 +760,39 @@ bool retro_load_game(const struct retro_game_info* game) {
+ 	}
+ 
+ 	GBASIOLockstepCoordinatorInit(&coordinator);
+-	p2SaveWritten = anonymousMemoryMap(DUAL_SAVE_SIZE);
++	p2SaveWritten = linkOn ? anonymousMemoryMap(DUAL_SAVE_SIZE) : NULL;
++	if (linkOn && !p2SaveWritten) {
++		_freePlayers();
++		return false;
++	}
+ 	p2SaveWrittenSize = 0;
+ 	int i;
+-	for (i = 0; i < DUAL_PLAYERS; ++i) {
++	for (i = 0; i < _activePlayers(); ++i) {
+ 		if (!_setupPlayer(i, bios, &opts)) {
+ 			_log(RETRO_LOG_ERROR, "could not set up GBA #%d", i + 1);
+ 			_freePlayers();
+ 			return false;
+ 		}
+ 	}
+-	_setP2SavePath(game);
+-	_loadP2Save();
++	p2SavePath[0] = '\0';
++	if (linkOn) {
++		_setP2SavePath(game);
++		_loadP2Save();
++	}
+ 
+ 	void* state = NULL;
+ 	size_t size = 0;
+ 	coreStateSize = players[0].core->stateSize(players[0].core);
+-	players[0].driver.d.saveState(&players[0].driver.d, &state, &size);
++	if (linkOn) {
++		players[0].driver.d.saveState(&players[0].driver.d, &state, &size);
++	}
+ 	free(state);
+ 	driverStateSize = size;
+ 
+ 	audioConverterReset(&audioConverter, players[screenPlayer].core->audioSampleRate(players[screenPlayer].core));
+ 	gameLoaded = true;
+-	_log(RETRO_LOG_INFO, "loaded: 2 GBAs on one link cable, screen %dP, BIOS %s, state %u bytes",
+-	     screenPlayer + 1, biosLoaded ? "file" : "built-in (HLE)", (unsigned) retro_serialize_size());
++	_log(RETRO_LOG_INFO, "loaded: %d GBA(s), link %s, screen %dP, BIOS %s, state %u bytes",
++	     _activePlayers(), linkOn ? "on" : "off", screenPlayer + 1, biosLoaded ? "file" : "built-in (HLE)", (unsigned) retro_serialize_size());
+ 	return true;
+ }
+ 
+@@ -793,7 +814,7 @@ void retro_unload_game(void) {
+ 
+ void retro_reset(void) {
+ 	int i;
+-	for (i = 0; i < DUAL_PLAYERS; ++i) {
++	for (i = 0; i < _activePlayers(); ++i) {
+ 		players[i].core->reset(players[i].core);
+ 	}
+ }
+@@ -823,7 +844,7 @@ static void _runLinkedFrame(void) {
+ 	while (reference->frameCounter(reference) != target) {
+ 		bool progressed = false;
+ 		int i;
+-		for (i = 0; i < DUAL_PLAYERS; ++i) {
++		for (i = 0; i < _activePlayers(); ++i) {
+ 			if (players[i].link->asleep) {
+ 				continue;
+ 			}
+@@ -850,7 +871,7 @@ static void _runLinkedFrame(void) {
+ 
+ static void _outputAudio(bool enabled) {
+ 	int i;
+-	for (i = 0; i < DUAL_PLAYERS; ++i) {
++	for (i = 0; i < _activePlayers(); ++i) {
+ 		struct mAudioBuffer* buffer = players[i].core->getAudioBuffer(players[i].core);
+ 		if (i != screenPlayer) {
+ 			mAudioBufferClear(buffer);
+@@ -890,7 +911,7 @@ void retro_run(void) {
+ 	bool videoOn = av & RETRO_AV_ENABLE_VIDEO;
+ 
+ 	int i;
+-	for (i = 0; i < DUAL_PLAYERS; ++i) {
++	for (i = 0; i < _activePlayers(); ++i) {
+ 		struct mCore* core = players[i].core;
+ 		core->setKeys(core, _readKeys(i));
+ 		/* Rendering is invisible to emulation and not serialized: only draw what is shown */
+@@ -898,9 +919,13 @@ void retro_run(void) {
+ 		((struct GBA*) core->board)->video.frameskipCounter = draw ? 0 : 0x10000;
+ 	}
+ 
+-	_runLinkedFrame();
++	if (linkOn) {
++		_runLinkedFrame();
++	} else {
++		players[0].core->runFrame(players[0].core);
++	}
+ 	++stats.frames;
+-	for (i = 0; i < DUAL_PLAYERS; ++i) {
++	for (i = 0; i < _activePlayers(); ++i) {
+ 		stats.p[i].frameCounter = players[i].core->frameCounter(players[i].core);
+ 	}
+ 
+@@ -912,7 +937,7 @@ void retro_run(void) {
+ 	}
+ 	_outputAudio(av & RETRO_AV_ENABLE_AUDIO);
+ 
+-	if (players[1].saveUpdated) {
++	if (linkOn && players[1].saveUpdated) {
+ 		players[1].saveUpdated = false;
+ 		_writeP2Save(false);
+ 	}
+@@ -929,7 +954,7 @@ size_t retro_serialize_size(void) {
+ 	if (!gameLoaded) {
+ 		return 0;
+ 	}
+-	return sizeof(struct DualStateHeader) + DUAL_PLAYERS * _playerStateSize();
++	return sizeof(struct DualStateHeader) + _activePlayers() * _playerStateSize();
+ }
+ 
+ static void _saveExtra(struct GBA* gba, struct DualExtra* extra) {
+@@ -1017,7 +1042,7 @@ bool retro_serialize(void* data, size_t size) {
+ 	struct DualStateHeader* header = data;
+ 	STORE_32LE(DUAL_STATE_MAGIC, 0, &header->magic);
+ 	STORE_32LE(DUAL_STATE_VERSION, 0, &header->version);
+-	STORE_32LE(DUAL_PLAYERS, 0, &header->players);
++	STORE_32LE(_activePlayers(), 0, &header->players);
+ 	STORE_32LE(coreStateSize, 0, &header->coreStateSize);
+ 	STORE_32LE(driverStateSize, 0, &header->driverStateSize);
+ 	STORE_32LE(DUAL_SAVE_SIZE, 0, &header->saveSize);
+@@ -1025,23 +1050,25 @@ bool retro_serialize(void* data, size_t size) {
+ 
+ 	uint8_t* cursor = (uint8_t*) data + sizeof(*header);
+ 	int i;
+-	for (i = 0; i < DUAL_PLAYERS; ++i) {
++	for (i = 0; i < _activePlayers(); ++i) {
+ 		struct DualPlayer* player = &players[i];
+ 		if (!player->core->saveState(player->core, cursor)) {
+ 			return false;
+ 		}
+ 		cursor += coreStateSize;
+ 
+-		void* blob = NULL;
+-		size_t blobSize = 0;
+-		player->driver.d.saveState(&player->driver.d, &blob, &blobSize);
+-		if (!blob || blobSize != driverStateSize) {
++		if (linkOn) {
++			void* blob = NULL;
++			size_t blobSize = 0;
++			player->driver.d.saveState(&player->driver.d, &blob, &blobSize);
++			if (!blob || blobSize != driverStateSize) {
++				free(blob);
++				return false;
++			}
++			memcpy(cursor, blob, blobSize);
+ 			free(blob);
+-			return false;
++			cursor += driverStateSize;
+ 		}
+-		memcpy(cursor, blob, blobSize);
+-		free(blob);
+-		cursor += driverStateSize;
+ 
+ 		memcpy(cursor, player->save, DUAL_SAVE_SIZE);
+ 		cursor += DUAL_SAVE_SIZE;
+@@ -1081,6 +1108,19 @@ bool retro_unserialize(const void* data, size_t size) {
+ 	if (value != DUAL_STATE_VERSION) {
+ 		return false;
+ 	}
++	LOAD_32LE(value, 0, &header->players);
++	if (value != (uint32_t) _activePlayers()) {
++		_log(RETRO_LOG_ERROR, "state link mode differs; reload content with matching mgba_dual_link");
++		return false;
++	}
++	LOAD_32LE(value, 0, &header->saveSize);
++	if (value != DUAL_SAVE_SIZE) {
++		return false;
++	}
++	LOAD_32LE(value, 0, &header->extraSize);
++	if (value != sizeof(struct DualExtra)) {
++		return false;
++	}
+ 	LOAD_32LE(value, 0, &header->coreStateSize);
+ 	if (value != coreStateSize) {
+ 		return false;
+@@ -1094,7 +1134,7 @@ bool retro_unserialize(const void* data, size_t size) {
+ 	size_t stride = _playerStateSize();
+ 	int i;
+ 	/* 1) cores: a core load rebuilds its timing list */
+-	for (i = 0; i < DUAL_PLAYERS; ++i) {
++	for (i = 0; i < _activePlayers(); ++i) {
+ 		const uint8_t* cursor = base + i * stride;
+ 		if (!players[i].core->loadState(players[i].core, cursor)) {
+ 			_log(RETRO_LOG_ERROR, "GBA #%d state rejected", i + 1);
+@@ -1102,14 +1142,14 @@ bool retro_unserialize(const void* data, size_t size) {
+ 		}
+ 	}
+ 	/* 2) save memory, exactness extras */
+-	for (i = 0; i < DUAL_PLAYERS; ++i) {
++	for (i = 0; i < _activePlayers(); ++i) {
+ 		const uint8_t* cursor = base + i * stride + coreStateSize + driverStateSize;
+ 		memcpy(players[i].save, cursor, DUAL_SAVE_SIZE);
+ 		_loadExtra(players[i].core->board, (const struct DualExtra*) (cursor + DUAL_SAVE_SIZE));
+ 	}
+ 	/* 3) lockstep drivers re-schedule into the rebuilt timing lists
+ 	 *    (player 0's blob also restores the shared coordinator) */
+-	for (i = 0; i < DUAL_PLAYERS; ++i) {
++	for (i = 0; linkOn && i < DUAL_PLAYERS; ++i) {
+ 		const uint8_t* cursor = base + i * stride + coreStateSize;
+ 		if (!players[i].driver.d.loadState(&players[i].driver.d, cursor, driverStateSize)) {
+ 			_log(RETRO_LOG_ERROR, "link state %d rejected", i + 1);
+@@ -1142,6 +1182,10 @@ void* retro_get_memory_data(unsigned id) {
+ 		return NULL;
+ 	}
+ 	struct GBA* gba0 = players[0].core->board;
++	if (!linkOn && (id == DUAL_MEMORY_WRAM + 1 || id == DUAL_MEMORY_IWRAM + 1
++	    || id == DUAL_MEMORY_SAVE + 1 || id == DUAL_MEMORY_FRAME + 1)) {
++		return NULL;
++	}
+ 	switch (id) {
+ 	case RETRO_MEMORY_SAVE_RAM:
+ 		return players[0].save;
+@@ -1173,6 +1217,10 @@ size_t retro_get_memory_size(unsigned id) {
+ 	if (!gameLoaded) {
+ 		return 0;
+ 	}
++	if (!linkOn && (id == DUAL_MEMORY_WRAM + 1 || id == DUAL_MEMORY_IWRAM + 1
++	    || id == DUAL_MEMORY_SAVE + 1 || id == DUAL_MEMORY_FRAME + 1)) {
++		return 0;
++	}
+ 	switch (id) {
+ 	case RETRO_MEMORY_SAVE_RAM:
+ 		return _saveSize(0);

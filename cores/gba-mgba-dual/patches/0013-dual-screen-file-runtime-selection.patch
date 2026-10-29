@@ -1,0 +1,203 @@
+Subject: Libretro dual: pick the shown screen (1P/2P) at run time from /tmp/hb_dual_screen
+Series-Step: 13/19 (mgba_dual 1.6-os4)
+Origin: hanbang (this project)
+요약: 보여 줄 화면 · 소리(1P/2P)를 /tmp/hb_dual_screen 파일로 게임 중에도 고름(30장마다 확인, 에뮬 상태에는 영향 없음). 없으면 코어 옵션 mgba_dual_screen.
+
+Local presentation policy, deliberately outside all serialized state: one stat() per 30 retro_run calls, open only on
+change; the file holds "1P" or "2P". Also refreshed right before an actual 2P save write, so a guest switch during the
+polling interval cannot overwrite the host-owned save. Falls back to the core option mgba_dual_screen. Version string
+1.1-rbfix-screenfile.
+
+---
+diff --git a/src/platform/libretro/dual/libretro_dual.c b/src/platform/libretro/dual/libretro_dual.c
+index 5f054428b762..d20d384d9786 100644
+--- a/src/platform/libretro/dual/libretro_dual.c
++++ b/src/platform/libretro/dual/libretro_dual.c
+@@ -48,12 +48,14 @@
+ #include <mgba-util/vfs.h>
+ 
+ #include <stdio.h>
++#include <fcntl.h>
++#include <sys/stat.h>
+ #ifndef _WIN32
+ #include <unistd.h>
+ #endif
+ 
+ #define DUAL_PLAYERS 2
+-#define DUAL_VERSION "1.1-rbfix"
++#define DUAL_VERSION "1.1-rbfix-screenfile"
+ #define DUAL_WIDTH GBA_VIDEO_HORIZONTAL_PIXELS
+ #define DUAL_HEIGHT GBA_VIDEO_VERTICAL_PIXELS
+ #define DUAL_AUDIO_CHUNK 1024
+@@ -170,6 +172,7 @@ static bool linkOn = true;
+ static bool useBitmasks;
+ static bool renderBoth;
+ static int screenPlayer;
++static int screenOption;
+ static size_t coreStateSize;
+ static size_t driverStateSize;
+ static char p2SavePath[PATH_MAX];
+@@ -357,13 +360,122 @@ static const char* _getVariable(const char* key) {
+ 
+ static void _readScreenOption(void) {
+ 	const char* value = _getVariable("mgba_dual_screen");
+-	int newScreen = (linkOn && value && strcmp(value, "2P") == 0) ? 1 : 0;
++	screenOption = (value && strcmp(value, "2P") == 0) ? 1 : 0;
++}
++
++/* Local presentation policy, deliberately outside all serialized state.
++ * Normal playback: one stat per 30 retro_run calls, open only on change.
++ * Also refresh immediately before an actual 2P save write: a guest switch
++ * during the polling interval must not overwrite the host-owned save. */
++#define HB_SCREEN_FILE "/tmp/hb_dual_screen"
++#define HB_SCREEN_POLL_FRAMES 30
++static int screenFilePlayer = -1;
++static unsigned screenFileCountdown;
++static bool screenFileStatValid;
++static struct stat screenFileStat;
++static int screenFileLogged = -2;
++static int screenLogged = -1;
++
++static void screenFileReset(void)
++{
++   screenFilePlayer = -1;
++   screenFileCountdown = HB_SCREEN_POLL_FRAMES;
++   screenFileStatValid = false;
++   screenFileLogged = -2;
++   screenLogged = -1;
++}
++
++static bool screenFileSame(const struct stat *a, const struct stat *b)
++{
++   return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
++      a->st_mode == b->st_mode && a->st_size == b->st_size &&
++      a->st_mtime == b->st_mtime && a->st_ctime == b->st_ctime
++#if defined(__linux__)
++      && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec
++      && a->st_ctim.tv_nsec == b->st_ctim.tv_nsec
++#elif defined(__APPLE__)
++      && a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec
++      && a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec
++#endif
++      ;
++}
++
++static void screenFileRefresh(void)
++{
++   struct stat st;
++   FILE *file;
++   char data[5];
++   size_t size;
++   int fd;
++   if (!linkOn)
++      return;
++   if (stat(HB_SCREEN_FILE, &st) != 0)
++   {
++      screenFilePlayer = -1;
++      screenFileStatValid = false;
++      return;
++   }
++   if (screenFileStatValid && screenFileSame(&st, &screenFileStat))
++      return;
++   screenFileStat = st;
++   screenFileStatValid = true;
++   screenFilePlayer = -1;
++   if (!S_ISREG(st.st_mode) || st.st_size < 2 || st.st_size > 4)
++      return;
++   /* O_NONBLOCK also avoids hanging if a regular file becomes a FIFO
++    * between stat and open. Failed reads are retried at the next poll. */
++   fd = open(HB_SCREEN_FILE, O_RDONLY | O_NONBLOCK);
++   if (fd < 0)
++   {
++      screenFileStatValid = false;
++      return;
++   }
++   file = fdopen(fd, "rb");
++   if (!file)
++   {
++      close(fd);
++      screenFileStatValid = false;
++      return;
++   }
++   size = fread(data, 1, sizeof(data), file);
++   if (ferror(file))
++      screenFileStatValid = false;
++   else if ((size == 2 || (size == 3 && data[2] == '\n') ||
++            (size == 4 && data[2] == '\r' && data[3] == '\n')) &&
++            data[1] == 'P' && (data[0] == '1' || data[0] == '2'))
++      screenFilePlayer = data[0] - '1';
++   fclose(file);
++}
++
++static void screenFileTick(void)
++{
++   if (linkOn && --screenFileCountdown == 0)
++   {
++      screenFileCountdown = HB_SCREEN_POLL_FRAMES;
++      screenFileRefresh();
++   }
++}
++
++static int selectedScreen(void)
++{
++   return linkOn ? (screenFilePlayer >= 0 ? screenFilePlayer : screenOption) : 0;
++}
++
++static void _applyScreen(void) {
++	int newScreen = selectedScreen();
+ 	if (newScreen != screenPlayer && gameLoaded) {
++		/* Presentation buffers only; these are not part of emulation state. */
+ 		mAudioBufferClear(players[newScreen].core->getAudioBuffer(players[newScreen].core));
+ 		audioConverterReset(&audioConverter, players[newScreen].core->audioSampleRate(players[newScreen].core));
+ 		memcpy(players[newScreen].frameBuffer, players[newScreen].videoBuffer, DUAL_WIDTH * DUAL_HEIGHT * sizeof(mColor));
+ 	}
+ 	screenPlayer = newScreen;
++	if (newScreen != screenLogged || screenFilePlayer != screenFileLogged) {
++		_log(RETRO_LOG_INFO, "screen %dP (%s)", newScreen + 1,
++		     !linkOn ? "link off" : screenFilePlayer >= 0 ? HB_SCREEN_FILE : "core option");
++	}
++	screenLogged = newScreen;
++	screenFileLogged = screenFilePlayer;
+ }
+ 
+ /* --- player 2 save file (.p2.srm) --- */
+@@ -422,7 +534,7 @@ static void _syncPath(const char* path) {
+ }
+ 
+ static void _writeP2Save(bool force) {
+-	if (!linkOn || screenPlayer == 1 || !p2SavePath[0]) {
++	if (!linkOn || !p2SavePath[0]) {
+ 		/* 2P (guest) mode: the 2P save belongs to the host device */
+ 		return;
+ 	}
+@@ -438,6 +550,10 @@ static void _writeP2Save(bool force) {
+ 			return;
+ 		}
+ 	}
++	screenFileRefresh();
++	if (selectedScreen() == 1) {
++		return;
++	}
+ 	char tmpPath[PATH_MAX + 8];
+ 	snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", p2SavePath);
+ 	bool ok = _writeAll(tmpPath, players[1].save, size);
+@@ -750,6 +866,9 @@ bool retro_load_game(const struct retro_game_info* game) {
+ 	value = _getVariable("mgba_dual_link");
+ 	linkOn = !(value && strcmp(value, "off") == 0);
+ 	_readScreenOption();
++	screenFileReset();
++	screenFileRefresh();
++	_applyScreen();
+ 
+ 	const char* sysDir = NULL;
+ 	char biosPath[PATH_MAX];
+@@ -904,6 +1023,9 @@ void retro_run(void) {
+ 		_readScreenOption();
+ 	}
+ 
++	screenFileTick();
++	_applyScreen();
++
+ 	int av = RETRO_AV_ENABLE_VIDEO | RETRO_AV_ENABLE_AUDIO;
+ 	if (!environCallback(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av)) {
+ 		av = RETRO_AV_ENABLE_VIDEO | RETRO_AV_ENABLE_AUDIO;

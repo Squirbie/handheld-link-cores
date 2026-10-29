@@ -1,0 +1,326 @@
+--- a/dual/libretro_dual.c
++++ b/dual/libretro_dual.c
+@@ -53,6 +53,21 @@
+  *   세이브만 2P에 넣어 전원을 다시 켬. 원피스의 빈 머리는 전송 도우미가
+  *   전송 사본에만 채움. 1P 세이브를 2P로 복사하지 않음.
+  *
++ * - 두 기계 박자(10/21, 1.4): 2P 기계의 장 경계를 반 장(80줄) 옮김(2P '장 끝' = 줄 64).
++ *   실제 두 기계는 켠 때가 달라 박자가 어긋나 있는데, 똑같이 켜진 두 대가 같은 장에
++ *   같은 입력을 받으면 같은 순간에 같은 바이트를 보내 서로 부딪힘(뿌요뿌요 통 'つうしん'
++ *   빈 칸 · 원피스 · 파이어 프로 'NETWORK ERROR' · '通信エラー'). 박자를 반 장 어긋나게 하면
++ *   같은 장에 눌러도 두 기계가 반 장 차이로 처리해 한쪽이 늘 먼저. link off(혼자)는 그대로.
++ *   두 대 상태에는 판 칸 0x200 비트(1.3 이하는 이 상태를 거절 → 섞여도 몰래 어긋나지 않음).
++ * - 박자는 게임별 옵션(10/21, 1.5): wswan_dual_link_phase = same(기본) | half. 기기에서 원피스 그랜드
++ *   배틀이 1.4 로 안 돼서, 기본은 0010(1.3) 과 같은 박자(같은 상태 바이트)로 두고 반 장이 필요한
++ *   게임(뿌요뿌요 통 · 파이어 프로레슬링)만 게임별 .opt 로 half. 불러올 때만 읽음 · link off 면 늘 same.
++ *   half 상태(0x200)와 same 상태는 서로 거절 → 두 기기 설정이 다르면 몰래 어긋나지 않고 안 붙음.
++ * - 60Hz 셈 맞춤(10/21, 1.6): 손님 세이브를 받아 2P 만 전원을 다시 켜면 2P 의 60Hz 맞춤 셈(4장마다 한 장 더)이
++ *   0 으로 돌아가 1P 와 어긋났음(4장 중 2장은 한 기계만 한 장 더 → 원피스 대전 시작 NETWORK ERROR).
++ *   다시 켠 바로 뒤 2P 셈을 1P 셈과 같게. 받기 전(혼자 · 두 대 처음)은 1.5 와 같은 바이트. 판 칸은 그대로
++ *   (방장이 접속 전에만 하는 일이고 손님은 접속 때 방장 상태를 받음 → 1.5 와 섞여도 몰래 어긋나지 않음).
++ *
+  * 시험용 환경 변수: WSWAN_DUAL_RENDER_BOTH=1(두 기계 다 그림) ·
+  * WSWAN_DUAL_TRACE=<파일>(밖에서 온 상태 · 2P 세이브 기록).
+  * 시험용 메모리 번호(레트로아크는 안 씀): 아래 DUAL_MEMORY_*. */
+@@ -78,8 +93,11 @@
+ #define DUAL_LIBRARY_NAME  "Beetle WonderSwan Dual"
+ /* 넷플레이 버전 칸은 끝 문자 포함 32바이트다.
+  * 자기 세이브 판과 리비전 표시는 유지하고 길이 초과는 빌드 때 막는다.
+- * 1.3(0010) = 1.2-os4 + 세로 게임 세워 보이기(상태 판 칸에 세로 비트) */
+-#define DUAL_VERSION       "1.3-os4"
++ * 1.3(0010) = 1.2-os4 + 세로 게임 세워 보이기(상태 판 칸에 세로 비트)
++ * 1.4(10/21) = 1.3 + 2P 기계 박자 반 장 어긋나게(상태 판 칸에 0x200)
++ * 1.5(10/21) = 1.4 의 반 장 박자를 게임별 옵션으로(기본 same = 1.3 과 같은 박자 · 같은 상태 바이트)
++ * 1.6(10/21) = 1.5 + 손님 세이브를 받아 2P 를 다시 켤 때 2P 60Hz 셈을 1P 와 맞춤(판 칸 그대로) */
++#define DUAL_VERSION       "1.6-os4"
+ typedef char hb_version_fits_netplay[(sizeof(DUAL_VERSION GIT_VERSION) <= 32) ? 1 : -1];
+ #define DUAL_EXTENSIONS    "ws|wsc|pc2"
+ #define DUAL_WIDTH         224
+@@ -92,6 +110,8 @@
+ #define DUAL_STATE_VERSION 1u
+ #define DUAL_STATE_ROTATE  0x100u /* 판 칸(머리 4~7바이트)의 이 비트 = 세로. 가로면 0 → 1.2 와 같은 바이트,
+                                      1.2 이하 코어는 이 비트가 선 상태를 '판이 다름'으로 거절 */
++#define DUAL_STATE_PHASE   0x200u /* 판 칸의 이 비트 = 두 대 · 2P 박자 반 장 어긋남(half). 1.3 이하 코어는 거절 */
++#define DUAL_P2_FRAME_END  64     /* 2P 기계 '장 끝' 줄: 세로 귀선(144)보다 80줄 앞 = 박자 반 장 어긋남 */
+ #define DUAL_HEADER_SIZE   64
+ #include "hb_ownsave.h"
+ 
+@@ -133,7 +153,10 @@
+    void P##hb_ws_link_give(unsigned); \
+    void P##hb_ws_link_stats(uint32_t *, unsigned); \
+    void P##hb_ws_set_render(int); \
+-   const void *P##hb_ws_framebuffer(void);
++   void P##hb_ws_set_frame_end(int); \
++   const void *P##hb_ws_framebuffer(void); \
++   unsigned P##hb_ws_60hz_counter(void); \
++   void P##hb_ws_set_60hz_counter(unsigned);
+ 
+ INNER_DECLS(wsA_)
+ INNER_DECLS(wsB_)
+@@ -170,7 +193,10 @@
+    void (*link_give)(unsigned);
+    void (*link_stats)(uint32_t *, unsigned);
+    void (*set_render)(int);
++   void (*set_frame_end)(int);
+    const void *(*framebuffer)(void);
++   unsigned (*get_60hz_counter)(void);
++   void (*set_60hz_counter)(unsigned);
+ };
+ 
+ #define INNER_TABLE(P) { \
+@@ -185,7 +211,8 @@
+    P##hb_ws_run_pre, P##hb_ws_subframes, P##hb_ws_emu_begin, \
+    P##hb_ws_emu_line, P##hb_ws_emu_end, P##hb_ws_run_post, \
+    P##hb_ws_link_take, P##hb_ws_link_give, P##hb_ws_link_stats, \
+-   P##hb_ws_set_render, P##hb_ws_framebuffer }
++   P##hb_ws_set_render, P##hb_ws_set_frame_end, P##hb_ws_framebuffer, \
++   P##hb_ws_60hz_counter, P##hb_ws_set_60hz_counter }
+ 
+ static const struct Inner inner[2] = { INNER_TABLE(wsA_), INNER_TABLE(wsB_) };
+ 
+@@ -246,6 +273,7 @@
+ static bool renderBoth;
+ static bool gameLoaded;
+ static bool linkOn = true;
++static bool phaseHalf;         /* 옵션 wswan_dual_link_phase = half 이고 link on(불러올 때 정함) */
+ static int screenOption;       /* 옵션: 0 = 1P, 1 = 2P */
+ static int shown;              /* 이번 장에 내보내는 기계 */
+ static bool audioOn = true;
+@@ -508,10 +536,14 @@
+ static bool envA(unsigned cmd, void *data) { return envProxy(0, cmd, data); }
+ static bool envB(unsigned cmd, void *data) { return envProxy(1, cmd, data); }
+ 
++static bool frontVideoOn = true;   /* 이번 retro_run 에 앞단이 화면을 받음(GET_AUDIO_VIDEO_ENABLE) */
++
+ static void videoProxy(int m, const void *data, unsigned width, unsigned height, size_t pitch)
+ {
+    if (m == shown && videoCallback)
+    {
++      if (!frontVideoOn && phaseHalf)
++         data = NULL;   /* 2P 는 앞단이 화면을 끈 장에도 그려 두지만(반 장 박자) 앞단에는 안 보냄 */
+       if (rotateTall && !rotateHw)
+          rotateFrame(data, width, height, pitch);
+       else
+@@ -844,6 +876,8 @@
+    static const struct retro_variable vars[] = {
+       { "wswan_dual_screen", "Screen and sound (host/solo = 1P, guest = 2P); 1P|2P" },
+       { "wswan_dual_link", "2P WonderSwan on the link cable (off = solo, one console, faster); on|off" },
++      /* 게임별 .opt 로 고름(불러올 때만 읽음). 두 기기가 같아야 함 — 다르면 넷플레이 상태를 서로 거절 */
++      { "wswan_dual_link_phase", "Link timing at game load (same = 1.3 timing, half = 2P half a frame later, 1.4 timing for Puyo Puyo Tsuu and Fire Pro Wrestling). Both consoles must match; same|half" },
+       /* 원래 코어와 같은 키 · 같은 값 목록 · 같은 기본값(manual) — 게임별 .opt 의 portrait 를 그대로 읽고,
+        * 게임별 .opt 없이 전역 옵션 파일을 쓸 때도 원래 코어가 둔 값을 바꿔 쓰지 않음(레트로아크는 같은 값이면
+        * 파일을 안 고침). manual · landscape = 가로(이 코어는 SELECT 로 안 돌림).
+@@ -975,13 +1009,15 @@
+ 
+ void wsA_Comm_Reset(void);
+ void wsB_Comm_Reset(void);
+-/* 1P는 통신선만, 2P는 전원을 다시 켠다. */
++/* 1P는 통신선만, 2P는 전원을 다시 켠다. 다시 켜면 2P 60Hz 셈이 0 이 되므로 1P 셈과 같게(1.6) —
++ * 안 맞추면 4장 중 2장은 한 기계만 한 장 더 돌아 두 기계가 한 장씩 앞서거니 뒤서거니 함. */
+ static bool ownSaveApply(const uint8_t *data, size_t size)
+ {
+    if (!linkOn || !saveSize || (size && size != saveSize)) return false;
+    memset(saveMemory(1), 0, saveSize);
+    if (size) memcpy(saveMemory(1), data, size);
+    inner[1].reset();
++   inner[1].set_60hz_counter(inner[0].get_60hz_counter());
+    wsA_Comm_Reset();
+    wsB_Comm_Reset();
+    dual_log(RETRO_LOG_INFO, "손님 자기 세이브 받음: %u 바이트, 2P 전원과 케이블 초기화", (unsigned)size);
+@@ -1029,6 +1065,12 @@
+       return false;
+    }
+ 
++   /* 1P 는 예전처럼 세로 귀선에서 장 끝. 2P 는 half 일 때만 박자 반 장 어긋나게(same · link off = 0010 그대로) */
++   value = getVariable("wswan_dual_link_phase");
++   phaseHalf = linkOn && value && !strcmp(value, "half");
++   inner[0].set_frame_end(-1);
++   inner[1].set_frame_end(phaseHalf ? DUAL_P2_FRAME_END : -1);
++
+    innerSize = inner[0].serialize_size();
+    sizeB = inner[1].serialize_size();
+    if (!innerSize || innerSize != sizeB)
+@@ -1070,7 +1112,8 @@
+    stats.screen = (uint32_t)shown;
+    gameLoaded = true;
+    dual_log(RETRO_LOG_INFO, "켬: 원더스완 %s, 화면 %dP, 세이브 %u 바이트, 상태 %u 바이트",
+-         linkOn ? "두 대(통신 케이블 연결)" : "한 대(link off)", shown + 1,
++         !linkOn ? "한 대(link off)" : phaseHalf ? "두 대(통신 케이블 연결, 박자 half)" : "두 대(통신 케이블 연결)",
++         shown + 1,
+          (unsigned)saveSize, (unsigned)retro_serialize_size());
+    return true;
+ }
+@@ -1203,6 +1246,7 @@
+    if (!environCallback(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av))
+       av = 3;
+    videoOn = (av & 1) != 0;
++   frontVideoOn = videoOn;
+    audioOn = (av & 2) != 0;
+    screenFileTick();
+    applyScreen();
+@@ -1211,7 +1255,9 @@
+ 
+    /* 그리기는 에뮬 결과와 무관하고 상태에도 없음: 보이는 기계만 그림 */
+    inner[0].set_render(renderBoth || (videoOn && shown == 0));
+-   inner[1].set_render(renderBoth || (videoOn && shown == 1));
++   /* half: 2P 기계는 장 경계가 화면 가운데(반 장 박자)라 한 그림이 두 retro_run 에 걸침 → 2P 를 보이는 쪽(손님)은
++    * 앞단이 화면을 끈 장(넷플레이 되감아 다시 도는 장)에도 그려 둠. 안 그러면 되감은 뒤 그림이 한동안 멈춤 */
++   inner[1].set_render(renderBoth || (shown == 1 && (videoOn || phaseHalf)));
+ 
+    if (linkOn)
+       runLinked();
+@@ -1302,7 +1348,8 @@
+ 
+    memset(p, 0, DUAL_HEADER_SIZE);
+    store32(p + 0, DUAL_STATE_MAGIC);
+-   store32(p + 4, (hb_has_token() ? 3 : DUAL_STATE_VERSION) | (rotateTall ? DUAL_STATE_ROTATE : 0));
++   store32(p + 4, (hb_has_token() ? 3 : DUAL_STATE_VERSION) | (rotateTall ? DUAL_STATE_ROTATE : 0)
++         | (phaseHalf ? DUAL_STATE_PHASE : 0));
+    memcpy(p + 16, hb_own_token, 16);
+    hb_put32(p + 32, hb_own_save_hint);
+    hb_put32(p + 36, hb_has_token() ? hb_own_frame : 0);
+@@ -1333,7 +1380,14 @@
+       return false;
+    }
+    version = load32(p + 4);
+-   base = version & ~DUAL_STATE_ROTATE;   /* 세로 비트를 뺀 판(1 · 2 · 3) */
++   base = version & ~(DUAL_STATE_ROTATE | DUAL_STATE_PHASE);   /* 세로 · 박자 비트를 뺀 판(1 · 2 · 3) */
++   if (((version & DUAL_STATE_PHASE) != 0) != phaseHalf)
++   {
++      /* 박자 설정이 다른 상태(same ↔ half, 또는 상대가 1.4) → 몰래 어긋나지 않게 거절 */
++      dual_log(RETRO_LOG_ERROR, "두 기계 박자 설정이 다른 상태(%s ↔ %s) — 두 기기의 wswan_dual_link_phase 를 같게",
++            (version & DUAL_STATE_PHASE) ? "half" : "same", phaseHalf ? "half" : "same");
++      return false;
++   }
+    if ((base != DUAL_STATE_VERSION && base != 2 && base != 3) ||
+          load32(p + 8) != 2 || load32(p + 12) != innerSize)
+    {
+--- a/libretro.c
++++ b/libretro.c
+@@ -1404,6 +1404,26 @@
+ static int hb_update_sample_rate = 0;
+ static int hb_render_off         = 0;
+ 
++/* 한방 10/21: '장 끝' 줄. -1(기본) = 세로 귀선(줄 144)을 돈 뒤 끝 — 예전과 같음(1P · 혼자).
++ * 두 대 앞단은 2P 기계에 줄 64 를 줘서 2P 박자를 반 장(80줄) 어긋나게 함. 그때는 장 경계가
++ * 화면 가운데라, 내보내는 그림은 마지막 세로 귀선 때 다 그려진 그림(hb_vblank_pixels). */
++unsigned hb_ws_current_line(void);
++static int hb_frame_end_line     = -1;
++static int hb_rows_skipped       = 1;   /* 지난 세로 귀선 뒤 안 그린 줄이 있었음 */
++static uint32_t hb_vblank_pixels[FB_WIDTH * FB_HEIGHT];
++
++void hb_ws_set_frame_end(int line)
++{
++   hb_frame_end_line = line;
++   hb_rows_skipped   = 1;
++   memset(hb_vblank_pixels, 0, sizeof(hb_vblank_pixels));
++}
++
++static const void *hb_out_pixels(void)
++{
++   return hb_frame_end_line < 0 ? (const void *)surf->pixels : (const void *)hb_vblank_pixels;
++}
++
+ void hb_ws_run_pre(void)
+ {
+    bool updated   = false;
+@@ -1460,6 +1480,17 @@
+    hb_skip_frame = skip_frame;
+ }
+ 
++/* 한방 10/21(1.6): 60Hz 맞춤 셈 읽기 · 쓰기 — 두 대 앞단이 2P 만 다시 켤 때 1P 셈과 맞추려고 씀 */
++unsigned hb_ws_60hz_counter(void)
++{
++   return retro_60hz_counter;
++}
++
++void hb_ws_set_60hz_counter(unsigned counter)
++{
++   retro_60hz_counter = (uint16_t)(counter % (RETRO_60HZ_CYCLE_INDEX + 1));
++}
++
+ /* If we are running in 60Hz mode, then on every 4th call of
+  * retro_run() an extra ('force skipped') frame is emulated first */
+ int hb_ws_subframes(void)
+@@ -1482,7 +1513,23 @@
+ /* 한 줄(256 CPU 사이클). 1 = 이 줄에서 한 장이 끝남(세로 귀선 시작) */
+ int hb_ws_emu_line(void)
+ {
+-   return wsExecuteLine(hb_spec.surface, hb_spec.skip) ? 1 : 0;
++   unsigned line;
++   bool vblank;
++
++   if (hb_frame_end_line < 0)
++      return wsExecuteLine(hb_spec.surface, hb_spec.skip) ? 1 : 0;
++
++   line = hb_ws_current_line();
++   if (line < 144 && hb_spec.skip)
++      hb_rows_skipped = 1;
++   vblank = wsExecuteLine(hb_spec.surface, hb_spec.skip);
++   if (vblank)
++   {
++      if (!hb_rows_skipped)
++         memcpy(hb_vblank_pixels, surf->pixels, FB_WIDTH * FB_HEIGHT * RETRO_PIX_BYTES);
++      hb_rows_skipped = 0;
++   }
++   return (int)line == hb_frame_end_line ? 1 : 0;
+ }
+ 
+ void hb_ws_emu_end(int sub, int nsub)
+@@ -1520,7 +1567,7 @@
+    if (hw_rotate_enabled || !rotate_tall)
+    {
+       if (!skip_frame)
+-         video_cb(surf->pixels, width, height, FB_WIDTH * RETRO_PIX_BYTES);
++         video_cb(hb_out_pixels(), width, height, FB_WIDTH * RETRO_PIX_BYTES);
+       else
+          video_cb(NULL, width, height, FB_WIDTH * RETRO_PIX_BYTES);
+    }
+@@ -1531,10 +1578,10 @@
+          /* Perform software-based display rotation */
+          if (RETRO_PIX_BYTES == 4)
+             ROTATE_PIXEL_BUF(
+-                  uint32_t, surf->pixels, width, height, rotate_buf)
++                  uint32_t, hb_out_pixels(), width, height, rotate_buf)
+          else
+             ROTATE_PIXEL_BUF(
+-                  uint16_t, surf->pixels, width, height, rotate_buf)
++                  uint16_t, hb_out_pixels(), width, height, rotate_buf)
+ 
+          video_cb(rotate_buf, height, width, FB_HEIGHT * RETRO_PIX_BYTES);
+       }
+@@ -1655,7 +1702,7 @@
+ 
+ const void *hb_ws_framebuffer(void)
+ {
+-   return surf ? surf->pixels : NULL;
++   return surf ? hb_out_pixels() : NULL;
+ }
+ 
+ uint8_t *hb_ws_internal_eeprom(void)
+@@ -1838,6 +1885,10 @@
+    st.malloced       = 0;
+    st.initial_malloc = 0;
+ 
++   /* 한방 10/21: 장 경계가 화면 가운데면, 불러온 뒤 첫 세로 귀선 그림의 윗줄은 불러오기 전에 그린 것
++    * (그림은 상태 밖) → 그 한 장은 내보내지 않고 바로 앞 그림을 그대로 둠(찢긴 그림 대신) */
++   if (hb_frame_end_line >= 0)
++      hb_rows_skipped = 1;
+    return MDFNSS_LoadSM(&st, 0, 0);
+ }
+ 
+--- a/mednafen/wswan/gfx.c
++++ b/mednafen/wswan/gfx.c
+@@ -264,6 +264,12 @@
+    return(ret);
+ }
+ 
++/* 한방 10/21: 지금 줄 번호 — 두 대 앞단이 2P 기계의 '장 끝' 줄을 셀 때 씀 */
++unsigned hb_ws_current_line(void)
++{
++   return wsLine;
++}
++
+ void WSwan_SetLayerEnableMask(uint64 mask)
+ {
+    LayerEnabled = mask;

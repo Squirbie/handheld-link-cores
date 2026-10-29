@@ -1,0 +1,371 @@
+Subject: Libretro dual: guest's own save (host swaps the guest's save into the 2P slot before the guest joins)
+Series-Step: 14/19 (mgba_dual 1.6-os4)
+Origin: hanbang (this project)
+요약: 손님이 자기 세이브를 방장 기기로 보내 방장 쪽 2P 칸에 넣고(2P 기계만 다시 켬), 끝나면 2P 진행을 손님 세이브로 되돌려 쓰게 하는 코어 쪽 구현(hb_ownsave.h).
+
+The guest sends its own save to the host's helper port before connecting; the host core replaces only the 2P SRAM
+(and restarts only the 2P machine, player 1's CPU and save are untouched) while nobody is connected yet, and answers
+with an ACK plus a random ticket. The guest core binds to that exchange only when launched with --connect, exports the
+2P SRAM at exit, and a helper script writes it back to the guest's save. The transport (request / ack / intent files
+under /tmp/hb_ownsave) is driven by a helper script that is not part of this patch. Version string 1.2-ownsave.
+
+---
+diff --git a/src/platform/libretro/dual/hb_ownsave.h b/src/platform/libretro/dual/hb_ownsave.h
+new file mode 100644
+index 000000000000..e13cfcf30c98
+--- /dev/null
++++ b/src/platform/libretro/dual/hb_ownsave.h
+@@ -0,0 +1,223 @@
++/* 손님 자기 세이브: 파일 입출력은 로컬 역할만 보고, 표만 상태에 넣는다. */
++#ifndef HB_OWNSAVE_H
++#define HB_OWNSAVE_H
++#include <dirent.h>
++#include <errno.h>
++#include <stdint.h>
++#include <time.h>
++
++#define HB_OWN_DIR "/tmp/hb_ownsave"
++#define HB_OWN_MAX 131072u
++static uint8_t hb_own_token[16];
++static uint32_t hb_own_crc, hb_own_kind, hb_own_max;
++static uint32_t hb_own_save_hint;
++static unsigned hb_own_countdown;
++static bool hb_own_applied, hb_own_guest;
++
++static uint32_t hb_u32(const uint8_t *p)
++{
++   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++      ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static void hb_put32(uint8_t *p, uint32_t value)
++{
++   unsigned i;
++   for (i = 0; i < 4; i++) p[i] = (uint8_t)(value >> (8 * i));
++}
++
++static uint64_t hb_millis(void)
++{
++   struct timespec t;
++   if (clock_gettime(CLOCK_MONOTONIC, &t)) return 0;
++   return (uint64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
++}
++
++static bool hb_has_token(void)
++{
++   unsigned i;
++   for (i = 0; i < sizeof(hb_own_token); i++)
++      if (hb_own_token[i]) return true;
++   return false;
++}
++
++static bool hb_atomic(const char *name, const void *data, size_t size)
++{
++   char path[256], temp[256];
++   int fd;
++   size_t done = 0;
++   bool ok = false;
++   snprintf(path, sizeof(path), HB_OWN_DIR "/%s", name);
++   snprintf(temp, sizeof(temp), HB_OWN_DIR "/%s.%ld.tmp", name, (long)getpid());
++   fd = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
++   if (fd < 0) return false;
++   while (done < size) {
++      ssize_t n = write(fd, (const uint8_t *)data + done, size - done);
++      if (n < 0 && errno == EINTR) continue;
++      if (n <= 0) break;
++      done += n;
++   }
++   if (done == size && fsync(fd) == 0) ok = true;
++   if (close(fd)) ok = false;
++   if (ok && rename(temp, path)) ok = false;
++   if (!ok) unlink(temp);
++   return ok;
++}
++
++static bool hb_own_inode(unsigned long inode)
++{
++   DIR *dir = opendir("/proc/self/fd");
++   struct dirent *entry;
++   bool found = false;
++   if (!dir) return false;
++   while ((entry = readdir(dir))) {
++      char path[128], value[128];
++      unsigned long candidate = 0;
++      ssize_t n;
++      snprintf(path, sizeof(path), "/proc/self/fd/%s", entry->d_name);
++      n = readlink(path, value, sizeof(value) - 1);
++      if (n <= 0) continue;
++      value[n] = 0;
++      if (sscanf(value, "socket:[%lu]", &candidate) == 1 && candidate == inode) {
++         found = true;
++         break;
++      }
++   }
++   closedir(dir);
++   return found;
++}
++
++static bool hb_host_waiting(unsigned port)
++{
++   const char *tables[2] = { "/proc/net/tcp", "/proc/net/tcp6" };
++   bool listening = false;
++   unsigned i;
++   for (i = 0; i < 2; i++) {
++      char line[1024];
++      FILE *f = fopen(tables[i], "r");
++      if (!f) {
++         if (!i) return false;
++         continue;
++      }
++      while (fgets(line, sizeof(line), f)) {
++         char local[80], remote[80], *colon;
++         unsigned state, lport;
++         unsigned long inode;
++         if (sscanf(line, "%*u: %79s %79s %x %*s %*s %*s %*s %*s %lu",
++                    local, remote, &state, &inode) != 4) continue;
++         colon = strrchr(local, ':');
++         if (!colon || sscanf(colon + 1, "%x", &lport) != 1 || lport != port) continue;
++         /* TIME_WAIT는 이미 끝난 연결이다. 접속 중인 소켓도 안전하게 거절한다. */
++         if (state != 0x0A && state != 0x06) {
++            fclose(f);
++            return false;
++         }
++         if (state == 0x0A && hb_own_inode(inode)) listening = true;
++      }
++      fclose(f);
++   }
++   return listening;
++}
++
++static void hb_guest_check(void)
++{
++   unsigned pid = 0;
++   FILE *f = fopen(HB_OWN_DIR "/guest", "r");
++   if (!f) return;
++   if (fscanf(f, "%u", &pid) == 1 && pid == (unsigned)getpid()) hb_own_guest = true;
++   fclose(f);
++}
++
++static void hb_own_init(const void *rom, size_t size, uint32_t kind, uint32_t maximum)
++{
++   const uint8_t *p = (const uint8_t *)rom;
++   uint32_t crc = 0xffffffffu;
++   char capability[128];
++   size_t i;
++   unsigned bit;
++   memset(hb_own_token, 0, sizeof(hb_own_token));
++   hb_own_applied = hb_own_guest = false;
++   hb_own_save_hint = 0;
++   hb_own_countdown = 1;
++   hb_own_kind = kind;
++   hb_own_max = maximum;
++   for (i = 0; i < size; i++) {
++      crc ^= p[i];
++      for (bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
++   }
++   hb_own_crc = ~crc;
++   if (!maximum || maximum > HB_OWN_MAX) return;
++   if (mkdir(HB_OWN_DIR, 0700) && errno != EEXIST) return;
++   snprintf(capability, sizeof(capability), "HBO1 %u %u %u %u\n",
++            (unsigned)getpid(), hb_own_crc, maximum, kind);
++   hb_atomic("core", capability, strlen(capability));
++}
++
++static void hb_own_poll(bool enabled, bool (*apply)(const uint8_t *, size_t))
++{
++   uint8_t header[44], *data;
++   uint32_t size, port;
++   uint64_t expires;
++   struct stat st;
++   int fd;
++   ssize_t n;
++   unsigned i;
++   bool token_ok = false;
++   if (!enabled || --hb_own_countdown) return;
++   hb_own_countdown = 30;
++   hb_guest_check();
++   if (hb_own_applied || hb_own_guest) return;
++   fd = open(HB_OWN_DIR "/request", O_RDONLY | O_NOFOLLOW);
++   if (fd < 0) return;
++   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 44 ||
++         st.st_size > 44 + HB_OWN_MAX) { close(fd); return; }
++   n = read(fd, header, sizeof(header));
++   if (n != sizeof(header) || memcmp(header, "HBQ1", 4) ||
++         hb_u32(header + 4) != (unsigned)getpid() || hb_u32(header + 8) != hb_own_crc) {
++      close(fd); return;
++   }
++   size = hb_u32(header + 12);
++   port = hb_u32(header + 16);
++   expires = hb_u32(header + 20) | ((uint64_t)hb_u32(header + 24) << 32);
++   for (i = 28; i < 44; i++) if (header[i]) token_ok = true;
++   if (!token_ok || size > hb_own_max || st.st_size != 44 + size || port > 65534 ||
++         !port || !hb_millis() || hb_millis() > expires || !hb_host_waiting(port)) {
++      close(fd); return;
++   }
++   data = (uint8_t *)malloc(size ? size : 1);
++   if (!data) { close(fd); return; }
++   n = size ? read(fd, data, size) : 0;
++   close(fd);
++   if (n == size && hb_millis() <= expires && hb_host_waiting(port)) {
++      /* 레트로아크의 같은 실행 스레드 안: 접속 처리보다 앞선 한 번만 바꾼다. */
++      unlink(HB_OWN_DIR "/request");
++      if (apply(data, size)) {
++         uint8_t ack[20];
++         memcpy(hb_own_token, header + 28, 16);
++         hb_own_save_hint = size;
++         hb_own_applied = true;
++         memcpy(ack, "HBA1", 4);
++         memcpy(ack + 4, hb_own_token, 16);
++         hb_atomic("ack", ack, sizeof(ack));
++      }
++   }
++   free(data);
++}
++
++static void hb_own_export(const uint8_t *save, size_t size)
++{
++   uint8_t *packet;
++   hb_guest_check();
++   if (!hb_own_guest || !hb_has_token() || !save || !size || size > HB_OWN_MAX) return;
++   packet = (uint8_t *)malloc(32 + size);
++   if (!packet) return;
++   memcpy(packet, "HBE1", 4);
++   hb_put32(packet + 4, hb_own_crc);
++   hb_put32(packet + 8, hb_own_kind);
++   hb_put32(packet + 12, size);
++   memcpy(packet + 16, hb_own_token, 16);
++   memcpy(packet + 32, save, size);
++   hb_atomic("export", packet, 32 + size);
++   free(packet);
++}
++#endif
+diff --git a/src/platform/libretro/dual/libretro_dual.c b/src/platform/libretro/dual/libretro_dual.c
+index d20d384d9786..f3befd0e87d2 100644
+--- a/src/platform/libretro/dual/libretro_dual.c
++++ b/src/platform/libretro/dual/libretro_dual.c
+@@ -55,7 +55,7 @@
+ #endif
+ 
+ #define DUAL_PLAYERS 2
+-#define DUAL_VERSION "1.1-rbfix-screenfile"
++#define DUAL_VERSION "1.2-ownsave"
+ #define DUAL_WIDTH GBA_VIDEO_HORIZONTAL_PIXELS
+ #define DUAL_HEIGHT GBA_VIDEO_VERTICAL_PIXELS
+ #define DUAL_AUDIO_CHUNK 1024
+@@ -68,6 +68,7 @@
+ 
+ #define DUAL_STATE_MAGIC 0x31444748 /* "HGD1" */
+ #define DUAL_STATE_VERSION 1
++#include "hb_ownsave.h"
+ 
+ /* Extra memory ids for test harnesses (RetroArch never asks for these). */
+ #define DUAL_MEMORY_STATS 0x4844
+@@ -827,6 +828,37 @@ static void _freePlayers(void) {
+ 	}
+ }
+ 
++
++/* 1P의 CPU와 저장은 그대로 두고 케이블과 2P 전원만 다시 켠다. */
++static bool _ownSaveApply(const uint8_t* data, size_t size) {
++    int i;
++    if (!linkOn || size > DUAL_SAVE_SIZE) return false;
++    if (size && size != 512 && size != 8192 && size != 32768 &&
++        size != 65536 && size != 131072) return false;
++    for (i = 0; i < 2; i++) {
++        struct GBA* gba = players[i].core->board;
++        players[i].core->setPeripheral(players[i].core, mPERIPH_GBA_LINK_PORT, NULL);
++        mTimingDeschedule(&gba->timing, &gba->sio.completeEvent);
++        gba->sio.siocnt &= ~0x80;
++        gba->memory.io[GBA_REG_SIOCNT >> 1] = gba->sio.siocnt;
++    }
++    GBASIOLockstepCoordinatorDeinit(&coordinator);
++    GBASIOLockstepCoordinatorInit(&coordinator);
++    memset(players[1].save, 0xFF, DUAL_SAVE_SIZE);
++    memcpy(players[1].save, data, size);
++    players[1].core->reset(players[1].core);
++    for (i = 0; i < 2; i++) {
++        players[i].driver.lockstepId = 0;
++        GBASIOLockstepCoordinatorAttach(&coordinator, &players[i].driver);
++        players[i].core->setPeripheral(players[i].core, mPERIPH_GBA_LINK_PORT, &players[i].driver.d);
++        players[i].link = TableLookup(&coordinator.players, players[i].driver.lockstepId);
++    }
++    players[1].saveUpdated = false;
++    memset(players[1].frameBuffer, 0, DUAL_WIDTH * DUAL_HEIGHT * sizeof(mColor));
++    _log(RETRO_LOG_INFO, "손님 자기 세이브 받음: %u 바이트, 2P 전원과 케이블 초기화", (unsigned)size);
++    return true;
++}
++
+ bool retro_load_game(const struct retro_game_info* game) {
+ 	if (!game || !game->data || !game->size) {
+ 		_log(RETRO_LOG_ERROR, "needs the ROM in memory");
+@@ -910,6 +942,7 @@ bool retro_load_game(const struct retro_game_info* game) {
+ 
+ 	audioConverterReset(&audioConverter, players[screenPlayer].core->audioSampleRate(players[screenPlayer].core));
+ 	gameLoaded = true;
++	hb_own_init(game->data, game->size, 1, linkOn ? DUAL_SAVE_SIZE : 0);
+ 	_log(RETRO_LOG_INFO, "loaded: %d GBA(s), link %s, screen %dP, BIOS %s, state %u bytes",
+ 	     _activePlayers(), linkOn ? "on" : "off", screenPlayer + 1, biosLoaded ? "file" : "built-in (HLE)", (unsigned) retro_serialize_size());
+ 	return true;
+@@ -926,6 +959,11 @@ void retro_unload_game(void) {
+ 	if (!gameLoaded) {
+ 		return;
+ 	}
++	/* 저장 종류 판별 전 빠른 종료는 보냈던 원본 길이를 지킨다. */
++	size_t ownSize = linkOn ? _saveSize(1) : 0;
++	if (linkOn && ((struct GBA*)players[1].core->board)->memory.savedata.type == GBA_SAVEDATA_AUTODETECT
++	    && hb_own_save_hint && hb_own_save_hint <= ownSize) ownSize = hb_own_save_hint;
++	hb_own_export(linkOn ? players[1].save : NULL, ownSize);
+ 	_writeP2Save(false);
+ 	gameLoaded = false;
+ 	_freePlayers();
+@@ -1017,6 +1055,7 @@ static void _outputAudio(bool enabled) {
+ }
+ 
+ void retro_run(void) {
++	hb_own_poll(linkOn, _ownSaveApply);
+ 	inputPollCallback();
+ 	bool updated = false;
+ 	if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated) {
+@@ -1163,7 +1202,9 @@ bool retro_serialize(void* data, size_t size) {
+ 	memset(data, 0, total);
+ 	struct DualStateHeader* header = data;
+ 	STORE_32LE(DUAL_STATE_MAGIC, 0, &header->magic);
+-	STORE_32LE(DUAL_STATE_VERSION, 0, &header->version);
++	STORE_32LE(hb_has_token() ? 2 : DUAL_STATE_VERSION, 0, &header->version);
++	memcpy(header->reserved, hb_own_token, 16);
++	hb_put32((uint8_t*)header->reserved + 16, hb_own_save_hint);
+ 	STORE_32LE(_activePlayers(), 0, &header->players);
+ 	STORE_32LE(coreStateSize, 0, &header->coreStateSize);
+ 	STORE_32LE(driverStateSize, 0, &header->driverStateSize);
+@@ -1227,7 +1268,7 @@ bool retro_unserialize(const void* data, size_t size) {
+ 		return false;
+ 	}
+ 	LOAD_32LE(value, 0, &header->version);
+-	if (value != DUAL_STATE_VERSION) {
++	if (value != DUAL_STATE_VERSION && value != 2) {
+ 		return false;
+ 	}
+ 	LOAD_32LE(value, 0, &header->players);
+@@ -1252,6 +1293,9 @@ bool retro_unserialize(const void* data, size_t size) {
+ 		return false;
+ 	}
+ 
++	uint32_t ownVersion;
++	LOAD_32LE(ownVersion, 0, &header->version);
++	if (ownVersion == 2 && hb_u32((const uint8_t*)header->reserved + 16) > DUAL_SAVE_SIZE) return false;
+ 	const uint8_t* base = (const uint8_t*) data + sizeof(*header);
+ 	size_t stride = _playerStateSize();
+ 	int i;
+@@ -1278,6 +1322,12 @@ bool retro_unserialize(const void* data, size_t size) {
+ 			return false;
+ 		}
+ 	}
++	memset(hb_own_token, 0, 16);
++	hb_own_save_hint = 0;
++	if (ownVersion == 2) {
++		memcpy(hb_own_token, header->reserved, 16);
++		hb_own_save_hint = hb_u32((const uint8_t*)header->reserved + 16);
++	}
+ 	return true;
+ }
+ 

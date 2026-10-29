@@ -1,0 +1,40 @@
+diff --git a/dual/libretro_dual.c b/dual/libretro_dual.c
+index d64c05b..516a654 100644
+--- a/dual/libretro_dual.c
++++ b/dual/libretro_dual.c
+@@ -48,6 +48,8 @@
+ /* 넷플레이 버전 칸은 끝 글자 포함 32바이트 */
+ typedef char hb_version_fits_netplay[(sizeof(DUAL_VERSION) <= 32) ? 1 : -1];
+ 
++/* (10/26 유니트론) 2P 기계 시계를 1P 보다 몇 초 늦게 — 진짜 두 대처럼 켤 때 시각이 달라야 RTC 로 난수 씨앗을 정하는 게임(기갑세기 유니트론)이 두 기계에서 똑같은 난수로 선공 정하기를 끝없이 비기지 않음 */
++#define HB_P2_RTC_SKEW 3
+ #define DUAL_MEMORY_RAM   0x5700  /* +0 1P · +1 2P: RAM 16KiB(0x4000~0x7FFF) */
+ #define DUAL_MEMORY_FRAME 0x5720  /* +0 1P · +1 2P: 화면 160×152 RGB565 */
+ #define DUAL_MEMORY_STATS 0x5730
+@@ -426,7 +428,7 @@ static bool reloadP2Same(void)
+    inner[1].set_link(1);
+    if (!inner[1].load_game(&back))
+       return false;
+-   inner[1].set_rtc_base(rtcBase);
++   inner[1].set_rtc_base(rtcBase + HB_P2_RTC_SKEW);
+    romHash[1] = inner[1].rom_hash();
+    stats.p2Loaded = 0;
+    return true;
+@@ -478,7 +480,7 @@ static bool reloadP2(void *rom, size_t size, const char *path)
+    inner[1].set_link(1);
+    if (!inner[1].load_game(&p2info))
+       return false;
+-   inner[1].set_rtc_base(rtcBase);
++   inner[1].set_rtc_base(rtcBase + HB_P2_RTC_SKEW);
+    return true;
+ }
+ 
+@@ -752,7 +754,7 @@ bool retro_load_game(const struct retro_game_info *info)
+       if (fixed && fixed[0])
+          base = (int64_t)strtoll(fixed, NULL, 10);
+       inner[0].set_rtc_base(base);
+-      inner[1].set_rtc_base(base);
++      inner[1].set_rtc_base(base + HB_P2_RTC_SKEW);
+       rtcBase = base;
+    }
+    /* 각자 자기 세이브: 1P 롬 CRC · 2P 가 짝이면 그 CRC · 짝 요청을 알아들음 */

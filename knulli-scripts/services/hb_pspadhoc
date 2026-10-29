@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# KNULLI service: keeps /userdata/system/claude/hb_pspadhoc.py running - a PPSSPP ad-hoc server (port 27312) that writes
+# the server with the lowest IP on the same Wi-Fi to /etc/hosts as "hbpsp". Point PPSSPP at it with
+# psp.ppsspp.Network.proAdhocServer=hbpsp in knulli.conf. Details at the top of hb_pspadhoc.py.
+# Enable: add "hb_pspadhoc" to system.services in /userdata/system/knulli.conf (S99userservices starts it at boot).
+# Disable: remove that word and reboot. Install this file as /userdata/system/services/hb_pspadhoc
+P=/var/run/hb_pspadhoc.pid
+case "$1" in
+  start|"")
+    if [ -f "$P" ] && kill -0 "$(cat "$P")" 2>/dev/null; then
+      exit 0
+    fi
+    python3 /userdata/system/claude/hb_pspadhoc.py >> /tmp/hb_pspadhoc.log 2>&1 < /dev/null &
+    echo $! > "$P"
+    ;;
+  stop)
+    [ -f "$P" ] && kill "$(cat "$P")" 2>/dev/null
+    rm -f "$P"
+    ;;
+esac
+exit 0

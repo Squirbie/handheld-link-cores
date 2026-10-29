@@ -1,0 +1,287 @@
+Subject: Libretro dual: single-pak link, the 2P GBA boots without a cartridge from the real BIOS (mgba_dual_p2_nocart)
+Series-Step: 19/19 (mgba_dual 1.6-os4)
+Origin: hanbang (this project)
+요약: 1.6 싱글팩 — 게임별 옵션 mgba_dual_p2_nocart=enabled 이면 2P 게임기를 팩 없이 진짜 바이오스로 켜서, 방장(1P)의 멀티부트 프로그램을 받게 함(봄버맨 스토리 · 매지컬 퀘스트 · 샨테). 옵션이 꺼져 있으면(기본) 1.5 와 바이트까지 같음.
+
+With the per-game core option mgba_dual_p2_nocart = enabled (read at load, link on, BIOS available) the 2P GBA is
+created without a ROM: the BIOS is loaded first, the cartridge area is an open bus, no save chip (FORCE_NONE), and the
+BIOS waits for the multiboot signal (0x6200) of player 1 as on a real console. If the BIOS cannot be used (file missing,
+use_bios off) the 2P GBA runs from the pack as before and a log line says so. The state version field gets
+DUAL_STATE_NOCART16 only for a no-cartridge 2P; 1.5 and older refuse it. The guest sends no save (only an ACK), the
+.p2.srm slot is not read or written, and the guest core binds to no exchange. With the option off the behaviour is
+byte-identical to 1.5. Version string 1.6-os4.
+
+---
+diff --git a/src/platform/libretro/dual/hb_ownsave.h b/src/platform/libretro/dual/hb_ownsave.h
+index bc0629e75bfe..97082443012c 100644
+--- a/src/platform/libretro/dual/hb_ownsave.h
++++ b/src/platform/libretro/dual/hb_ownsave.h
+@@ -16,6 +16,11 @@
+  * 1.5 짝 게임(다른 판끼리, GBA 만): 방장 요청이 HBQ4(= HBQ3 + 2P 롬 CRC · 경로)면 그 롬을 이 기기에서 읽어
+  *   CRC 가 같을 때만 2P 게임기를 그 롬으로 바꾸고 손님 세이브를 넣는다(다르면 /tmp/hb_ownsave/reject 에 거절).
+  *   손님 쪽 거래 · 되쓰기의 게임 CRC 는 2P 롬 CRC(hb_own_p2crc, 짝이 아니면 콘텐츠 CRC 그대로).
++ *
++ * 1.6 싱글팩(2P 팩 없음, hb_nocart): 2P 게임기에 팩이 없어 손님 세이브를 넣을 곳이 없다.
++ *   방장: HBQ3 는 세이브를 넣지 않고 받음 확인(ack)만 — 손님 도우미(5판)가 기다리거나 '못 보냄' 알림 없이 바로 같이하기.
++ *         표는 상태에 넣지 않음(손님 코어가 무엇에 묶여도 되쓰기 조건이 안 됨). HBQ4(짝)는 거절 5 → 손님은 바로 혼자 하기.
++ *   손님: intent 에 묶지 않음(거래 · 중간 저장 · 끝 되쓰기 없음). 1P 세이브는 지금처럼 읽지도 쓰지도 않음.
+  */
+ #ifndef HB_OWNSAVE_H
+ #define HB_OWNSAVE_H
+@@ -40,6 +45,8 @@ static uint32_t hb_own_crc, hb_own_kind, hb_own_max, hb_own_save_hint;
+ /* 1.5 짝 게임: 코어가 hb_own_init 앞에 정함(2P 가 다른 롬이면 켬 · 그 롬 CRC) */
+ static bool hb_pair_on;
+ static uint32_t hb_pair_crc, hb_own_p2crc;
++/* 1.6 싱글팩: 코어가 hb_own_init 앞에 정함(2P 를 팩 없이 켰음) */
++static bool hb_nocart;
+ static unsigned hb_own_countdown;
+ static bool hb_own_applied, hb_own_guest, hb_own_p2_skip_logged;
+ static uint8_t hb_generation[8];
+@@ -361,6 +368,11 @@ static void hb_local_init(void)
+ 
+    if (!hb_launched_as_guest()) return;
+    hb_own_guest = true;
++   if (hb_nocart) {
++      /* 1.6 싱글팩: 2P 에 팩(세이브)이 없어 이 판 2P 진행은 내 세이브가 아님 — 보낸 거래가 있어도 묶지 않음 */
++      HB_LOG(RETRO_LOG_INFO, "각자 세이브: 2P 팩 없음(싱글팩) — 거래에 묶지 않음(중간 저장 · 끝 되쓰기 없음)");
++      return;
++   }
+ 
+    /* intent: "HBI3" 표[16] CRC[4] 기종[4] 초[8] 거래 폴더 "\n" */
+    fd = open(HB_OWN_DIR "/intent", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+@@ -456,6 +468,7 @@ static void hb_own_init(const void *rom, size_t size, uint32_t kind, uint32_t ma
+ #define HB_PAIR_CRC 2       /* 2P 롬 CRC 가 손님 것과 다름 */
+ #define HB_PAIR_SAME 3      /* 2P 롬이 1P 와 같은 롬(짝 아님) */
+ #define HB_PAIR_APPLY 4     /* 2P 게임기를 새 롬으로 못 켬 */
++#define HB_PAIR_NOCART 5    /* 1.6: 방장 2P 가 팩 없음(싱글팩) — 짝 롬을 끼울 수 없음 */
+ static void hb_pair_reject(const uint8_t *token, uint32_t why, const char *path, const char *detail)
+ {
+    uint8_t reject[24];
+@@ -537,6 +550,24 @@ static void hb_own_poll(bool enabled, bool (*apply)(const uint8_t *, size_t),
+    }
+    n = size ? read(fd, data, size) : 0;
+    close(fd);
++   if (hb_nocart) {
++      /* 1.6 싱글팩 방장: 2P 에 팩이 없어 세이브를 넣지 않음. 짝 요청은 바로 거절(손님 혼자 하기),
++       * 보통 요청은 대기 중일 때 받음 확인만(표 · 크기 힌트는 상태에 안 넣음 → 손님 되쓰기 조건이 안 됨) */
++      if (pair) {
++         hb_pair_reject(header + 28, HB_PAIR_NOCART, path, "방장 2P 팩 없음(싱글팩)");
++      } else if (n == (ssize_t)size && hb_millis() <= expires && hb_host_waiting(port)) {
++         uint8_t ack[20];
++         unlink(HB_OWN_DIR "/request");
++         hb_own_applied = true;
++         memcpy(ack, "HBA3", 4);
++         memcpy(ack + 4, header + 28, 16);
++         hb_atomic("ack", ack, sizeof(ack));
++         HB_LOG(RETRO_LOG_INFO, "2P 팩 없음(싱글팩): 손님 세이브 %u 바이트는 넣지 않고 받음 확인만 — 손님은 바로 같이하기",
++                (unsigned)size);
++      }
++      free(data);
++      return;
++   }
+    if (pair && n == (ssize_t)size) {
+       /* 롬 읽기(몇십 ms)는 마지막 대기 확인보다 앞에서 */
+       uint32_t romCrc = 0;
+diff --git a/src/platform/libretro/dual/libretro_dual.c b/src/platform/libretro/dual/libretro_dual.c
+index 499cd02cd3a0..dff2a791bcee 100644
+--- a/src/platform/libretro/dual/libretro_dual.c
++++ b/src/platform/libretro/dual/libretro_dual.c
+@@ -63,7 +63,12 @@
+ /* 1.5(10/21) = 1.4.1 + 짝 게임: 2P 게임기가 다른 판(짝) 롬을 쓸 수 있음. 손님은 /tmp/hb_dual_p2rom,
+  * 방장은 손님 세이브 요청(HBQ4)의 2P 롬. 짝일 때만 상태 판 칸에 DUAL_STATE_PAIR15 + 2P 롬 CRC
+  * (짝이 아니면 상태 · 동작이 1.4.1 과 바이트까지 같음). */
+-#define DUAL_VERSION "1.5-os4"
++/* 1.6(10/21) = 1.5 + 싱글팩(팩 하나로 여럿이): 게임별 코어 옵션 mgba_dual_p2_nocart = enabled 이면 2P 게임기를
++ * 팩 없이(롬 없이) 진짜 바이오스로 켬 → 바이오스가 방장(1P)에게서 프로그램을 받아 돌림(멀티부트).
++ * 바이오스를 못 쓰면(파일 없음 · use_bios 꺼짐) 2P 를 팩으로 켜고 기록만 남김. 그때만 상태 판 칸에
++ * DUAL_STATE_NOCART16 — 1.5 이하 · 팩 있는 2P 와는 서로 거절(몰래 어긋나지 않게). 2P 에 팩이 없으니
++ * 손님 세이브는 넣지 않고(받음 확인만) · 2P 칸(.p2.srm) · 손님 되쓰기도 없음. 옵션이 꺼져 있으면(기본) 1.5 와 바이트까지 같음. */
++#define DUAL_VERSION "1.6-os4"
+ #define DUAL_WIDTH GBA_VIDEO_HORIZONTAL_PIXELS
+ #define DUAL_HEIGHT GBA_VIDEO_VERTICAL_PIXELS
+ #define DUAL_AUDIO_CHUNK 1024
+@@ -81,6 +86,9 @@
+  * 1.5 는 짝 여부 · 2P 롬 CRC 가 다른 상태를 거절(서로 다른 짝끼리 몰래 어긋나지 않게). */
+ #define DUAL_STATE_PAIR15 0x200
+ #define DUAL_PAIR_CRC_AT 24 /* header->reserved 안 바이트 위치 */
++/* 1.6: 2P 가 팩 없이 바이오스로 켜진 두 대 상태. 1.5 이하는 남는 판 칸 때문에 거절하고,
++ * 1.6 은 팩 없음 여부가 다른 상태를 거절. */
++#define DUAL_STATE_NOCART16 0x400
+ #include "hb_ownsave.h"
+ 
+ /* Extra memory ids for test harnesses (RetroArch never asks for these). */
+@@ -201,6 +209,8 @@ static uint32_t p2RomCrc;
+ static char biosPathSaved[PATH_MAX];
+ static bool biosPathValid;
+ static struct mCoreOptions optsSaved;
++/* 1.6 싱글팩: 이번 실행에서 2P 게임기가 팩 없이 바이오스로 켜졌는지(켤 때 한 번 정함) */
++static bool p2NoCart;
+ 
+ /* Trace-only netplay check: hashes of the states this core produced (and
+  * received). Loading anything else is a state that came over the network:
+@@ -628,6 +638,8 @@ void retro_set_environment(retro_environment_t env) {
+ 		{ "mgba_dual_screen", "Screen and sound (host/solo = 1P, guest = 2P); 1P|2P" },
+ 		{ "mgba_dual_use_bios", "Use BIOS file if found (same on both devices); ON|OFF" },
+ 		{ "mgba_dual_skip_bios", "Skip BIOS intro (same on both devices); OFF|ON" },
++		/* 1.6 싱글팩: 게임별 .opt 로만 켬(두 기기 같은 값) — 켤 때 한 번 읽음 */
++		{ "mgba_dual_p2_nocart", "2P without cartridge, single-pak link (restart content, same on both devices); disabled|enabled" },
+ 		{ NULL, NULL },
+ 	};
+ 	env(RETRO_ENVIRONMENT_SET_VARIABLES, (void*) vars);
+@@ -744,18 +756,36 @@ static bool _setupPlayer(int i, const char* biosPath, const struct mCoreOptions*
+ 	memset(player->save, 0xFF, DUAL_SAVE_SIZE);
+ 	core->setVideoBuffer(core, player->videoBuffer, DUAL_WIDTH);
+ 
+-	/* Both cores read the same ROM image; mGBA copies on write if a game ever writes ROM
+-	 * (1.5: 짝 게임이면 2P 만 짝 롬) */
+-	struct VFile* rom = (i == 1 && p2RomData) ? VFileFromMemory(p2RomData, p2RomSize) : VFileFromMemory(romData, romSize);
+-	if (!rom || !core->loadROM(core, rom)) {
+-		return false;
+-	}
+-	if (biosPath && opts->useBios) {
+-		struct VFile* bios = VFileOpen(biosPath, O_RDONLY);
+-		if (bios && core->loadBIOS(core, bios, 0)) {
++	/* 1.6 싱글팩: 2P 는 팩(롬) 없이 진짜 바이오스로. 바이오스를 먼저 넣어 보고, 못 넣으면 팩으로 켬(기록만).
++	 * 롬을 안 넣으면 mGBA 의 카트 자리는 실제 GBA 처럼 열린 버스(롬 크기 0)이고, 롬 영역 쓰기는 무시됨. */
++	bool noCart = i == 1 && p2NoCart;
++	if (noCart) {
++		struct VFile* bios = biosPath && opts->useBios ? VFileOpen(biosPath, O_RDONLY) : NULL;
++		if (bios && core->loadBIOS(core, bios, 0) && ((struct GBA*) core->board)->memory.fullBios) {
+ 			biosLoaded = true;
+-		} else if (bios) {
+-			bios->close(bios);
++		} else {
++			if (bios && !((struct GBA*) core->board)->biosVf) {
++				bios->close(bios);
++			}
++			_log(RETRO_LOG_WARN, "2P 팩 없음: 바이오스를 못 넣음 — 2P 를 팩으로 켬(싱글팩 같이하기 안 됨)");
++			p2NoCart = false;
++			noCart = false;
++		}
++	}
++	if (!noCart) {
++		/* Both cores read the same ROM image; mGBA copies on write if a game ever writes ROM
++		 * (1.5: 짝 게임이면 2P 만 짝 롬) */
++		struct VFile* rom = (i == 1 && p2RomData) ? VFileFromMemory(p2RomData, p2RomSize) : VFileFromMemory(romData, romSize);
++		if (!rom || !core->loadROM(core, rom)) {
++			return false;
++		}
++		if (biosPath && opts->useBios) {
++			struct VFile* bios = VFileOpen(biosPath, O_RDONLY);
++			if (bios && core->loadBIOS(core, bios, 0)) {
++				biosLoaded = true;
++			} else if (bios) {
++				bios->close(bios);
++			}
+ 		}
+ 	}
+ 	core->rtc.override = RTC_FAKE_EPOCH;
+@@ -800,10 +830,20 @@ static bool _setupPlayer(int i, const char* biosPath, const struct mCoreOptions*
+ 		 * → 실제 GBA 가 켜진 뒤의 값으로 둠(짝이 아니면 이 줄을 지나지 않음) */
+ 		((struct GBA*) core->board)->memory.biosPrefetch = 0xE129F000;
+ 	}
++	if (noCart && !((struct GBA*) core->board)->memory.biosPrefetch) {
++		/* 1.6 싱글팩: 팩 없는 2P 는 바이오스 안에서만 돌다가(받기 끝날 때까지) 처음 바이오스를 벗어날 때
++		 * 이 값이 정해짐. 0 인 상태로 되감으면 mGBA 가 읽지 않고 지금 값을 둠(serialize.c) → 1.5 짝 게임과 같은
++		 * 까닭으로 상태 대조가 어긋남. 켜진 뒤의 값으로 둠(바이오스 안에서는 이 값을 읽는 일이 없어 동작은 같음). */
++		((struct GBA*) core->board)->memory.biosPrefetch = 0xE129F000;
++	}
+ 	struct VFile* save = VFileFromMemory(player->save, DUAL_SAVE_SIZE);
+ 	if (!save || !core->loadSave(core, save)) {
+ 		return false;
+ 	}
++	if (noCart) {
++		/* 팩이 없으니 세이브 칩도 없음(세이브 영역 읽기 = 0xFF, 쓰기 무시) — 2P 세이브는 늘 비어 있음 */
++		GBASavedataForceType(&((struct GBA*) core->board)->memory.savedata, GBA_SAVEDATA_FORCE_NONE);
++	}
+ 	return true;
+ }
+ 
+@@ -839,6 +879,8 @@ static void _freePlayers(void) {
+ 	p2RomSize = 0;
+ 	p2RomCrc = 0;
+ 	hb_pair_on = false;
++	p2NoCart = false;
++	hb_nocart = false;
+ }
+ 
+ /* 1.5 손님: /tmp/hb_dual_p2rom(한 줄 = 2P 롬 경로, ZIP 이면 안의 .gba 하나)이 있으면 2P 게임기에 그 롬.
+@@ -1077,7 +1119,21 @@ bool retro_load_game(const struct retro_game_info* game) {
+ 	optsSaved = opts;
+ 	hb_pair_on = false;
+ 	hb_logger = _log;
+-	if (linkOn) {
++	/* 1.6 싱글팩: 켤 때 한 번(게임별 .opt). 케이블이 켜져 있고 바이오스를 쓸 수 있을 때만 — 아니면 기록만 */
++	p2NoCart = false;
++	value = _getVariable("mgba_dual_p2_nocart");
++	if (value && strcmp(value, "enabled") == 0) {
++		if (!linkOn) {
++			_log(RETRO_LOG_INFO, "2P 팩 없음 옵션: 케이블 꺼짐(혼자) — 쓰지 않음");
++		} else if (!bios || !opts.useBios) {
++			_log(RETRO_LOG_WARN, "2P 팩 없음 옵션: 바이오스 %s — 2P 를 팩으로 켬(싱글팩 같이하기 안 됨)",
++			     opts.useBios ? "폴더 없음" : "끔(mgba_dual_use_bios)");
++		} else {
++			p2NoCart = true;
++		}
++	}
++	hb_nocart = false;
++	if (linkOn && !p2NoCart) {
+ 		_p2RomFromFile();
+ 	}
+ 
+@@ -1098,11 +1154,17 @@ bool retro_load_game(const struct retro_game_info* game) {
+ 	}
+ 	hb_pair_on = p2RomData != NULL;
+ 	hb_pair_crc = p2RomCrc;
++	/* 1.6: 2P 를 실제로 팩 없이 켰을 때만(바이오스를 못 넣어 팩으로 켰으면 보통 두 대) */
++	hb_nocart = linkOn && p2NoCart;
+ 	hb_own_init(game->data, game->size, 1, linkOn ? DUAL_SAVE_SIZE : 0);
+ 	p2SavePath[0] = '\0';
+ 	if (linkOn) {
+ 		_setP2SavePath(game);
+-		if (p2RomData) {
++		if (p2NoCart) {
++			/* 싱글팩: 2P 에 팩(세이브)이 없음 — 2P 칸(<롬>.p2.srm)은 읽지도 쓰지도 않음 */
++			p2SavePath[0] = '\0';
++			_log(RETRO_LOG_INFO, "2P 팩 없음: 2P 게임기를 롬 없이 바이오스로 켬(싱글팩 받기) — 2P 칸 · 손님 되쓰기 없음");
++		} else if (p2RomData) {
+ 			/* 짝 게임 손님: 2P 는 방장 상태로 받음 — 1P 롬 이름의 2P 칸은 읽지도 쓰지도 않음 */
+ 			p2SavePath[0] = '\0';
+ 		} else {
+@@ -1390,8 +1452,9 @@ bool retro_serialize(void* data, size_t size) {
+ 	struct DualStateHeader* header = data;
+ 	STORE_32LE(DUAL_STATE_MAGIC, 0, &header->magic);
+ 	bool pair = linkOn && p2RomData;
+-	STORE_32LE((hb_has_token() ? 3 : DUAL_STATE_VERSION) | (linkOn ? DUAL_STATE_LINK14 : 0) | (pair ? DUAL_STATE_PAIR15 : 0),
+-	           0, &header->version);
++	bool noCart = linkOn && p2NoCart;
++	STORE_32LE((hb_has_token() ? 3 : DUAL_STATE_VERSION) | (linkOn ? DUAL_STATE_LINK14 : 0) | (pair ? DUAL_STATE_PAIR15 : 0)
++	           | (noCart ? DUAL_STATE_NOCART16 : 0), 0, &header->version);
+ 	memcpy(header->reserved, hb_own_token, 16);
+ 	hb_put32((uint8_t*)header->reserved + 16, hb_own_save_hint);
+ 	hb_put32((uint8_t*)header->reserved + 20, hb_has_token() ? hb_own_frame : 0);
+@@ -1484,7 +1547,14 @@ bool retro_unserialize(const void* data, size_t size) {
+ 		     (unsigned) hb_u32((const uint8_t*)header->reserved + DUAL_PAIR_CRC_AT), (unsigned) p2RomCrc);
+ 		return false;
+ 	}
+-	value &= ~(DUAL_STATE_LINK14 | DUAL_STATE_PAIR15);
++	/* 1.6: 2P 팩 없음(싱글팩) 상태는 2P 를 팩 없이 켠 쪽만 읽음(1.5 · 팩 있는 2P 와 서로 거절) */
++	bool noCart = linkOn && p2NoCart;
++	if (!!(value & DUAL_STATE_NOCART16) != noCart) {
++		_log(RETRO_LOG_ERROR, "%s", noCart ? "state has a 2P cartridge; both sides need mgba_dual_p2_nocart (and the BIOS)"
++		                                   : "2P-without-cartridge (single-pak) state; set mgba_dual_p2_nocart on both devices (1.6)");
++		return false;
++	}
++	value &= ~(DUAL_STATE_LINK14 | DUAL_STATE_PAIR15 | DUAL_STATE_NOCART16);
+ 	if (value != DUAL_STATE_VERSION && value != 2 && value != 3) {
+ 		return false;
+ 	}
+@@ -1512,7 +1582,7 @@ bool retro_unserialize(const void* data, size_t size) {
+ 
+ 	uint32_t ownVersion;
+ 	LOAD_32LE(ownVersion, 0, &header->version);
+-	ownVersion &= ~(DUAL_STATE_LINK14 | DUAL_STATE_PAIR15);
++	ownVersion &= ~(DUAL_STATE_LINK14 | DUAL_STATE_PAIR15 | DUAL_STATE_NOCART16);
+ 	if (ownVersion >= 2 && hb_u32((const uint8_t*)header->reserved + 16) > DUAL_SAVE_SIZE) return false;
+ 	const uint8_t* base = (const uint8_t*) data + sizeof(*header);
+ 	size_t stride = _playerStateSize();

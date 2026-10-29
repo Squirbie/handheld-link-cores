@@ -1,0 +1,2043 @@
+From 9adae5baeba1ea90a61c15fc686269de3cb7ff0e Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Thu, 22 Oct 2026 00:46:44 +0900
+Subject: [PATCH 1/2] GG Dual: Gear-to-Gear link hooks, line-stepped SMS/GG
+ frame, two-console wrapper (hanbang 10/22)
+
+---
+ core/hb_gglink.h     |   43 ++
+ core/io_ctrl.c       |   67 +++
+ core/system.c        |  454 +++++++++++++++++
+ core/system.h        |    3 +
+ dual/build_dual.sh   |   32 ++
+ dual/libretro_dual.c | 1122 ++++++++++++++++++++++++++++++++++++++++++
+ dual/link_dual.T     |    4 +
+ libretro/libretro.c  |  175 ++++++-
+ 8 files changed, 1885 insertions(+), 15 deletions(-)
+ create mode 100644 core/hb_gglink.h
+ create mode 100755 dual/build_dual.sh
+ create mode 100644 dual/libretro_dual.c
+ create mode 100644 dual/link_dual.T
+
+diff --git a/core/hb_gglink.h b/core/hb_gglink.h
+new file mode 100644
+index 0000000..f9b1e05
+--- /dev/null
++++ b/core/hb_gglink.h
+@@ -0,0 +1,43 @@
++/***************************************************************************************
++ *  한방 10/22: 게임기어 두 대 통신(기어 투 기어 케이블) 고리
++ *
++ *  이 파일의 고리는 dual/libretro_dual.c(Genesis Plus GX GG Dual)만 씀.
++ *  hb_gg_link_on == 0(기본)이면 io_ctrl.c 의 게임기어 포트 0x01~0x05 는 원래 Genesis Plus GX 와
++ *  한 글자도 다르지 않게 돔(혼자 = 원래 코어와 같은 그림 · 소리).
++ *
++ *  실기 근거(SMS Power "Gear to Gear Cable" · 1993 개발 문서 jon.txt):
++ *   - 포트 0x01 병렬 7비트(PC0~PC6), 0x02 방향(1 = 입력) · 비트7 NMI 허용,
++ *     케이블이 비트를 엇갈려 이음: 0<->2, 1<->3, 4<->5, 6<->6
++ *   - 포트 0x03 보낼 바이트, 0x04 받은 바이트, 0x05 상태/설정:
++ *     비트0 보내는 중 · 비트1 받은 바이트 있음 · 비트2 상대 꺼짐/오류 · 비트3 받으면 NMI ·
++ *     비트4 보내기(PC4=TX) · 비트5 받기(PC5=RX) · 비트6~7 속도(4800/2400/1200/300bps)
++ *
++ *  Copyright (C) 2026 hanbang — Genesis Plus GX 라이선스(LICENSE.txt, 비상업)를 따름.
++ ****************************************************************************************/
++#ifndef _HB_GGLINK_H_
++#define _HB_GGLINK_H_
++
++#include <stdint.h>
++
++struct hb_gg_link_ops
++{
++  /* 상대가 내 핀에 보이는 병렬 값(케이블 엇갈림 적용, 비트0~6, 아무도 안 모는 줄 = 1) */
++  uint8_t (*par_in)(void *ctx);
++  /* 내 포트 0x01/0x02 를 썼음(PC6 → 상대 NMI 판단용) */
++  void (*par_out)(void *ctx);
++  /* 포트 0x03 을 썼음(보내기 시작) */
++  void (*tx)(void *ctx, uint8_t data);
++  /* 포트 0x04 를 읽었음(받은 바이트를 가져감) */
++  void (*rx_read)(void *ctx);
++  /* 포트 0x05 를 썼음 */
++  void (*ctrl)(void *ctx);
++  void *ctx;
++};
++
++/* 0 이면 원래 동작. 래퍼가 게임을 켤 때 1 로 */
++extern int hb_gg_link_on;
++extern struct hb_gg_link_ops hb_gg_link;
++/* 시험용 기록: 포트 0x01~0x05 읽기쓰기를 래퍼에 알림(NULL 이면 안 함) */
++extern void (*hb_gg_port_trace)(void *ctx, int write, unsigned port, unsigned value);
++
++#endif
+diff --git a/core/io_ctrl.c b/core/io_ctrl.c
+index e4799ec..34f85a7 100644
+--- a/core/io_ctrl.c
++++ b/core/io_ctrl.c
+@@ -49,9 +49,15 @@
+ #include "paddle.h"
+ #include "sportspad.h"
+ #include "graphic_board.h"
++#include "hb_gglink.h"
+ 
+ uint8 io_reg[0x10];
+ 
++/* 한방 10/22: 게임기어 두 대 통신 고리(hb_gglink.h). 꺼져 있으면(기본) 원래 동작 */
++int hb_gg_link_on = 0;
++struct hb_gg_link_ops hb_gg_link;
++void (*hb_gg_port_trace)(void *ctx, int write, unsigned port, unsigned value) = 0;
++
+ uint8 region_code = REGION_USA;
+ 
+ static struct port_t
+@@ -603,21 +609,45 @@ unsigned int io_z80_read(unsigned int offset)
+ 
+ void io_gg_write(unsigned int offset, unsigned int data)
+ {
++  if (hb_gg_port_trace && (offset >= 1) && (offset <= 5))
++  {
++    hb_gg_port_trace(hb_gg_link.ctx, 1, offset, data);
++  }
++
+   switch (offset)
+   {
+     case 1: /* Parallel data register */
+       io_reg[1] = data;
++      if (hb_gg_link_on)
++      {
++        hb_gg_link.par_out(hb_gg_link.ctx);
++      }
+       return;
+ 
+     case 2: /* Data direction register and NMI enable */
+       io_reg[2] = data;
++      if (hb_gg_link_on)
++      {
++        hb_gg_link.par_out(hb_gg_link.ctx);
++      }
+       return;
+ 
+     case 3: /* Transmit data buffer */
+       io_reg[3] = data;
++      if (hb_gg_link_on)
++      {
++        hb_gg_link.tx(hb_gg_link.ctx, data);
++      }
+       return;
+ 
+     case 5: /* Serial control (bits 0-2 are read-only) */
++      if (hb_gg_link_on)
++      {
++        /* 한방: 상태 비트0~2 는 래퍼가 관리 — 쓰기로 지우지 않음 */
++        io_reg[5] = (data & 0xF8) | (io_reg[5] & 0x07);
++        hb_gg_link.ctrl(hb_gg_link.ctx);
++        return;
++      }
+       io_reg[5] = data & 0xF8;
+       return;
+ 
+@@ -631,7 +661,44 @@ void io_gg_write(unsigned int offset, unsigned int data)
+   }
+ }
+ 
++static unsigned int io_gg_read_orig(unsigned int offset);
++
+ unsigned int io_gg_read(unsigned int offset)
++{
++  unsigned int data;
++
++  /* 한방 10/22: 연결 꺼짐 · 기록 없음이면 원래 함수 그대로 */
++  if (!hb_gg_link_on && !hb_gg_port_trace)
++  {
++    return io_gg_read_orig(offset);
++  }
++
++  if (hb_gg_link_on && (offset == 1))
++  {
++    /* 입력으로 둔 핀(방향 비트 1)은 케이블 건너편이 모는 값(아무도 안 몰면 1) */
++    unsigned int in = hb_gg_link.par_in(hb_gg_link.ctx) & 0x7F;
++    data = (io_reg[1] & ~(io_reg[2] & 0x7F)) | (io_reg[2] & 0x7F & in);
++  }
++  else
++  {
++    data = io_gg_read_orig(offset);
++  }
++
++  if (hb_gg_link_on && (offset == 4))
++  {
++    /* 받은 바이트를 가져감 → 받음 비트를 끄고 다음 바이트를 받을 수 있게 */
++    hb_gg_link.rx_read(hb_gg_link.ctx);
++  }
++
++  if (hb_gg_port_trace && (offset >= 1) && (offset <= 5))
++  {
++    hb_gg_port_trace(hb_gg_link.ctx, 0, offset, data);
++  }
++
++  return data;
++}
++
++static unsigned int io_gg_read_orig(unsigned int offset)
+ {
+   switch (offset)
+   {
+diff --git a/core/system.c b/core/system.c
+index 669f22d..04d09af 100644
+--- a/core/system.c
++++ b/core/system.c
+@@ -1394,3 +1394,457 @@ void system_frame_sms(int do_skip)
+   input_end_frame(mcycles_vdp);
+   Z80.cycles -= mcycles_vdp;
+ }
++
++
++/*--------------------------------------------------------------------------*/
++/* 한방 10/22: system_frame_sms 를 가로줄 하나씩 나눈 판                    */
++/*                                                                          */
++/* 게임기어 두 대를 한 코어에서 돌릴 때 두 기계를 줄마다 번갈아 돌리려고    */
++/* 만듦. 하는 일은 위 system_frame_sms 와 같고(같은 차례 · 같은 계산), 한 장 */
++/* = hb_frame_sms_begin() 한 번 + hb_frame_sms_line() 이 1 을 돌려줄 때까지 */
++/* (lines_per_frame 번). 장 가운데의 값은 상태 저장에 안 들어가므로 장이    */
++/* 끝난 뒤에만 상태를 저장 · 불러와야 함(레트로아크는 늘 장 사이에서 함).   */
++/*--------------------------------------------------------------------------*/
++static int hb_sms_phase, hb_sms_line_no, hb_sms_start, hb_sms_end, hb_sms_skip;
++
++void hb_frame_sms_begin(int do_skip)
++{
++  /* reset frame cycle count */
++  mcycles_vdp = 0;
++
++  /* reset VDP FIFO */
++  fifo_write_cnt = 0;
++  fifo_slots = 0;
++
++  /* check if display settings has changed during previous frame */
++  if (bitmap.viewport.changed & 2)
++  {
++    bitmap.viewport.changed &= ~2;
++
++    if (system_hw & SYSTEM_MD)
++    {
++      /* interlaced modes */
++      int old_interlaced = interlaced;
++      interlaced = (reg[12] & 0x02) >> 1;
++
++      if (old_interlaced != interlaced)
++      {
++        /* double resolution mode */
++        im2_flag = ((reg[12] & 0x06) == 0x06);
++
++        /* reset field status flag */
++        odd_frame = interlaced;
++
++        /* video mode has changed */
++        bitmap.viewport.changed = 5;
++
++        /* update rendering mode */
++        if (reg[1] & 0x04)
++        {
++          if (im2_flag)
++          {
++            render_bg = (reg[11] & 0x04) ? render_bg_m5_im2_vs : render_bg_m5_im2;
++            render_obj = (reg[12] & 0x08) ? render_obj_m5_im2_ste : render_obj_m5_im2;
++          }
++          else
++          {
++            render_bg = (reg[11] & 0x04) ? render_bg_m5_vs : render_bg_m5;
++            render_obj = (reg[12] & 0x08) ? render_obj_m5_ste : render_obj_m5;
++          }
++        }
++      }
++
++      /* active screen height */
++      if (reg[1] & 0x04)
++      {
++        /* Mode 5 */
++        if (reg[1] & 0x08)
++        {
++          /* 240 active lines */
++          bitmap.viewport.h = 240;
++          bitmap.viewport.y = (config.overscan & 1) * 24 * vdp_pal;
++        }
++        else
++        {
++          /* 224 active lines */
++          bitmap.viewport.h = 224;
++          bitmap.viewport.y = (config.overscan & 1) * (8 + (24 * vdp_pal));
++        }
++      }
++      else
++      {
++        bitmap.viewport.h = 192;
++        bitmap.viewport.y = (config.overscan & 1) * 24 * (vdp_pal + 1);
++      }
++    }
++    else
++    {
++      /* check for VDP extended modes */
++      int mode = (reg[0] & 0x06) | (reg[1] & 0x18);
++
++      /* update active height */
++      if (mode == 0x0E)
++      {
++        bitmap.viewport.h = 240;
++      }
++      else if (mode == 0x16)
++      {
++        bitmap.viewport.h = 224;
++      }
++      else
++      {
++        bitmap.viewport.h = 192;
++      }
++
++      /* update vertical overscan */
++      if (config.overscan & 1)
++      {
++        bitmap.viewport.y = (240 + 48*vdp_pal - bitmap.viewport.h) >> 1;
++      }
++      else
++      {
++        if ((system_hw == SYSTEM_GG) && !config.gg_extra)
++        {
++          /* Display area reduced to 160x144 */
++          bitmap.viewport.y = (144 - bitmap.viewport.h) / 2;
++        }
++        else
++        {
++          bitmap.viewport.y = 0;
++        }
++      }
++    }
++
++    /* active screen width */
++    bitmap.viewport.w = 256 + ((reg[12] & 0x01) << 6);
++
++    /* check viewport changes */
++    if (bitmap.viewport.h != bitmap.viewport.oh)
++    {
++      bitmap.viewport.oh = bitmap.viewport.h;
++      bitmap.viewport.changed |= 1;
++    }
++  }
++
++  /* initialize VCounter */
++  v_counter = bitmap.viewport.h;
++
++  /* first line of overscan */
++  if (bitmap.viewport.y > 0)
++  {
++    blank_line(v_counter, -bitmap.viewport.x, bitmap.viewport.w + 2*bitmap.viewport.x);
++  }
++
++  /* Mega Drive VDP specific */
++  if (system_hw & SYSTEM_MD)
++  {
++    /* clear DMA Busy & field flags */
++    status &= 0xED;
++
++    /* set VBLANK flag */
++    status |= 0x08;
++
++    /* interlaced modes only */
++    if (interlaced)
++    {
++      /* switch even/odd field flag */
++      odd_frame ^= 1;
++      status |= (odd_frame << 4);
++    }
++
++    /* run VDP DMA */
++    if (dma_length)
++    {
++      vdp_dma_update(0);
++    }
++  }
++
++  /* update 6-Buttons & Lightguns */
++  input_refresh();
++
++  /* H-Int counter */
++  if (h_counter == 0)
++  {
++    /* Horizontal Interrupt is pending */
++    hint_pending = 0x10;
++    if (reg[0] & 0x10)
++    {
++      /* Cycle-accurate HINT */
++      /* IRQ line is latched between instructions, during instruction last cycle.       */
++      /* This means that if Z80 cycle count is exactly a multiple of MCYCLES_PER_LINE,  */
++      /* interrupt should be triggered AFTER the next instruction.                      */
++      if ((Z80.cycles % MCYCLES_PER_LINE) == 0)
++      {
++        z80_run(Z80.cycles + 1);
++      }
++
++      /* Z80 interrupt */
++      Z80.irq_state = ASSERT_LINE;
++    }
++  }
++
++  /* refresh inputs just before VINT */
++  osd_input_update();
++
++  hb_sms_skip = do_skip;
++  hb_sms_phase = 0;
++}
++
++int hb_frame_sms_line(void)
++{
++  switch (hb_sms_phase)
++  {
++    case 0:
++    {
++      /* run Z80 until end of line */
++      z80_run(MCYCLES_PER_LINE);
++
++      /* make sure VINT flag was not read (then cleared) by last instruction */
++      if (v_counter == bitmap.viewport.h)
++      {
++        /* Set VINT flag */
++        status |= 0x80;
++
++        /* Vertical Interrupt */
++        vint_pending = 0x20;
++        if (reg[1] & 0x20)
++        {
++          Z80.irq_state = ASSERT_LINE;
++        }
++      }
++
++      /* update VDP cycle count */
++      mcycles_vdp = MCYCLES_PER_LINE;
++
++      /* initialize line count */
++      hb_sms_line_no = bitmap.viewport.h + 1;
++
++      /* initialize overscan area */
++      hb_sms_start = lines_per_frame - bitmap.viewport.y;
++      hb_sms_end   = bitmap.viewport.h + bitmap.viewport.y;
++
++      hb_sms_phase = 1;
++      return 0;
++    }
++
++    case 1:
++    {
++      int line = hb_sms_line_no;
++
++      /* Vertical Blanking (do-while body) */
++
++      /* update VCounter */
++      v_counter = line;
++
++      /* render overscan */
++      if ((line < hb_sms_end) || (line >= hb_sms_start))
++      {
++        /* Master System & Game Gear VDP specific */
++        if ((system_hw < SYSTEM_MD) && (line > (lines_per_frame - 16)))
++        {
++          /* Sprites are still processed during top border */
++          if (reg[1] & 0x40)
++          {
++            render_obj((line - lines_per_frame) & 1);
++          }
++
++          /* Sprites pre-processing occurs even when display is disabled */
++          parse_satb(line - lines_per_frame);
++        }
++
++        blank_line(line, -bitmap.viewport.x, bitmap.viewport.w + 2*bitmap.viewport.x);
++      }
++
++      /* update 6-Buttons & Lightguns */
++      input_refresh();
++
++      /* run Z80 until end of line */
++      z80_run(mcycles_vdp + MCYCLES_PER_LINE);
++
++      /* update VDP cycle count */
++      mcycles_vdp += MCYCLES_PER_LINE;
++
++      if (++hb_sms_line_no >= (lines_per_frame - 1))
++      {
++        hb_sms_phase = 2;
++      }
++      return 0;
++    }
++
++    case 2:
++    {
++      int line = hb_sms_line_no;
++
++      /* update VCounter */
++      v_counter = line;
++
++      /* last line of overscan */
++      if (bitmap.viewport.y > 0)
++      {
++        /* Master System & Game Gear VDP specific */
++        if (system_hw < SYSTEM_MD)
++        {
++          /* Sprites are still processed during top border */
++          if (reg[1] & 0x40)
++          {
++            render_obj(1);
++          }
++        }
++
++        blank_line(line, -bitmap.viewport.x, bitmap.viewport.w + 2*bitmap.viewport.x);
++      }
++
++      /* reload H-Int counter */
++      h_counter = reg[10];
++
++      /* Detect pause button input (in Game Gear Mode, NMI is not generated) */
++      if (system_hw != SYSTEM_GG)
++      {
++        if (input.pad[0] & INPUT_START)
++        {
++          /* NMI is edge-triggered */
++          if (!pause_b)
++          {
++            pause_b = 1;
++            z80_set_nmi_line(ASSERT_LINE);
++            z80_set_nmi_line(CLEAR_LINE);
++          }
++        }
++        else
++        {
++          pause_b = 0;
++        }
++      }
++
++      /* 3-D glasses faking: skip rendering of left lens frame */
++      hb_sms_skip |= (work_ram[0x1ffb] & cart.special & HW_3D_GLASSES);
++
++      /* Mega Drive VDP specific */
++      if (system_hw & SYSTEM_MD)
++      {
++        /* clear VBLANK flag */
++        status &= ~0x08;
++
++        /* run VDP DMA */
++        if (dma_length)
++        {
++          vdp_dma_update(mcycles_vdp);
++        }
++
++        /* parse first line of sprites */
++        if (reg[1] & 0x40)
++        {
++          parse_satb(-1);
++        }
++      }
++
++      /* Master System & Game Gear VDP specific */
++      else
++      {
++        /* Sprites pre-processing occurs even when display is disabled */
++        parse_satb(-1);
++      }
++
++      /* update 6-Buttons & Lightguns */
++      input_refresh();
++
++      /* run Z80 until end of line */
++      z80_run(mcycles_vdp + MCYCLES_PER_LINE);
++
++      /* update VDP cycle count */
++      mcycles_vdp += MCYCLES_PER_LINE;
++
++      /* latch Vertical Scroll register */
++      vscroll = reg[9];
++
++      /* reset line count */
++      hb_sms_line_no = 0;
++
++      hb_sms_phase = 3;
++      return 0;
++    }
++
++    default:
++    {
++      int line = hb_sms_line_no;
++
++      /* Active Display (do-while body) */
++
++      /* run VDP DMA (Mega Drive VDP specific) */
++      if (dma_length)
++      {
++        vdp_dma_update(mcycles_vdp);
++      }
++
++      /* make sure that line has not already been rendered */
++      if (v_counter != line)
++      {
++        /* update VCounter */
++        v_counter = line;
++
++        /* render scanline */
++        if (!hb_sms_skip)
++        {
++          render_line(line);
++        }
++      }
++
++      /* update 6-Buttons & Lightguns */
++      input_refresh();
++
++      /* H-Int counter */
++      if (h_counter == 0)
++      {
++        /* reload H-Int counter */
++        h_counter = reg[10];
++
++        /* Horizontal Interrupt is pending */
++        hint_pending = 0x10;
++        if (reg[0] & 0x10)
++        {
++          /* Cycle-accurate HINT */
++          /* IRQ line is latched between instructions, during instruction last cycle.       */
++          /* This means that if Z80 cycle count is exactly a multiple of MCYCLES_PER_LINE,  */
++          /* interrupt should be triggered AFTER the next instruction.                      */
++          if ((Z80.cycles % MCYCLES_PER_LINE) == 0)
++          {
++            z80_run(Z80.cycles + 1);
++          }
++
++          /* assert Z80 interrupt */
++          Z80.irq_state = ASSERT_LINE;
++        }
++      }
++      else
++      {
++        /* decrement H-Int counter */
++        h_counter--;
++      }
++
++      /* run Z80 until end of line */
++      z80_run(mcycles_vdp + MCYCLES_PER_LINE);
++
++      /* update VDP cycle count */
++      mcycles_vdp += MCYCLES_PER_LINE;
++
++      if (++hb_sms_line_no < bitmap.viewport.h)
++      {
++        return 0;
++      }
++
++      /* check viewport changes */
++      if (bitmap.viewport.w != bitmap.viewport.ow)
++      {
++        bitmap.viewport.ow = bitmap.viewport.w;
++        bitmap.viewport.changed |= 1;
++      }
++
++      /* adjust timings for next frame */
++      input_end_frame(mcycles_vdp);
++      Z80.cycles -= mcycles_vdp;
++
++      hb_sms_phase = 4;
++      return 1;
++    }
++  }
++}
+diff --git a/core/system.h b/core/system.h
+index fb6ca76..ab5cef3 100644
+--- a/core/system.h
++++ b/core/system.h
+@@ -116,5 +116,8 @@ extern void system_reset(void);
+ extern void system_frame_gen(int do_skip);
+ extern void system_frame_scd(int do_skip);
+ extern void system_frame_sms(int do_skip);
++/* 한방 10/22: system_frame_sms 를 가로줄 하나씩(두 대를 줄마다 번갈아 돌릴 때) */
++extern void hb_frame_sms_begin(int do_skip);
++extern int hb_frame_sms_line(void);
+ 
+ #endif /* _SYSTEM_H_ */
+diff --git a/dual/build_dual.sh b/dual/build_dual.sh
+new file mode 100755
+index 0000000..b5dbf8a
+--- /dev/null
++++ b/dual/build_dual.sh
+@@ -0,0 +1,32 @@
++#!/bin/bash
++# Genesis Plus GX GG Dual 빌드(한방 10/22) — VM hbbuild(Debian 12 aarch64 · gcc 12)에서, 이 소스 맨 위 폴더에서:
++#   nice -n 19 bash dual/build_dual.sh [GIT_VERSION 글자, 예: -a1b2c3d]
++# 1) 원래 Makefile.libretro 로 안쪽 오브젝트를 만듦(기기 KNULLI 와 같은 platform=unix 옵션, -j1)
++#    → 덤으로 genesis_plus_gx_libretro.so = 한방 고리가 든 한 대짜리(고리 꺼짐 = 원래 동작, 시험용)
++# 2) 안쪽 오브젝트를 ld -r 로 하나 → objcopy 로 전역 이름 전부에 ggA_ / ggB_ 를 붙인 두 벌
++# 3) 래퍼(dual/libretro_dual.c)와 묶어 build_dual/genesisplusgx_gg_dual_libretro.so (retro_* 만 밖에 보임)
++set -euo pipefail
++GV="${1:-}"
++ARCH_FLAGS="${ARCH_FLAGS:--mcpu=cortex-a53}"
++B=build_dual
++mkdir -p "$B"
++echo "== 1) 안쪽 오브젝트 (make -f Makefile.libretro platform=unix -j1)"
++CFLAGS="$ARCH_FLAGS" make -f Makefile.libretro platform=unix GIT_VERSION="$GV" -j1 >"$B/make_inner.log" 2>&1 || { tail -40 "$B/make_inner.log"; exit 1; }
++OBJS=$(find . -name '*.o' -not -path "./$B/*" | sort)
++echo "   오브젝트 $(echo "$OBJS" | wc -l)개"
++echo "== 2) 두 벌(ggA_ · ggB_)"
++ld -r -o "$B/inner_all.o" $OBJS
++for P in A B; do
++  nm -g --defined-only "$B/inner_all.o" | awk 'NF==3 {print $3}' | sort -u | awk -v p="gg${P}_" '{print $1" "p$1}' > "$B/rename_$P.txt"
++  objcopy --redefine-syms="$B/rename_$P.txt" "$B/inner_all.o" "$B/inner_$P.o"
++done
++echo "   바꾼 이름 $(wc -l < "$B/rename_A.txt")개"
++echo "== 3) 래퍼 + 묶기"
++gcc -O2 -fPIC $ARCH_FLAGS -DNDEBUG "-DGIT_VERSION=\"$GV\"" -Ilibretro/libretro-common/include -Wall -Wno-unused-function \
++  -c -o "$B/dual_wrapper.o" dual/libretro_dual.c
++gcc -shared -o "$B/genesisplusgx_gg_dual_libretro.so" "$B/dual_wrapper.o" "$B/inner_A.o" "$B/inner_B.o" \
++  -Wl,--version-script=dual/link_dual.T -Wl,--no-undefined -lm
++strip --strip-unneeded "$B/genesisplusgx_gg_dual_libretro.so"
++cp genesis_plus_gx_libretro.so "$B/genesis_plus_gx_hb_libretro.so"
++strip --strip-unneeded "$B/genesis_plus_gx_hb_libretro.so"
++md5sum "$B/genesisplusgx_gg_dual_libretro.so" "$B/genesis_plus_gx_hb_libretro.so"
+diff --git a/dual/libretro_dual.c b/dual/libretro_dual.c
+new file mode 100644
+index 0000000..bb015ab
+--- /dev/null
++++ b/dual/libretro_dual.c
+@@ -0,0 +1,1122 @@
++/* Genesis Plus GX GG Dual — 게임기어 두 대를 한 코어로, 기어 투 기어 케이블로 이음 (한방 10/22)
++ *
++ * Genesis Plus GX(Eke-Eke) 라이선스(LICENSE.txt, 비상업 · 고친 소스 전부 공개)를 따름.
++ *
++ * 구조(원더스완 Dual · 네오지오 포켓 Dual 과 같은 꼴):
++ *  - 안쪽 코어(Genesis Plus GX 302fe82 + 한방 고리)를 두 번 넣음. 빌드가 안쪽 전역 이름에 ggA_ / ggB_ 를
++ *    붙여(objcopy) 전역 변수가 따로인 두 대.
++ *  - 한 장 안에서 두 기계를 '가로줄 하나씩' 번갈아 돌림(262줄). 줄 사이에서 케이블을 처리:
++ *      병렬(포트 0x01/0x02): 읽을 때마다 상대 출력 핀을 엇갈림(0<->2, 1<->3, 4<->5, 6<->6)으로 보여 줌.
++ *      직렬(포트 0x03~0x05): 보낸 바이트는 속도(4800/2400/1200/300bps, 10비트)만큼 줄이 지난 뒤
++ *      상대 받기 칸으로 — 상대가 아직 안 읽었으면 읽을 때까지 기다림(손 맞춤 · 바이트 안 버림).
++ *      상대가 받기를 켰고(비트5) NMI 허용(비트3)이면 그 기계 다음 줄 앞에서 NMI.
++ *  - 0번 패드 = 1P 기계(방장), 1번 패드 = 2P 기계(손님). 보이는 화면 · 소리 = gg_dual_screen(에뮬엔 영향 없음).
++ *  - gg_dual_link = off 면 2P 기계를 아예 안 돌리고 1P 는 원래 retro_run 그대로 = 원래 코어와 같은 그림 · 소리.
++ *  - 세이브: 1P = 보통 .srm(레트로아크가 RETRO_MEMORY_SAVE_RAM 으로) · 2P = <세이브 폴더>/<롬 이름>.p2.sav —
++ *    방장(1P 화면 · link on)만 읽고 씀(없으면 새 카트 = 1P 세이브를 복사하지 않음, 원칙 '각자 자기 세이브').
++ *  - 상태 = 머리 64 + 케이블 64 + 기계마다 고정 칸(SLOT_SIZE: Genesis Plus GX 상태 + 세이브 램 32KB).
++ *    Z80 구조체 속 함수 포인터는 0 으로 저장(실행마다 주소가 달라 넷플레이 CRC 가 어긋나지 않게).
++ *  - 시험용 환경 변수: GG_DUAL_TRACE=<파일>(60장마다 넘긴 바이트 · 밖에서 온 상태)
++ *                      GG_DUAL_PORTLOG=<파일>(포트 0x01~0x05 읽기쓰기 전부 — 느림)
++ */
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "libretro.h"
++#include "../core/hb_gglink.h"
++
++#ifndef GIT_VERSION
++#define GIT_VERSION ""
++#endif
++#define DUAL_LIBRARY_NAME "Genesis Plus GX GG Dual"
++#define DUAL_VERSION "1.0-hb" GIT_VERSION
++/* 넷플레이 버전 칸은 끝 글자 포함 32바이트 */
++typedef char hb_version_fits_netplay[(sizeof(DUAL_VERSION) <= 32) ? 1 : -1];
++
++#define DUAL_MEMORY_RAM   0x5700  /* +0 1P · +1 2P: 작업 램 8KB(0xC000~0xDFFF) */
++#define DUAL_MEMORY_FRAME 0x5720  /* +0 1P · +1 2P: 화면(FB_W×FB_H RGB565, 줄 FB_W*2) */
++#define DUAL_MEMORY_STATS 0x5730
++#define DUAL_MEMORY_IOREG 0x5740  /* +0 1P · +1 2P: io_reg[16] */
++
++#define FB_W 160
++#define FB_H 144
++#define SRAM_SAVE 0x8000          /* 상태에 넣는 세이브 램(세가 매퍼 최대 32KB) */
++#define SLOT_SIZE 0x24000         /* 기계 한 대 칸: 앞 = Genesis Plus GX 상태, 뒤 32KB = 세이브 램 */
++#define SLOT_STATE_MAX (SLOT_SIZE - SRAM_SAVE)
++#define STATE_MAGIC "HBGGDU1"
++#define STATE_VERSION 1
++#define HEADER_SIZE 64
++#define LINK_SIZE 64
++#define P2_WRITE_EVERY 7200       /* 장(약 2분)마다 2P 세이브가 바뀌었으면 씀 */
++
++#define DECL(P) \
++   void P##retro_set_environment(retro_environment_t); \
++   void P##retro_set_video_refresh(retro_video_refresh_t); \
++   void P##retro_set_audio_sample(retro_audio_sample_t); \
++   void P##retro_set_audio_sample_batch(retro_audio_sample_batch_t); \
++   void P##retro_set_input_poll(retro_input_poll_t); \
++   void P##retro_set_input_state(retro_input_state_t); \
++   void P##retro_init(void); \
++   void P##retro_deinit(void); \
++   bool P##retro_load_game(const struct retro_game_info *); \
++   void P##retro_unload_game(void); \
++   void P##retro_run(void); \
++   void P##retro_reset(void); \
++   void P##retro_get_system_av_info(struct retro_system_av_info *); \
++   void *P##retro_get_memory_data(unsigned); \
++   size_t P##retro_get_memory_size(unsigned); \
++   void P##retro_cheat_reset(void); \
++   void P##retro_cheat_set(unsigned, bool, const char *); \
++   int P##hb_gg_is_8bit(void); \
++   int P##hb_gg_system_hw(void); \
++   void P##hb_gg_frame_begin(void); \
++   int P##hb_gg_run_line(void); \
++   void P##hb_gg_frame_end(void); \
++   void P##hb_gg_set_link(const struct hb_gg_link_ops *); \
++   void P##hb_gg_set_trace(void (*)(void *, int, unsigned, unsigned), void *); \
++   uint8_t *P##hb_gg_io_reg(void); \
++   void P##hb_gg_nmi(void); \
++   uint8_t *P##hb_gg_work_ram(void); \
++   uint8_t *P##hb_gg_sram(void); \
++   int P##hb_gg_sram_on(void); \
++   unsigned P##hb_gg_z80_pc(void); \
++   uint32_t P##hb_gg_rom_hash(void); \
++   int P##hb_gg_state_save(uint8_t *); \
++   int P##hb_gg_state_load(const uint8_t *);
++DECL(ggA_)
++DECL(ggB_)
++
++struct Inner
++{
++   void (*set_environment)(retro_environment_t);
++   void (*set_video_refresh)(retro_video_refresh_t);
++   void (*set_audio_sample)(retro_audio_sample_t);
++   void (*set_audio_sample_batch)(retro_audio_sample_batch_t);
++   void (*set_input_poll)(retro_input_poll_t);
++   void (*set_input_state)(retro_input_state_t);
++   void (*init)(void);
++   void (*deinit)(void);
++   bool (*load_game)(const struct retro_game_info *);
++   void (*unload_game)(void);
++   void (*run)(void);
++   void (*reset)(void);
++   void (*get_system_av_info)(struct retro_system_av_info *);
++   void *(*get_memory_data)(unsigned);
++   size_t (*get_memory_size)(unsigned);
++   void (*cheat_reset)(void);
++   void (*cheat_set)(unsigned, bool, const char *);
++   int (*is_8bit)(void);
++   int (*system_hw)(void);
++   void (*frame_begin)(void);
++   int (*run_line)(void);
++   void (*frame_end)(void);
++   void (*set_link)(const struct hb_gg_link_ops *);
++   void (*set_trace)(void (*)(void *, int, unsigned, unsigned), void *);
++   uint8_t *(*io_reg)(void);
++   void (*nmi)(void);
++   uint8_t *(*work_ram)(void);
++   uint8_t *(*sram)(void);
++   int (*sram_on)(void);
++   unsigned (*z80_pc)(void);
++   uint32_t (*rom_hash)(void);
++   int (*state_save)(uint8_t *);
++   int (*state_load)(const uint8_t *);
++};
++
++#define TAB(P) { P##retro_set_environment, P##retro_set_video_refresh, P##retro_set_audio_sample, \
++   P##retro_set_audio_sample_batch, P##retro_set_input_poll, P##retro_set_input_state, P##retro_init, P##retro_deinit, \
++   P##retro_load_game, P##retro_unload_game, P##retro_run, P##retro_reset, P##retro_get_system_av_info, \
++   P##retro_get_memory_data, P##retro_get_memory_size, P##retro_cheat_reset, P##retro_cheat_set, \
++   P##hb_gg_is_8bit, P##hb_gg_system_hw, P##hb_gg_frame_begin, P##hb_gg_run_line, P##hb_gg_frame_end, \
++   P##hb_gg_set_link, P##hb_gg_set_trace, P##hb_gg_io_reg, P##hb_gg_nmi, P##hb_gg_work_ram, P##hb_gg_sram, \
++   P##hb_gg_sram_on, P##hb_gg_z80_pc, P##hb_gg_rom_hash, P##hb_gg_state_save, P##hb_gg_state_load }
++
++static const struct Inner inner[2] = { TAB(ggA_), TAB(ggB_) };
++
++/* 케이블 상태(상태 저장에 들어감 — LINK_SIZE 칸) */
++struct LinkSide
++{
++   uint8_t txActive;    /* 보내는 중(포트 5 비트0) */
++   uint8_t txByte;
++   uint8_t pendNmi;     /* 이 기계 다음 줄 앞에서 NMI */
++   uint8_t pc6Seen;     /* 이 기계 PC6 핀에 보인 마지막 값(병렬 NMI 가장자리) */
++   uint32_t txLines;    /* 남은 줄 */
++};
++
++struct DualStats
++{
++   uint32_t magic, version, frames, linkOn, screen;
++   uint32_t bytes[2];        /* 1P→2P · 2P→1P 넘긴 바이트 */
++   uint32_t waits[2];        /* 상대가 아직 안 읽어 기다린 줄 수 */
++   uint32_t drops[2];        /* 상대가 받기를 안 켜서 버린 바이트 */
++   uint32_t nmis[2];         /* 기계마다 받은 NMI(직렬) */
++   uint32_t parNmis[2];      /* 기계마다 받은 NMI(병렬 PC6) */
++   uint32_t parReads[2];     /* 병렬 포트 읽기 */
++   uint32_t outsideLoads;    /* 불러온 상태 수 */
++   uint32_t p2Loaded, p2Writes;
++   uint32_t fbW, fbH;
++   uint32_t lastTx[2];       /* 마지막 보낸 바이트 */
++};
++
++static retro_environment_t environCallback;
++static retro_video_refresh_t videoCallback;
++static retro_audio_sample_batch_t audioBatchCallback;
++static retro_input_poll_t inputPollCallback;
++static retro_input_state_t inputStateCallback;
++static retro_log_printf_t logCallback;
++
++static int linkOn = 1;           /* 켤 때 정함 */
++static int screen;               /* 0 = 1P, 1 = 2P */
++static bool loaded;
++static uint32_t romHash;
++static struct LinkSide side[2];
++static struct DualStats stats;
++static FILE *traceFile, *portLog;
++static int parNmiOn = 1;         /* 병렬 PC6 NMI(시험용 GG_DUAL_PARNMI=0 으로 끔) */
++static int byteLinesFixed;       /* 시험용 GG_DUAL_BYTE_LINES=<줄> — 0 이면 속도대로 */
++
++/* 기계마다 화면 · 소리 받기 */
++static uint16_t frameBuf[2][FB_W * FB_H];
++static unsigned frameW[2], frameH[2];
++static int16_t soundBuf[2][8192 * 2];
++static size_t soundFrames[2];
++static bool frameSeen[2];
++
++/* 2P 세이브 */
++static char p2SavePath[2048];
++static uint32_t p2SaveHash;
++static unsigned p2Countdown;
++
++/* 안쪽 옵션 기본값(안쪽이 SET_VARIABLES 로 알려 준 첫 값) */
++struct InnerVar { char key[64]; char value[64]; };
++static struct InnerVar innerVars[96];
++static int nInnerVars;
++
++static void logf_(enum retro_log_level level, const char *fmt, ...)
++{
++   char buf[1024];
++   va_list ap;
++   va_start(ap, fmt);
++   vsnprintf(buf, sizeof(buf), fmt, ap);
++   va_end(ap);
++   if (logCallback)
++      logCallback(level, "[GG Dual] %s\n", buf);
++   if (traceFile)
++   {
++      fprintf(traceFile, "f=%u %s\n", stats.frames, buf);
++      fflush(traceFile);
++   }
++}
++
++static uint32_t fnv32(const uint8_t *p, size_t n)
++{
++   uint32_t h = 2166136261u;
++   size_t i;
++   for (i = 0; i < n; i++)
++   {
++      h ^= p[i];
++      h *= 16777619u;
++   }
++   return h;
++}
++
++/* ---- 안쪽 코어가 부르는 환경 함수 ---- */
++static void rememberInnerVars(const struct retro_variable *vars)
++{
++   for (; vars && vars->key; vars++)
++   {
++      const char *semi, *v;
++      size_t n;
++      int i;
++      if (!vars->value)
++         continue;
++      for (i = 0; i < nInnerVars; i++)
++         if (!strcmp(innerVars[i].key, vars->key))
++            break;
++      if (i == nInnerVars)
++      {
++         if (nInnerVars >= (int)(sizeof(innerVars) / sizeof(innerVars[0])))
++            continue;
++         nInnerVars++;
++      }
++      snprintf(innerVars[i].key, sizeof(innerVars[i].key), "%s", vars->key);
++      semi = strchr(vars->value, ';');
++      v = semi ? semi + 1 : vars->value;
++      while (*v == ' ')
++         v++;
++      n = strcspn(v, "|");
++      if (n >= sizeof(innerVars[i].value))
++         n = sizeof(innerVars[i].value) - 1;
++      memcpy(innerVars[i].value, v, n);
++      innerVars[i].value[n] = '\0';
++   }
++}
++
++static bool innerEnvironment(int m, unsigned cmd, void *data)
++{
++   int shown = (linkOn && screen == 1) ? 1 : 0;
++   switch (cmd)
++   {
++      case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION:
++         *(unsigned *)data = 0;       /* 안쪽은 옛 방식(SET_VARIABLES)으로 — 기본값만 기억 */
++         return true;
++      case RETRO_ENVIRONMENT_SET_VARIABLES:
++         rememberInnerVars((const struct retro_variable *)data);
++         return true;
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK:
++      case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
++      case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
++      case RETRO_ENVIRONMENT_SET_CONTENT_INFO_OVERRIDE:
++      case RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL:
++      case RETRO_ENVIRONMENT_SET_MEMORY_MAPS:
++      case RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS:
++      case RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY:
++      case RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE:
++         return true;
++      case RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK:
++         return false;                /* 프레임 건너뛰기 없음(두 기기 같아야 함) */
++      case RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS:
++         return true;                 /* 래퍼가 따로 알림 */
++      case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
++         if (m == 0)
++            return environCallback ? environCallback(cmd, data) : false;
++         return *(const enum retro_pixel_format *)data == RETRO_PIXEL_FORMAT_RGB565;
++      case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
++      case RETRO_ENVIRONMENT_SET_GEOMETRY:
++         if (m == shown && loaded)
++            return environCallback ? environCallback(cmd, data) : false;
++         return true;
++      case RETRO_ENVIRONMENT_GET_VARIABLE:
++      {
++         struct retro_variable *var = (struct retro_variable *)data;
++         int i;
++         if (!var || !var->key)
++            return false;
++         var->value = NULL;
++         /* 두 기기가 같아야 해서 모든 안쪽 옵션은 기본값으로 고정(프레임 건너뛰기 · 오버클록 등 없음) */
++         for (i = 0; i < nInnerVars; i++)
++            if (!strcmp(innerVars[i].key, var->key))
++            {
++               var->value = innerVars[i].value;
++               return true;
++            }
++         return false;
++      }
++      case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
++         *(bool *)data = false;
++         return true;
++      default:
++         return environCallback ? environCallback(cmd, data) : false;
++   }
++}
++
++static bool envA(unsigned cmd, void *data) { return innerEnvironment(0, cmd, data); }
++static bool envB(unsigned cmd, void *data) { return innerEnvironment(1, cmd, data); }
++
++static void storeFrame(int m, const void *data, unsigned width, unsigned height, size_t pitch)
++{
++   unsigned y, w = width < FB_W ? width : FB_W, h = height < FB_H ? height : FB_H;
++   if (!data)
++      return;
++   for (y = 0; y < h; y++)
++      memcpy(frameBuf[m] + y * FB_W, (const uint8_t *)data + y * pitch, w * 2);
++   frameW[m] = width;
++   frameH[m] = height;
++   frameSeen[m] = true;
++}
++
++static void videoA(const void *d, unsigned w, unsigned h, size_t p) { storeFrame(0, d, w, h, p); }
++static void videoB(const void *d, unsigned w, unsigned h, size_t p) { storeFrame(1, d, w, h, p); }
++
++static size_t storeSound(int m, const int16_t *data, size_t frames)
++{
++   size_t room = 8192 - soundFrames[m];
++   size_t n = frames < room ? frames : room;
++   memcpy(soundBuf[m] + soundFrames[m] * 2, data, n * 4);
++   soundFrames[m] += n;
++   return frames;
++}
++
++static size_t audioA(const int16_t *d, size_t f) { return storeSound(0, d, f); }
++static size_t audioB(const int16_t *d, size_t f) { return storeSound(1, d, f); }
++static void sampleA(int16_t l, int16_t r) { int16_t s[2] = { l, r }; storeSound(0, s, 1); }
++static void sampleB(int16_t l, int16_t r) { int16_t s[2] = { l, r }; storeSound(1, s, 1); }
++static void pollNone(void) { }
++
++/* 1P 기계: link off 면 원래처럼(포트 그대로), on 이면 0번 패드만 · 2P 기계: 1번 패드를 안쪽 0번으로 */
++static int16_t inputA(unsigned port, unsigned device, unsigned index, unsigned id)
++{
++   if (!inputStateCallback)
++      return 0;
++   if (linkOn && port != 0)
++      return 0;
++   return inputStateCallback(port, device, index, id);
++}
++
++static int16_t inputB(unsigned port, unsigned device, unsigned index, unsigned id)
++{
++   if (!inputStateCallback || port != 0)
++      return 0;
++   return inputStateCallback(1, device, index, id);
++}
++
++static const char *getVar(const char *key)
++{
++   struct retro_variable var;
++   var.key = key;
++   var.value = NULL;
++   if (environCallback && environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
++      return var.value;
++   return NULL;
++}
++
++static void readScreenOption(void)
++{
++   const char *v = getVar("gg_dual_screen");
++   int s = (v && !strcmp(v, "2P")) ? 1 : 0;
++   if (s != screen)
++      logf_(RETRO_LOG_INFO, "화면 %dP", s + 1);
++   screen = s;
++   stats.screen = (uint32_t)screen;
++}
++
++/* ---- 케이블 ---- */
++static unsigned byteLines(int m)
++{
++   /* 10비트(시작 + 8 + 끝) ÷ 속도, 한 줄 = 228 Z80 사이클(3.579545MHz) → 4800bps 33줄 · 2400 66 · 1200 131 · 300 524 */
++   static const unsigned lines[4] = { 33, 66, 131, 524 };
++   if (byteLinesFixed > 0)
++      return (unsigned)byteLinesFixed;
++   return lines[(inner[m].io_reg()[5] >> 6) & 3];
++}
++
++/* 상대(o)가 모는 핀을 m 쪽 핀 차례로(엇갈림) — 입력으로 둔 핀 · 직렬로 쓰는 핀은 1 */
++static uint8_t pinsSeenBy(int m)
++{
++   int o = !m;
++   const uint8_t *r = inner[o].io_reg();
++   uint8_t drive = (uint8_t)((r[1] | r[2]) & 0x7F);   /* 방향 1(입력)이면 1(끌어올림) */
++   uint8_t in = 0;
++   if (r[5] & 0x10)
++      drive |= 0x10;                                   /* PC4 = TX(쉴 때 1) */
++   if (r[5] & 0x20)
++      drive |= 0x20;                                   /* PC5 = RX(입력) */
++   if (drive & 0x01) in |= 0x04;
++   if (drive & 0x02) in |= 0x08;
++   if (drive & 0x04) in |= 0x01;
++   if (drive & 0x08) in |= 0x02;
++   if (drive & 0x10) in |= 0x20;
++   if (drive & 0x20) in |= 0x10;
++   if (drive & 0x40) in |= 0x40;
++   (void)m;
++   return in;
++}
++
++static uint8_t linkParIn(void *ctx)
++{
++   int m = (int)(intptr_t)ctx;
++   stats.parReads[m]++;
++   return pinsSeenBy(m);
++}
++
++/* PC6(NMI 핀, 케이블에서 곧게 이음): 상대가 1→0 으로 내리면, 내 PC6 이 입력이고 NMI 허용(포트 2 비트7 = 0)이면 NMI */
++static void checkPc6(int m)
++{
++   const uint8_t *r = inner[m].io_reg();
++   uint8_t level = (uint8_t)((pinsSeenBy(m) >> 6) & 1);
++   if (parNmiOn && side[m].pc6Seen && !level && (r[2] & 0x40) && !(r[2] & 0x80))
++   {
++      side[m].pendNmi = 1;
++      stats.parNmis[m]++;
++   }
++   side[m].pc6Seen = level;
++}
++
++static void linkParOut(void *ctx)
++{
++   int m = (int)(intptr_t)ctx;
++   checkPc6(!m);
++   checkPc6(m);
++}
++
++static void linkTx(void *ctx, uint8_t data)
++{
++   int m = (int)(intptr_t)ctx;
++   uint8_t *r = inner[m].io_reg();
++   stats.lastTx[m] = data;
++   if (!(r[5] & 0x10))
++      return;                         /* 보내기(비트4) 꺼짐 — 아무것도 안 나감 */
++   side[m].txByte = data;
++   if (!side[m].txActive)
++   {
++      side[m].txActive = 1;
++      side[m].txLines = byteLines(m);
++   }
++   r[5] |= 0x01;
++}
++
++static void linkRxRead(void *ctx)
++{
++   int m = (int)(intptr_t)ctx;
++   inner[m].io_reg()[5] &= (uint8_t)~0x02;
++}
++
++static void linkCtrl(void *ctx)
++{
++   int m = (int)(intptr_t)ctx;
++   (void)m;
++}
++
++static const struct hb_gg_link_ops linkOps[2] = {
++   { linkParIn, linkParOut, linkTx, linkRxRead, linkCtrl, (void *)(intptr_t)0 },
++   { linkParIn, linkParOut, linkTx, linkRxRead, linkCtrl, (void *)(intptr_t)1 },
++};
++
++/* 줄 하나가 지난 뒤 m 이 보내는 바이트 처리 */
++static void tickTx(int m)
++{
++   int o = !m;
++   uint8_t *r, *ro;
++   if (!side[m].txActive)
++      return;
++   if (side[m].txLines > 1)
++   {
++      side[m].txLines--;
++      return;
++   }
++   side[m].txLines = 0;
++   r = inner[m].io_reg();
++   ro = inner[o].io_reg();
++   if (!(ro[5] & 0x20))
++   {
++      /* 상대 받기 꺼짐 → 선 위로 나가고 사라짐 */
++      side[m].txActive = 0;
++      r[5] &= (uint8_t)~0x01;
++      stats.drops[m]++;
++      return;
++   }
++   if (ro[5] & 0x02)
++   {
++      /* 상대가 앞 바이트를 아직 안 읽음 → 기다림(손 맞춤) */
++      stats.waits[m]++;
++      return;
++   }
++   ro[4] = side[m].txByte;
++   ro[5] |= 0x02;
++   if (ro[5] & 0x08)
++      side[o].pendNmi = 1;
++   side[m].txActive = 0;
++   r[5] &= (uint8_t)~0x01;
++   stats.bytes[m]++;
++}
++
++static void runLine(int m, int *done)
++{
++   if (*done)
++      return;
++   if (side[m].pendNmi)
++   {
++      side[m].pendNmi = 0;
++      stats.nmis[m]++;
++      inner[m].nmi();
++   }
++   *done = inner[m].run_line();
++   tickTx(m);
++}
++
++static void portTrace(void *ctx, int write, unsigned port, unsigned value)
++{
++   int m = (int)(intptr_t)ctx;
++   if (portLog)
++      fprintf(portLog, "f=%u %dP %s %02X=%02X pc=%04X\n", stats.frames, m + 1, write ? "W" : "R", port, value,
++            inner[m].z80_pc());
++}
++
++/* ---- 2P 세이브 ---- */
++static void contentBase(const struct retro_game_info *info, char *base, size_t len)
++{
++   struct retro_game_info_ext *ext = NULL;
++   const char *p, *slash, *dot;
++   base[0] = '\0';
++   if (environCallback && environCallback(RETRO_ENVIRONMENT_GET_GAME_INFO_EXT, &ext) && ext && ext->name)
++   {
++      snprintf(base, len, "%s", ext->name);
++      return;
++   }
++   p = info ? info->path : NULL;
++   if (!p)
++      return;
++   slash = strrchr(p, '/');
++   snprintf(base, len, "%s", slash ? slash + 1 : p);
++   dot = strrchr(base, '.');
++   if (dot)
++      base[dot - base] = '\0';
++}
++
++/* 레트로아크가 .srm 을 쓰는 크기와 같게: 마지막으로 0xFF 가 아닌 바이트까지 */
++static size_t sramUsed(const uint8_t *s)
++{
++   size_t i;
++   for (i = 0x10000; i > 0; i--)
++      if (s[i - 1] != 0xFF)
++         return i;
++   return 0;
++}
++
++static void loadP2Save(void)
++{
++   FILE *f;
++   size_t n;
++   uint8_t *s = inner[1].sram();
++   if (!p2SavePath[0])
++      return;
++   f = fopen(p2SavePath, "rb");
++   if (!f)
++   {
++      logf_(RETRO_LOG_INFO, "2P 세이브 없음 → 새 카트(1P 세이브는 복사하지 않음): %s", p2SavePath);
++      p2SaveHash = fnv32(s, 0x10000);
++      return;
++   }
++   n = fread(s, 1, 0x10000, f);
++   fclose(f);
++   stats.p2Loaded = 1;
++   p2SaveHash = fnv32(s, 0x10000);
++   logf_(RETRO_LOG_INFO, "2P 세이브 읽음 %u 바이트: %s", (unsigned)n, p2SavePath);
++}
++
++static void writeP2Save(const char *why)
++{
++   const uint8_t *s = inner[1].sram();
++   uint32_t h;
++   size_t n;
++   char tmp[2100];
++   FILE *f;
++   int ok;
++   if (!p2SavePath[0] || !linkOn || screen != 0)
++      return;
++   h = fnv32(s, 0x10000);
++   if (h == p2SaveHash)
++      return;
++   n = sramUsed(s);
++   if (!n)
++      return;
++   snprintf(tmp, sizeof(tmp), "%s.tmp", p2SavePath);
++   f = fopen(tmp, "wb");
++   if (!f)
++   {
++      logf_(RETRO_LOG_WARN, "2P 세이브 임시 파일 못 엶: %s", tmp);
++      return;
++   }
++   ok = fwrite(s, 1, n, f) == n;
++   ok = (fflush(f) == 0) && ok;
++   ok = (fsync(fileno(f)) == 0) && ok;
++   ok = (fclose(f) == 0) && ok;
++   if (!ok || rename(tmp, p2SavePath) != 0)
++   {
++      /* 이름 바꾸기가 안 되는 곳이면 제자리 */
++      remove(tmp);
++      f = fopen(p2SavePath, "wb");
++      if (!f)
++         return;
++      ok = fwrite(s, 1, n, f) == n;
++      fflush(f);
++      fsync(fileno(f));
++      fclose(f);
++      if (!ok)
++         return;
++   }
++   p2SaveHash = h;
++   stats.p2Writes++;
++   logf_(RETRO_LOG_INFO, "2P 세이브 씀(%s) %u 바이트", why, (unsigned)n);
++}
++
++/* ---- libretro API ---- */
++
++unsigned retro_api_version(void)
++{
++   return RETRO_API_VERSION;
++}
++
++void retro_set_environment(retro_environment_t env)
++{
++   /* 메뉴 글씨: 기기 레트로아크 글꼴에 한글이 없을 수 있어 영어(다른 Dual 과 같음) */
++   static const struct retro_variable vars[] = {
++      { "gg_dual_screen", "Screen and sound (host/solo = 1P, guest = 2P); 1P|2P" },
++      { "gg_dual_link", "2P Game Gear on the Gear-to-Gear cable (off = solo, one console; restart); on|off" },
++      { NULL, NULL },
++   };
++   static const struct retro_controller_description pads[] = {
++      { "Game Gear", RETRO_DEVICE_JOYPAD },
++   };
++   static const struct retro_controller_info ports[] = {
++      { pads, 1 }, { pads, 1 }, { NULL, 0 },
++   };
++
++   environCallback = env;
++   env(RETRO_ENVIRONMENT_SET_VARIABLES, (void *)vars);
++   env(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void *)ports);
++   inner[0].set_environment(envA);
++   inner[1].set_environment(envB);
++}
++
++void retro_set_video_refresh(retro_video_refresh_t cb) { videoCallback = cb; }
++void retro_set_audio_sample(retro_audio_sample_t cb) { (void)cb; }
++void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { audioBatchCallback = cb; }
++void retro_set_input_poll(retro_input_poll_t cb) { inputPollCallback = cb; }
++void retro_set_input_state(retro_input_state_t cb) { inputStateCallback = cb; }
++void retro_set_controller_port_device(unsigned port, unsigned device) { (void)port; (void)device; }
++
++void retro_init(void)
++{
++   struct retro_log_callback log;
++   uint64_t quirks = RETRO_SERIALIZATION_QUIRK_PLATFORM_DEPENDENT;
++   const char *e;
++   int m;
++   logCallback = (environCallback && environCallback(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log)) ? log.log : NULL;
++   if (environCallback)
++      environCallback(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &quirks);
++   e = getenv("GG_DUAL_TRACE");
++   if (e && e[0] && !traceFile)
++      traceFile = fopen(e, "w");
++   e = getenv("GG_DUAL_PORTLOG");
++   if (e && e[0] && !portLog)
++      portLog = fopen(e, "w");
++   e = getenv("GG_DUAL_PARNMI");
++   parNmiOn = !(e && !strcmp(e, "0"));
++   e = getenv("GG_DUAL_BYTE_LINES");
++   byteLinesFixed = (e && e[0]) ? atoi(e) : 0;
++   for (m = 0; m < 2; m++)
++   {
++      inner[m].set_video_refresh(m ? videoB : videoA);
++      inner[m].set_audio_sample(m ? sampleB : sampleA);
++      inner[m].set_audio_sample_batch(m ? audioB : audioA);
++      inner[m].set_input_poll(pollNone);
++      inner[m].set_input_state(m ? inputB : inputA);
++      inner[m].init();
++   }
++}
++
++void retro_deinit(void)
++{
++   inner[0].deinit();
++   inner[1].deinit();
++   if (traceFile)
++   {
++      fclose(traceFile);
++      traceFile = NULL;
++   }
++   if (portLog)
++   {
++      fclose(portLog);
++      portLog = NULL;
++   }
++}
++
++void retro_get_system_info(struct retro_system_info *info)
++{
++   memset(info, 0, sizeof(*info));
++   info->library_name = DUAL_LIBRARY_NAME;
++   info->library_version = DUAL_VERSION;
++   info->valid_extensions = "gg|sms|sg|bin";
++   info->need_fullpath = true;
++   info->block_extract = false;
++}
++
++void retro_get_system_av_info(struct retro_system_av_info *info)
++{
++   inner[(linkOn && screen == 1) ? 1 : 0].get_system_av_info(info);
++}
++
++bool retro_load_game(const struct retro_game_info *info)
++{
++   static const struct retro_input_descriptor desc[] = {
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT, "D-Pad Left" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP, "D-Pad Up" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN, "D-Pad Down" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "Button 1" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A, "Button 2" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Start" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT, "D-Pad Left" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP, "D-Pad Up" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN, "D-Pad Down" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "Button 1" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A, "Button 2" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Start" },
++      { 0, 0, 0, 0, NULL },
++   };
++   const char *v, *dir = NULL;
++   char base[1024];
++
++   if (!info)
++      return false;
++   v = getVar("gg_dual_link");
++   linkOn = !(v && !strcmp(v, "off"));
++   readScreenOption();
++
++   memset(&stats, 0, sizeof(stats));
++   memset(side, 0, sizeof(side));
++   stats.magic = 0x47474444; /* 'GGDD' */
++   stats.version = 1;
++   p2SavePath[0] = '\0';
++
++   if (!inner[0].load_game(info))
++   {
++      logf_(RETRO_LOG_ERROR, "1P 기계 불러오기 실패");
++      return false;
++   }
++   if (linkOn && !inner[0].is_8bit())
++   {
++      logf_(RETRO_LOG_WARN, "8비트(게임기어 · 마스터 시스템) 롬이 아님 → 한 대로만 돎");
++      linkOn = 0;
++   }
++   if (linkOn && !inner[1].load_game(info))
++   {
++      logf_(RETRO_LOG_ERROR, "2P 기계 불러오기 실패");
++      inner[0].unload_game();
++      return false;
++   }
++   environCallback(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void *)desc);
++   stats.linkOn = (uint32_t)linkOn;
++   romHash = inner[0].rom_hash();
++
++   if (linkOn)
++   {
++      int m;
++      for (m = 0; m < 2; m++)
++      {
++         inner[m].set_link(&linkOps[m]);
++         side[m].pc6Seen = (uint8_t)((pinsSeenBy(m) >> 6) & 1);
++      }
++      /* 2P 세이브: 방장(1P 화면)만 */
++      if (screen == 0)
++      {
++         contentBase(info, base, sizeof(base));
++         if (environCallback(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &dir) && dir && dir[0] && base[0])
++            snprintf(p2SavePath, sizeof(p2SavePath), "%s/%s.p2.sav", dir, base);
++         loadP2Save();
++      }
++      p2Countdown = P2_WRITE_EVERY;
++   }
++   if (portLog)
++   {
++      inner[0].set_trace(portTrace, (void *)(intptr_t)0);
++      if (linkOn)
++         inner[1].set_trace(portTrace, (void *)(intptr_t)1);
++   }
++   loaded = true;
++   logf_(RETRO_LOG_INFO, "켬 %s link=%s 화면=%dP 롬지문 %08x 기계 %02x 상태 %u 바이트", DUAL_VERSION, linkOn ? "on" : "off",
++         screen + 1, romHash, inner[0].system_hw(), (unsigned)(HEADER_SIZE + LINK_SIZE + SLOT_SIZE * (linkOn ? 2 : 1)));
++   return true;
++}
++
++bool retro_load_game_special(unsigned type, const struct retro_game_info *info, size_t num)
++{
++   (void)type;
++   (void)info;
++   (void)num;
++   return false;
++}
++
++void retro_unload_game(void)
++{
++   if (!loaded)
++      return;
++   if (linkOn)
++   {
++      readScreenOption();
++      writeP2Save("끝냄");
++      inner[1].unload_game();
++   }
++   logf_(RETRO_LOG_INFO, "끔 넘긴 바이트 1P->2P %u 2P->1P %u 2P세이브 씀 %u", stats.bytes[0], stats.bytes[1], stats.p2Writes);
++   inner[0].unload_game();
++   loaded = false;
++}
++
++void retro_reset(void)
++{
++   inner[0].reset();
++   if (linkOn)
++   {
++      inner[1].reset();
++      memset(side, 0, sizeof(side));
++      side[0].pc6Seen = (uint8_t)((pinsSeenBy(0) >> 6) & 1);
++      side[1].pc6Seen = (uint8_t)((pinsSeenBy(1) >> 6) & 1);
++   }
++}
++
++static void sendAudio(const int16_t *snd, size_t total)
++{
++   size_t done = 0;
++   while (done < total && audioBatchCallback)
++   {
++      size_t k = audioBatchCallback(snd + done * 2, total - done);
++      if (!k)
++         break;
++      done += k;
++   }
++}
++
++void retro_run(void)
++{
++   bool updated = false;
++   int shown;
++
++   if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
++      readScreenOption();
++   inputPollCallback();
++   soundFrames[0] = soundFrames[1] = 0;
++
++   if (!linkOn)
++   {
++      /* 혼자: 원래 Genesis Plus GX 의 retro_run 그대로 */
++      inner[0].run();
++   }
++   else
++   {
++      int doneA = 0, doneB = 0, lines = 0;
++      inner[0].frame_begin();
++      inner[1].frame_begin();
++      while ((!doneA || !doneB) && ++lines < 4096)
++      {
++         runLine(0, &doneA);
++         runLine(1, &doneB);
++      }
++      inner[0].frame_end();
++      inner[1].frame_end();
++      if (p2Countdown && --p2Countdown == 0)
++      {
++         writeP2Save("주기");
++         p2Countdown = P2_WRITE_EVERY;
++      }
++   }
++
++   shown = (linkOn && screen == 1) ? 1 : 0;
++   stats.fbW = frameW[shown];
++   stats.fbH = frameH[shown];
++   if (videoCallback)
++   {
++      if (frameSeen[shown])
++         videoCallback(frameBuf[shown], frameW[shown] < FB_W ? frameW[shown] : FB_W,
++               frameH[shown] < FB_H ? frameH[shown] : FB_H, FB_W * 2);
++      else
++         videoCallback(NULL, FB_W, FB_H, FB_W * 2);
++   }
++   sendAudio(soundBuf[shown], soundFrames[shown]);
++
++   stats.frames++;
++   if (traceFile && stats.frames % 60 == 0)
++   {
++      fprintf(traceFile, "f=%u 넘김 1P->2P %u 2P->1P %u 기다림 %u/%u 버림 %u/%u NMI %u/%u 병렬NMI %u/%u 밖에서온상태 %u\n",
++            stats.frames, stats.bytes[0], stats.bytes[1], stats.waits[0], stats.waits[1], stats.drops[0], stats.drops[1],
++            stats.nmis[0], stats.nmis[1], stats.parNmis[0], stats.parNmis[1], stats.outsideLoads);
++      fflush(traceFile);
++   }
++}
++
++size_t retro_serialize_size(void)
++{
++   return HEADER_SIZE + LINK_SIZE + SLOT_SIZE * (linkOn ? 2 : 1);
++}
++
++static void put32(uint8_t *p, uint32_t v)
++{
++   p[0] = (uint8_t)v;
++   p[1] = (uint8_t)(v >> 8);
++   p[2] = (uint8_t)(v >> 16);
++   p[3] = (uint8_t)(v >> 24);
++}
++
++static uint32_t get32(const uint8_t *p)
++{
++   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static void putLink(uint8_t *p)
++{
++   int m;
++   memset(p, 0, LINK_SIZE);
++   for (m = 0; m < 2; m++)
++   {
++      uint8_t *q = p + m * 16;
++      q[0] = side[m].txActive;
++      q[1] = side[m].txByte;
++      q[2] = side[m].pendNmi;
++      q[3] = side[m].pc6Seen;
++      put32(q + 4, side[m].txLines);
++   }
++}
++
++static void getLink(const uint8_t *p)
++{
++   int m;
++   for (m = 0; m < 2; m++)
++   {
++      const uint8_t *q = p + m * 16;
++      side[m].txActive = q[0];
++      side[m].txByte = q[1];
++      side[m].pendNmi = q[2];
++      side[m].pc6Seen = q[3];
++      side[m].txLines = get32(q + 4);
++   }
++}
++
++static bool saveSlot(int m, uint8_t *slot, uint32_t *len)
++{
++   static uint8_t tmp[0x100000];     /* Genesis Plus GX 상태 최대(STATE_SIZE 0xfd000)보다 큼 */
++   int n = inner[m].state_save(tmp);
++   if (n <= 0 || n > SLOT_STATE_MAX)
++   {
++      logf_(RETRO_LOG_ERROR, "%dP 상태 %d 바이트가 칸(%u)보다 큼", m + 1, n, (unsigned)SLOT_STATE_MAX);
++      return false;
++   }
++   memcpy(slot, tmp, (size_t)n);
++   memset(slot + n, 0, SLOT_STATE_MAX - (size_t)n);
++   memcpy(slot + SLOT_STATE_MAX, inner[m].sram(), SRAM_SAVE);
++   *len = (uint32_t)n;
++   return true;
++}
++
++bool retro_serialize(void *data, size_t size)
++{
++   uint8_t *out = (uint8_t *)data;
++   uint32_t lenA = 0, lenB = 0;
++   if (size < retro_serialize_size())
++      return false;
++   memset(out, 0, HEADER_SIZE);
++   memcpy(out, STATE_MAGIC, 8);
++   put32(out + 8, STATE_VERSION);
++   put32(out + 12, (uint32_t)linkOn);
++   put32(out + 16, SLOT_SIZE);
++   put32(out + 28, romHash);
++   putLink(out + HEADER_SIZE);
++   if (!saveSlot(0, out + HEADER_SIZE + LINK_SIZE, &lenA))
++      return false;
++   if (linkOn && !saveSlot(1, out + HEADER_SIZE + LINK_SIZE + SLOT_SIZE, &lenB))
++      return false;
++   put32(out + 20, lenA);
++   put32(out + 24, lenB);
++   if (size > retro_serialize_size())
++      memset(out + retro_serialize_size(), 0, size - retro_serialize_size());
++   return true;
++}
++
++bool retro_unserialize(const void *data, size_t size)
++{
++   const uint8_t *in = (const uint8_t *)data;
++   uint32_t lenA, lenB;
++   if (size < HEADER_SIZE || memcmp(in, STATE_MAGIC, 8) || get32(in + 8) != STATE_VERSION || get32(in + 16) != SLOT_SIZE)
++   {
++      logf_(RETRO_LOG_ERROR, "상태 머리가 다름(다른 코어 · 다른 판의 상태?)");
++      return false;
++   }
++   if ((int)get32(in + 12) != linkOn)
++   {
++      logf_(RETRO_LOG_ERROR, "상태의 link(%u)가 지금(%d)과 다름", get32(in + 12), linkOn);
++      return false;
++   }
++   if (size < retro_serialize_size())
++      return false;
++   if (get32(in + 28) != romHash)
++   {
++      logf_(RETRO_LOG_ERROR, "상태의 롬 지문 %08x 이 지금 롬 %08x 과 다름 — 두 기기 롬을 같게", get32(in + 28), romHash);
++      return false;
++   }
++   lenA = get32(in + 20);
++   lenB = get32(in + 24);
++   if (!lenA || lenA > SLOT_STATE_MAX || lenB > SLOT_STATE_MAX || (linkOn && !lenB))
++      return false;
++   if (!inner[0].state_load(in + HEADER_SIZE + LINK_SIZE))
++      return false;
++   memcpy(inner[0].sram(), in + HEADER_SIZE + LINK_SIZE + SLOT_STATE_MAX, SRAM_SAVE);
++   if (linkOn)
++   {
++      if (!inner[1].state_load(in + HEADER_SIZE + LINK_SIZE + SLOT_SIZE))
++         return false;
++      memcpy(inner[1].sram(), in + HEADER_SIZE + LINK_SIZE + SLOT_SIZE + SLOT_STATE_MAX, SRAM_SAVE);
++      getLink(in + HEADER_SIZE);
++   }
++   stats.outsideLoads++;
++   return true;
++}
++
++void *retro_get_memory_data(unsigned id)
++{
++   switch (id)
++   {
++      case RETRO_MEMORY_SAVE_RAM:
++      case RETRO_MEMORY_SYSTEM_RAM:
++         return inner[0].get_memory_data(id);
++      case DUAL_MEMORY_RAM:
++         return inner[0].work_ram();
++      case DUAL_MEMORY_RAM + 1:
++         return linkOn ? inner[1].work_ram() : NULL;
++      case DUAL_MEMORY_FRAME:
++         return frameBuf[0];
++      case DUAL_MEMORY_FRAME + 1:
++         return linkOn ? frameBuf[1] : NULL;
++      case DUAL_MEMORY_IOREG:
++         return inner[0].io_reg();
++      case DUAL_MEMORY_IOREG + 1:
++         return linkOn ? inner[1].io_reg() : NULL;
++      case DUAL_MEMORY_STATS:
++         return &stats;
++   }
++   return NULL;
++}
++
++size_t retro_get_memory_size(unsigned id)
++{
++   switch (id)
++   {
++      case RETRO_MEMORY_SAVE_RAM:
++      case RETRO_MEMORY_SYSTEM_RAM:
++         return inner[0].get_memory_size(id);
++      case DUAL_MEMORY_RAM:
++         return 0x2000;
++      case DUAL_MEMORY_RAM + 1:
++         return linkOn ? 0x2000 : 0;
++      case DUAL_MEMORY_FRAME:
++         return FB_W * FB_H * 2;
++      case DUAL_MEMORY_FRAME + 1:
++         return linkOn ? FB_W * FB_H * 2 : 0;
++      case DUAL_MEMORY_IOREG:
++         return 16;
++      case DUAL_MEMORY_IOREG + 1:
++         return linkOn ? 16 : 0;
++      case DUAL_MEMORY_STATS:
++         return sizeof(stats);
++   }
++   return 0;
++}
++
++unsigned retro_get_region(void)
++{
++   return RETRO_REGION_NTSC;
++}
++
++/* 치트는 두 기계에 같이(넷플레이에서 두 기기가 같아야 함) */
++void retro_cheat_reset(void)
++{
++   inner[0].cheat_reset();
++   if (linkOn)
++      inner[1].cheat_reset();
++}
++
++void retro_cheat_set(unsigned index, bool enabled, const char *code)
++{
++   inner[0].cheat_set(index, enabled, code);
++   if (linkOn)
++      inner[1].cheat_set(index, enabled, code);
++}
+diff --git a/dual/link_dual.T b/dual/link_dual.T
+new file mode 100644
+index 0000000..9e82b5d
+--- /dev/null
++++ b/dual/link_dual.T
+@@ -0,0 +1,4 @@
++{
++   global: retro_*;
++   local: *;
++};
+diff --git a/libretro/libretro.c b/libretro/libretro.c
+index c632d64..55d358d 100644
+--- a/libretro/libretro.c
++++ b/libretro/libretro.c
+@@ -78,6 +78,7 @@
+ #include "shared.h"
+ #include "md_ntsc.h"
+ #include "sms_ntsc.h"
++#include "hb_gglink.h"
+ 
+ #define STATIC_ASSERT(name, test) typedef struct { int assert_[(test)?1:-1]; } assert_ ## name ## _
+ #define M68K_MAX_CYCLES 1107
+@@ -3518,12 +3519,12 @@ void retro_reset(void)
+    gen_reset(0);
+ }
+ 
+-void retro_run(void) 
++/* 한방 10/22: retro_run 을 앞(hb_run_head) · 장 · 뒤(hb_run_tail)로 나눔 — 하는 일 · 차례는 그대로.
++ * 두 대 래퍼(dual/libretro_dual.c)는 앞 · 뒤를 그대로 쓰고 장 가운데만 줄마다 돌림. */
++static int hb_run_head(void)
+ {
+    int do_skip = 0;
+    bool updated = false;
+-   int vwoffset = 0;
+-   int bmdoffset = 0;
+    is_running = true;
+ 
+ #ifdef HAVE_OVERCLOCK
+@@ -3580,18 +3581,13 @@ void retro_run(void)
+     update_audio_latency = false;
+   }
+ 
+-   if (system_hw == SYSTEM_MCD)
+-   {
+-      system_frame_scd(do_skip);
+-   }
+-   else if ((system_hw & SYSTEM_PBC) == SYSTEM_MD)
+-   {
+-      system_frame_gen(do_skip);
+-   }
+-   else
+-   {
+-      system_frame_sms(do_skip);
+-   }
++   return do_skip;
++}
++
++static void hb_run_tail(int do_skip)
++{
++   int vwoffset = 0;
++   int bmdoffset = 0;
+ 
+    if (bitmap.viewport.changed & 9)
+    {
+@@ -3654,4 +3650,153 @@ void retro_run(void)
+    audio_cb(soundbuffer, audio_update(soundbuffer));
+ }
+ 
++void retro_run(void) 
++{
++   int do_skip = hb_run_head();
++
++   if (system_hw == SYSTEM_MCD)
++   {
++      system_frame_scd(do_skip);
++   }
++   else if ((system_hw & SYSTEM_PBC) == SYSTEM_MD)
++   {
++      system_frame_gen(do_skip);
++   }
++   else
++   {
++      system_frame_sms(do_skip);
++   }
++
++   hb_run_tail(do_skip);
++}
++
++/* ---------------------------------------------------------------------------
++ * 한방 10/22: 두 대 래퍼(Genesis Plus GX GG Dual)가 쓰는 함수 — 빌드가 이 코어 전체 이름에
++ * ggA_ / ggB_ 를 붙여 두 벌을 한 .so 에 넣음. 8비트 기계(게임기어 · 마스터 시스템)에서만 씀.
++ * ------------------------------------------------------------------------- */
++static int hb_do_skip;
++
++int hb_gg_is_8bit(void)
++{
++   return (system_hw != SYSTEM_MCD) && ((system_hw & SYSTEM_PBC) != SYSTEM_MD);
++}
++
++int hb_gg_system_hw(void)
++{
++   return system_hw;
++}
++
++/* 한 장 시작(원래 retro_run 의 앞부분 + 장 머리) */
++void hb_gg_frame_begin(void)
++{
++   hb_do_skip = hb_run_head();
++   hb_frame_sms_begin(hb_do_skip);
++}
++
++/* 가로줄 하나. 장이 끝나면 1 */
++int hb_gg_run_line(void)
++{
++   return hb_frame_sms_line();
++}
++
++/* 한 장 끝(원래 retro_run 의 뒷부분 — 화면 · 소리 콜백) */
++void hb_gg_frame_end(void)
++{
++   hb_run_tail(hb_do_skip);
++}
++
++/* 통신 고리 켜기 · 끄기(ops == NULL 이면 끔) */
++void hb_gg_set_link(const struct hb_gg_link_ops *ops)
++{
++   if (ops)
++   {
++      hb_gg_link = *ops;
++      hb_gg_link_on = 1;
++   }
++   else
++   {
++      memset(&hb_gg_link, 0, sizeof(hb_gg_link));
++      hb_gg_link_on = 0;
++   }
++}
++
++void hb_gg_set_trace(void (*fn)(void *ctx, int write, unsigned port, unsigned value), void *ctx)
++{
++   hb_gg_port_trace = fn;
++   if (!hb_gg_link_on)
++      hb_gg_link.ctx = ctx;
++}
++
++uint8_t *hb_gg_io_reg(void)
++{
++   return io_reg;
++}
++
++/* NMI 한 번(가장자리). 줄과 줄 사이에서만 부름 */
++void hb_gg_nmi(void)
++{
++   z80_set_nmi_line(ASSERT_LINE);
++   z80_set_nmi_line(CLEAR_LINE);
++}
++
++uint8_t *hb_gg_work_ram(void)
++{
++   return work_ram;
++}
++
++uint8_t *hb_gg_sram(void)
++{
++   return sram.sram;
++}
++
++int hb_gg_sram_on(void)
++{
++   return sram.on;
++}
++
++unsigned hb_gg_z80_pc(void)
++{
++   return Z80.pc.w.l;
++}
++
++/* 롬 지문(FNV-1a 32) — 상태 머리에 넣어 다른 롬의 상태를 거절 */
++uint32_t hb_gg_rom_hash(void)
++{
++   uint32_t h = 2166136261u;
++   uint32_t i;
++   for (i = 0; i < cart.romsize; i++)
++   {
++      h ^= cart.rom[i];
++      h *= 16777619u;
++   }
++   return h ^ cart.romsize;
++}
++
++/* 상태 저장: Z80 구조체 안의 함수 · 표 포인터(실행 때마다 주소가 다름)를 0 으로 두고 저장 —
++ * 같은 장면이면 두 기기 · 두 실행이 같은 바이트(넷플레이 CRC). 불러오기는 원래처럼 콜백을 되돌림 */
++int hb_gg_state_save(uint8_t *buf)
++{
++   const struct z80_irq_daisy_chain *daisy = Z80.daisy;
++   int (*cb)(int) = Z80.irq_callback;
++   int size;
++   Z80.daisy = NULL;
++   Z80.irq_callback = NULL;
++   size = state_save(buf);
++   Z80.daisy = daisy;
++   Z80.irq_callback = cb;
++   return size;
++}
++
++int hb_gg_state_load(const uint8_t *buf)
++{
++   const struct z80_irq_daisy_chain *daisy = Z80.daisy;
++   if (!state_load((uint8_t *)buf))
++      return 0;
++   Z80.daisy = daisy;
++#ifdef HAVE_OVERCLOCK
++   update_overclock();
++#endif
++   return 1;
++}
++
+ #undef  CHUNKSIZE
+-- 
+2.53.0
+

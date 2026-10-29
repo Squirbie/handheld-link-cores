@@ -1,0 +1,30 @@
+# blueMSX (libretro, 572c918 + sramflush/disk 패치 위)에 적용하는 패치. 소스 루트에서 patch -p1 < 이 파일
+# 1) AmdFlash.c: 켤 때 .sram을 롬 복사 뒤에 읽어 저장된 플래시가 롬 빈 영역에 덮이지 않게 함
+# 2) MegaromCartridge.c: MegaFlashRomSccPlus가 롬 1MB 초과면 2MB 플래시 사용
+--- a/Src/Memory/AmdFlash.c	2026-10-01 17:36:19
++++ b/Src/Memory/AmdFlash.c	2026-10-01 17:36:19
+@@ -249,11 +249,10 @@
+ 
+     if (size > 0)
+         memcpy(rm->romData, romData, size);
+-#if 0
++    /* flash content saved by a previous session must win over the (blank) save area inside the ROM file */
+     if (rm->sramFilename[0] && loadSram) {
+         sramLoad(rm->sramFilename, rm->romData, rm->flashSize, NULL, 0);
+     }
+-#endif
+ 
+     return rm;
+ }
+--- a/Src/Memory/MegaromCartridge.c	2026-10-01 17:36:19
++++ b/Src/Memory/MegaromCartridge.c	2026-10-01 17:36:19
+@@ -458,7 +458,8 @@
+             break;
+ 
+         case ROM_MEGAFLSHSCCPLUS:
+-            success &= romMapperMegaFlashRomSccCreate(romName, buf, size, slot, sslot, 2, 0, 0x100000, 1);
++            /* Korean ROM-disk conversions for Yamanooto-style flash carts can exceed 1MB (up to 2MB): give them a 2MB flash */
++            success &= romMapperMegaFlashRomSccCreate(romName, buf, size, slot, sslot, 2, 0, size > 0x100000 ? 0x200000 : 0x100000, 1);
+             break;
+ 
+         case ROM_OBSONET:

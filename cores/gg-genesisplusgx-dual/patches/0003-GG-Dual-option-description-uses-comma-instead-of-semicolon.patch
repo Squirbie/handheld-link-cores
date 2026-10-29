@@ -1,0 +1,30 @@
+From: hanbang <hanbang@localhost>
+Date: Thu, 22 Oct 2026 01:46:00 +0900
+Subject: [PATCH] GG Dual: option description uses ',' instead of ';'
+
+RetroArch splits a core option description from its value list at the
+first ';', so gg_dual_link showed values like "restart); on" in the menu
+and rewrote the per-game .opt with that value. Only the description text
+changes (one byte, ';' -> ','). Same fix as NGP Dual 0005.
+
+(Reconstructed 2026-10-29: this change was built into the core on
+2026-10-22 straight from the working tree and was never committed. The
+diff below is `git diff` of that working tree against commit 3ef1895
+(= 302fe82 + patches 0001 and 0002).)
+---
+ dual/libretro_dual.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dual/libretro_dual.c b/dual/libretro_dual.c
+index c0c57f4..56b3896 100644
+--- a/dual/libretro_dual.c
++++ b/dual/libretro_dual.c
+@@ -702,7 +702,7 @@ void retro_set_environment(retro_environment_t env)
+    /* 메뉴 글씨: 기기 레트로아크 글꼴에 한글이 없을 수 있어 영어(다른 Dual 과 같음) */
+    static const struct retro_variable vars[] = {
+       { "gg_dual_screen", "Screen and sound (host/solo = 1P, guest = 2P); 1P|2P" },
+-      { "gg_dual_link", "2P Game Gear on the Gear-to-Gear cable (off = solo, one console; restart); on|off" },
++      { "gg_dual_link", "2P Game Gear on the Gear-to-Gear cable (off = solo, one console, restart); on|off" },
+       { NULL, NULL },
+    };
+    static const struct retro_controller_description pads[] = {

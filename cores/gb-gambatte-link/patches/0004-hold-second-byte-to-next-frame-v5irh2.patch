@@ -1,0 +1,102 @@
+Subject: Gambatte: hold the second byte of a run until the receiver has run into its next frame (v5irh2)
+Series-Step: 4/5 (gambatte link v5irh3)
+Origin: hanbang (this project); record name hanbang_gb_v5irh2_from_v5irh.diff
+요약: 받는 쪽이 첫 바이트를 읽기 전에 같은 장 안에 둘째 바이트가 와 덮어쓰던 것(포켓몬 카드 GB2 "통신 오류")을 다음 장 반 틱까지 붙잡아 고침.
+
+The first byte of a run that arrives while the frontend sleeps between frames is found at the start of this side's
+frame, after the game's own frame-start work, whereas on a cable it arrived during the frame before. A game that reads it
+once a frame (copied to RAM by its serial interrupt) then reads it only in the next frame, so when the sender waits about
+a frame or more before its second byte (gap >= 70224 cycles) the second byte must not arrive before that: Pokemon Trading
+Card GB2's START side waits a $1000 loop after the 21 answer, the half-frame allowance used to bring its next byte
+inside the same frame, it overwrote the first one and the game never became the client. Such a second byte now also waits
+until this side's next frame has run half a 240 Hz tick (Card GB 1 still works: its client gives up if the byte is more
+than about a third of a frame later). New counters: frames run, frame of the first byte, time first seen in a frame.
+
+---
+diff --git a/libgambatte/libretro/hb_netpacket_serial.h b/libgambatte/libretro/hb_netpacket_serial.h
+index 9186a7e416d7..1f81db67b92c 100644
+--- a/libgambatte/libretro/hb_netpacket_serial.h
++++ b/libgambatte/libretro/hb_netpacket_serial.h
+@@ -98,6 +98,8 @@ struct retro_netpacket_callback
+ #define HB_NP_GAP_NONE   0xFFFFFFFFu  /* first byte: nothing to count from */
+ #define HB_NP_GAP_LONG   0xFFFF  /* units (about 15 frames): a gap this long starts a new run of bytes */
+ #define HB_NP_STARTUP_SLACK 35112UL /* half a normal-speed frame; once per incoming run */
++#define HB_NP_SECOND_LONG 70224UL   /* v5irh2: cycles (a normal-speed frame): a gap this long before the second byte of a run
++                                  * means the sender waited for this side's game (see check()) */
+ #define HB_NP_CATCHUP    2106720 /* cycles (30 frames): a Game Boy further behind the sender than this answers at once */
+ #define HB_NP_LATE       140448  /* two frames of cycles: a byte later than this after its expected time is not waited for */
+ #define HB_NP_HIST       16      /* gaps remembered to guess the next one */
+@@ -150,7 +152,7 @@ class NetpacketSerial : public gambatte::SerialIO
+ public:
+    NetpacketSerial() : send_fn_(NULL), poll_fn_(NULL), peer_(-1), is_host_(false),
+       seq_(0), head_(0), tail_(0), last_poll_ms_(0), clock_(0), last_xfer_clock_(0),
+-      expect_(0), held_seq_(0x10000), hist_n_(0), after_send_(false), trace_(NULL), peer_clock_(0), sent_clock_(0), peer_seen_(false), sent_progress_(false), epoch_(0), epoch_set_(false), timing_(false), fresh_(true), boot_pending_(false), link_ready_(false), peer_boot_(false), generation_(0), peer_generation_(0), used_peer_generation_(0), peer_ack_(0), boot_reset_(false), peer_boot_reset_(false), boot_deadline_(0), boot_tx_ms_(0), runs_(0), auto_cold_(false), state_loaded_(false), event_(0), progressed_(false), ever_linked_(false), armed_clock_(0), late_(0), unarmed_from_(0), unarmed_seq_(0x10000), turn_seen_(false) { irReset(); ir_lag_=HB_IR_LAG_DEF; ir_hold_=HB_IR_HOLD_DEF; ir_rdall_=false; ir_refresh_=NULL; ir_refresh_ms_=0; }
++      expect_(0), held_seq_(0x10000), hist_n_(0), after_send_(false), trace_(NULL), peer_clock_(0), sent_clock_(0), peer_seen_(false), sent_progress_(false), epoch_(0), epoch_set_(false), timing_(false), fresh_(true), boot_pending_(false), link_ready_(false), peer_boot_(false), generation_(0), peer_generation_(0), used_peer_generation_(0), peer_ack_(0), boot_reset_(false), peer_boot_reset_(false), boot_deadline_(0), boot_tx_ms_(0), runs_(0), auto_cold_(false), state_loaded_(false), event_(0), progressed_(false), ever_linked_(false), armed_clock_(0), late_(0), unarmed_from_(0), unarmed_seq_(0x10000), turn_seen_(false), frames_(0), first_frame_(0), frame_clock_(0), new_frame_(false) { irReset(); ir_lag_=HB_IR_LAG_DEF; ir_hold_=HB_IR_HOLD_DEF; ir_rdall_=false; ir_refresh_=NULL; ir_refresh_ms_=0; }
+ 
+    /* v4bv: automatic cold start is confined to the untouched startup window.
+     * Input delivered to a running game, a loaded state, or an established
+@@ -182,6 +184,7 @@ public:
+       debugState("after-local-reset");
+    }
+    bool beforeRun() {
++      ++frames_; new_frame_ = true;   /* v5irh2: see check() */
+       bool run = beforeRunInner();
+       if (run && runs_ < 0xFFFFFFFFUL) ++runs_;
+       return run;
+@@ -367,6 +370,7 @@ public:
+          if (started() && peer_ >= 0) put('D',0,0,0,0);
+       }
+       clock_ = timeline() && epoch_set_ ? cycles - epoch_ : cycles;
++      if (new_frame_) { new_frame_ = false; frame_clock_ = clock_; }   /* v5irh2: first time seen in this frame */
+    }
+ 
+    virtual void setArmed(unsigned long cycles) { armed_clock_ = cycles; }
+@@ -491,6 +495,28 @@ public:
+          if (u.gap != HB_NP_GAP_NONE && last_xfer_clock_ && clock_ >= last_xfer_clock_) {
+             unsigned long due = (unsigned long)u.gap * HB_NP_GAP_UNIT, ran = clock_ - last_xfer_clock_;
+             bool slack = hist_n_ == 0 && !after_send_ && u.gap < HB_NP_GAP_LONG;
++            /* v5irh2: the first byte of a run that came while the frontend slept between frames is
++             * found at the start of this side's frame, after the game's own frame-start work, where
++             * on a cable it came during the frame before. A game that reads it once a frame (copied
++             * to RAM by its serial interrupt) then reads it only at the next frame, so when the
++             * sender waits about a frame or more before its second byte, the second byte must not
++             * come before that: Pokemon Card GB2's START side waits a $1000 loop after the 21
++             * answer (0.9 to 1.1 frames), the slack below brought its next byte inside the same
++             * frame, it overwrote the first one and the game never became the client
++             * ('통신 오류입니다'). So such a second byte also waits until this side's next frame
++             * has run half a 240 Hz tick (Pokemon Card GB 1: 1.4 frames, its client gives up if
++             * the byte is more than about a third of a frame later than that). */
++            bool next_frame = slack && due >= HB_NP_SECOND_LONG;
++            if (next_frame) {
++               if (frames_ == first_frame_ || clock_ < frame_clock_
++                     || clock_ - frame_clock_ < (unsigned long)HB_NP_GAP_NEW * HB_NP_GAP_UNIT / 2) {
++                  if (u.seq != held_seq_) {
++                     held_seq_ = u.seq;
++                     tr("hold2f", u.seq, u.data, (unsigned)(ran / HB_NP_GAP_UNIT));
++                  }
++                  return false;
++               }
++            }
+             if (slack)
+                due = due > HB_NP_STARTUP_SLACK ? due - HB_NP_STARTUP_SLACK : 0;
+             if (ran < due && due - ran <= HB_NP_CATCHUP) {
+@@ -520,6 +546,8 @@ public:
+          bool turn = after_send_ && u.gap < HB_NP_GAP_LONG;
+          if (turn)
+             turn_seen_ = true;          /* v4bw: see send() */
++         if (u.gap >= HB_NP_GAP_LONG)
++            first_frame_ = frames_;     /* v5irh2: first byte of a run, see above */
+          after_send_ = false;
+          expect_ = turn ? 0             /* its turn soon after ours: its next byte follows our next one */
+                         : (unsigned long)guess_gap(u.gap) * HB_NP_GAP_UNIT + 1;
+@@ -764,6 +792,10 @@ private:
+    unsigned long unarmed_from_;    /* v4bw: this side's time from which the waiting byte counts as not listened to */
+    unsigned unarmed_seq_;          /* v4bw: that byte (0x10000 = none) */
+    bool turn_seen_;                /* v4bw: the other side answered our last byte with a byte of its own */
++   unsigned long frames_;          /* v5irh2: frames run (beforeRun calls) */
++   unsigned long first_frame_;     /* v5irh2: the frame the first byte of the current incoming run was taken in */
++   unsigned long frame_clock_;     /* v5irh2: this side's time first seen in the current frame */
++   bool new_frame_;                /* v5irh2: a frame began and its time is not seen yet */
+ 
+ 
+ public:

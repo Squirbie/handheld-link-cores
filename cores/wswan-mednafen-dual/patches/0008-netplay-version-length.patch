@@ -1,0 +1,14 @@
+--- a/dual/libretro_dual.c
++++ b/dual/libretro_dual.c
+@@ -68,7 +68,10 @@
+ #endif
+ 
+ #define DUAL_LIBRARY_NAME  "Beetle WonderSwan Dual"
+-#define DUAL_VERSION       "1.1-ownsave"
++/* 넷플레이 버전 칸은 끝 문자 포함 32바이트다.
++ * 자기 세이브 판과 리비전 표시는 유지하고 길이 초과는 빌드 때 막는다. */
++#define DUAL_VERSION       "1.1-os1"
++typedef char hb_version_fits_netplay[(sizeof(DUAL_VERSION GIT_VERSION) <= 32) ? 1 : -1];
+ #define DUAL_EXTENSIONS    "ws|wsc|pc2"
+ #define DUAL_WIDTH         224
+ #define DUAL_HEIGHT        144

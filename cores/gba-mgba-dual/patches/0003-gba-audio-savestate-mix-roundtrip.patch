@@ -1,0 +1,151 @@
+Subject: GBA Audio: savestates roundtrip the mix exactly
+Series-Step: 3/19 (mgba_dual 1.6-os4)
+Origin: tangobattle/mgba 7bd57294a4af5b7998b043faacf80b2bb777cfcf (2026-07-20), MPL-2.0; carried unchanged in the hb_dual branch, original authors are credited there
+요약: 되감기 · 넷플레이 재계산 때 소리 상태가 어긋나지 않게 상태 저장/불러오기를 고침(tangobattle/mgba).
+
+Three stale pieces of audio state survived a save+load cycle wrong,
+each audible under rollback re-simulation (every netplay mispredict):
+
+- The frequency-class registers (SOUND1/2/3CNT_X, SOUND4CNT_HI) read
+  back with their frequency bits masked — they are write-only — so the
+  deserialize-time register replay clobbered every channel's frequency
+  with the masked value: PSG tones came back detuned (e.g. 0x403 ->
+  0x400) and phase-drifted from the restore point on. The true values
+  now ride in the PSG state's reserved slots, flagged by a spare flags
+  bit, and are re-applied after the replay; unflagged (old) states keep
+  the replay derivation.
+- The square channels' output latches (ch->sample) are pure functions
+  of serialized state but were never recomputed on load, so the mixer
+  kept voicing the pre-load phase for up to a full duty step whenever
+  an edge sat between the restored and revoked timelines.
+- audio->lastSample was stored absolutely while the serializer's
+  negative-cycle rebase can shift the state's clock, desyncing the
+  sampling grid on exactly the saves where the rebase fired. It is now
+  stored relative like every other timing anchor, gated on the same
+  flag for old states.
+
+Verified by mgba-siolink's audio fidelity and rollback stream tests:
+the audio a consumer pulls across a mispredict-heavy netplay run is
+now bit-identical to a straight run of the same inputs.
+
+(cherry picked from commit 7bd57294a4af5b7998b043faacf80b2bb777cfcf)
+
+---
+diff --git a/include/mgba/internal/gb/audio.h b/include/mgba/internal/gb/audio.h
+index 8b9b775c3c43..8806f3b41807 100644
+--- a/include/mgba/internal/gb/audio.h
++++ b/include/mgba/internal/gb/audio.h
+@@ -247,6 +247,7 @@ void GBAudioSamplePSG(struct GBAudio* audio, int16_t* left, int16_t* right);
+ struct GBSerializedPSGState;
+ void GBAudioPSGSerialize(const struct GBAudio* audio, struct GBSerializedPSGState* state, uint32_t* flagsOut);
+ void GBAudioPSGDeserialize(struct GBAudio* audio, const struct GBSerializedPSGState* state, const uint32_t* flagsIn);
++void GBAudioPSGDeserializeExact(struct GBAudio* audio, const struct GBSerializedPSGState* state, const uint32_t* flagsIn);
+ 
+ struct GBSerializedState;
+ void GBAudioSerialize(const struct GBAudio* audio, struct GBSerializedState* state);
+diff --git a/include/mgba/internal/gb/serialize.h b/include/mgba/internal/gb/serialize.h
+index 72fe9c436834..111b917f310f 100644
+--- a/include/mgba/internal/gb/serialize.h
++++ b/include/mgba/internal/gb/serialize.h
+@@ -211,6 +211,7 @@ DECL_BIT(GBSerializedAudioFlags, Ch1SweepEnabled, 25);
+ DECL_BIT(GBSerializedAudioFlags, Ch1SweepOccurred, 26);
+ DECL_BIT(GBSerializedAudioFlags, Ch3Readable, 27);
+ DECL_BIT(GBSerializedAudioFlags, SkipFrame, 28);
++DECL_BIT(GBSerializedAudioFlags, ExactFrequency, 31);
+ 
+ DECL_BITFIELD(GBSerializedAudioEnvelope, uint32_t);
+ DECL_BITS(GBSerializedAudioEnvelope, Length, 0, 7);
+diff --git a/src/gb/audio.c b/src/gb/audio.c
+index 6a97d8beab5a..411632db18ec 100644
+--- a/src/gb/audio.c
++++ b/src/gb/audio.c
+@@ -1013,6 +1013,11 @@ void GBAudioPSGSerialize(const struct GBAudio* audio, struct GBSerializedPSGStat
+ 	sweep = GBSerializedAudioSweepSetTime(sweep, audio->ch1.sweep.time & 7);
+ 	STORE_32LE(ch1Flags, 0, &state->ch1.envelope);
+ 	STORE_32LE(sweep, 0, &state->ch1.sweep);
++	flags = GBSerializedAudioFlagsSetExactFrequency(flags, 1);
++	STORE_32LE(audio->ch1.control.frequency, 0, &state->ch1.reserved);
++	STORE_32LE(audio->ch2.control.frequency, 0, &state->ch2.reserved[0]);
++	STORE_32LE(audio->ch4.ratio | (audio->ch4.frequency << 4) | (audio->ch4.power << 8), 0, &state->ch2.reserved[1]);
++	STORE_16LE(audio->ch3.rate, 0, &state->ch3.reserved);
+ 	STORE_32LE(audio->ch1.lastUpdate - mTimingCurrentTime(audio->timing), 0, &state->ch1.lastUpdate);
+ 
+ 	flags = GBSerializedAudioFlagsSetCh2Volume(flags, audio->ch2.envelope.currentVolume);
+@@ -1120,6 +1125,35 @@ void GBAudioPSGDeserialize(struct GBAudio* audio, const struct GBSerializedPSGSt
+ 	}
+ 	audio->ch4.nSamples = 0;
+ 	audio->ch4.samples = 0;
++
++	// The output latches are pure functions of the state restored above,
++	// but the mixer reads them directly between duty steps — left stale,
++	// a rollback restore keeps voicing the pre-restore phase for up to a
++	// full duty step (~32 output samples of the wrong level whenever an
++	// edge sits between the restore point and the revoked future).
++	_updateSquareSample(&audio->ch1);
++	_updateSquareSample(&audio->ch2);
++}
++
++void GBAudioPSGDeserializeExact(struct GBAudio* audio, const struct GBSerializedPSGState* state, const uint32_t* flagsIn) {
++	uint32_t flags;
++	uint32_t value;
++	uint16_t rate;
++	LOAD_32LE(flags, 0, flagsIn);
++	if (!GBSerializedAudioFlagsGetExactFrequency(flags)) {
++		// Pre-fork state: leave the register-replay derivation in place.
++		return;
++	}
++	LOAD_32LE(value, 0, &state->ch1.reserved);
++	audio->ch1.control.frequency = value & 0x7FF;
++	LOAD_32LE(value, 0, &state->ch2.reserved[0]);
++	audio->ch2.control.frequency = value & 0x7FF;
++	LOAD_32LE(value, 0, &state->ch2.reserved[1]);
++	audio->ch4.ratio = value & 0x7;
++	audio->ch4.frequency = (value >> 4) & 0xF;
++	audio->ch4.power = (value >> 8) & 1;
++	LOAD_16LE(rate, 0, &state->ch3.reserved);
++	audio->ch3.rate = rate & 0x7FF;
+ }
+ 
+ void GBAudioSerialize(const struct GBAudio* audio, struct GBSerializedState* state) {
+diff --git a/src/gba/audio.c b/src/gba/audio.c
+index 1e913554ff9b..711a4b51d114 100644
+--- a/src/gba/audio.c
++++ b/src/gba/audio.c
+@@ -443,7 +443,13 @@ void GBAAudioSerialize(const struct GBAAudio* audio, struct GBASerializedState*
+ 		STORE_16(audio->currentSamples[i].left, 0, &state->currentSamples[i].left);
+ 		STORE_16(audio->currentSamples[i].right, 0, &state->currentSamples[i].right);
+ 	}
+-	STORE_32(audio->lastSample, 0, &state->audio.lastSample);
++	// Relative, like every other timing anchor: the serialize-side
++	// negative-cycle rebase shifts the state's clock relative to the
++	// live one, so an absolute timestamp desyncs the sampling grid on
++	// exactly the saves where the rebase fired (audible as duty-edge
++	// jitter in rollback re-simulation). Old states hold an absolute
++	// value; the ExactFrequency flag marks the relative representation.
++	STORE_32(audio->lastSample - mTimingCurrentTime(&audio->p->timing), 0, &state->audio.lastSample);
+ 
+ 	int readA = audio->chA.fifoRead;
+ 	int readB = audio->chB.fifoRead;
+@@ -516,6 +522,11 @@ void GBAAudioDeserialize(struct GBAAudio* audio, const struct GBASerializedState
+ 		LOAD_16(audio->currentSamples[i].right, 0, &state->currentSamples[i].right);
+ 	}
+ 	LOAD_32(audio->lastSample, 0, &state->audio.lastSample);
++	uint32_t psgFlags;
++	LOAD_32LE(psgFlags, 0, &state->audio.flags);
++	if (GBSerializedAudioFlagsGetExactFrequency(psgFlags)) {
++		audio->lastSample += mTimingCurrentTime(&audio->p->timing);
++	}
+ 
+ 	int readA = 0;
+ 	int readB = 0;
+@@ -553,4 +564,10 @@ void GBAAudioDeserialize(struct GBAAudio* audio, const struct GBASerializedState
+ 		audio->lastSample = when - SAMPLE_INTERVAL;
+ 	}
+ 	mTimingSchedule(&audio->p->timing, &audio->sampleEvent, when);
++
++	// Last, AFTER the register-write replays above: the sound registers
++	// read back with their frequency bits masked (write-only), so the
++	// replay just clobbered every channel's frequency-class state with
++	// the masked values. Restore the exact fields the fork serializes.
++	GBAudioPSGDeserializeExact(&audio->psg, &state->audio.psg, &state->audio.flags);
+ }

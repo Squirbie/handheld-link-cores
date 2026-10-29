@@ -1,0 +1,343 @@
+From 37ddc42aee86ebc38d8f0e306b0a2bcaf47c9bd9 Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Tue, 20 Oct 2026 00:54:00 +0900
+Subject: [PATCH 2/5] Libretro: run a frame line by line (hb_ws_* API) for a
+ two-console frontend
+
+Split Emulate() and retro_run() into run_pre (options, input,
+frameskip) / emu_begin / emu_line (one 256-cycle scanline) / emu_end /
+run_post (video and audio out). retro_run() simply calls them in order,
+so the single-console core behaves exactly as before. A frontend that
+hosts two consoles alternates emu_line() between them and passes
+finished serial bytes across with hb_ws_link_take()/hb_ws_link_give().
+
+Also exported: hb_ws_set_render (skip drawing for the hidden console),
+hb_ws_framebuffer, hb_ws_internal_eeprom, and test-only helpers
+hb_ws_trace, hb_ws_watch (physical write watchpoint), hb_ws_cpu_reg.
+link.T exports hb_ws_* next to retro_*.
+
+---
+ libretro.c                    | 182 ++++++++++++++++++++++++++++------
+ link.T                        |   2 +-
+ mednafen/wswan/eeprom.c       |   6 ++
+ mednafen/wswan/eeprom.h       |   1 +
+ mednafen/wswan/wswan-memory.c |   6 ++
+ 5 files changed, 163 insertions(+), 34 deletions(-)
+
+diff --git a/libretro.c b/libretro.c
+index aaadf48..7283db7 100644
+--- a/libretro.c
++++ b/libretro.c
+@@ -1,4 +1,5 @@
+ #include <sys/types.h>
++#include <stdio.h>
+ 
+ #include <libretro.h>
+ #include <retro_math.h>
+@@ -427,7 +428,10 @@ static void Reset(void)
+ 
+ static uint8 *chee = NULL;
+ 
+-static void Emulate(EmulateSpecStruct *espec,
++/* 한방 10/20: 예전 Emulate() 를 시작 · 줄(wsExecuteLine) · 끝으로 나눔 — 원더스완
++ * 두 대를 한 줄씩 번갈아 돌리는 앞단(hb_ws_*)이 쓰고, 한 대짜리 retro_run 은
++ * 셋을 이어 불러 예전과 똑같이 동작함. */
++static void Emulate_begin(EmulateSpecStruct *espec,
+       int skip_frame, int update_sample_rate)
+ {
+    espec->surface          = surf;
+@@ -442,9 +446,10 @@ static void Emulate(EmulateSpecStruct *espec,
+    WSButtonStatus          = chee[0] | (chee[1] << 8);
+ 
+    MDFNMP_ApplyPeriodicCheats();
++}
+ 
+-   while (!wsExecuteLine(espec->surface, espec->skip));
+-
++static void Emulate_end(EmulateSpecStruct *espec)
++{
+    espec->SoundBufSize = WSwan_SoundFlush(&audio_samples_buf,
+          &audio_samples_buf_size);
+ 
+@@ -455,6 +460,7 @@ static void Emulate(EmulateSpecStruct *espec,
+    v30mz_timestamp = 0;
+ }
+ 
++
+ #if 0
+ typedef struct
+ {
+@@ -1382,19 +1388,23 @@ static void update_input(void)
+ #endif
+ }
+ 
+-void retro_run(void)
++/* 한방 10/20: retro_run 을 앞(변수 · 입력 · 프레임 건너뛰기) / 가운데(장 수만큼
++ * Emulate 시작 · 줄 · 끝) / 뒤(화면 · 소리 내보내기)로 나눔. retro_run 은 이를
++ * 차례로 부르므로 한 대짜리 동작은 그대로이고, 두 대 앞단은 가운데의 줄
++ * 실행을 두 기계 사이에서 번갈아 부름. */
++static EmulateSpecStruct hb_spec;
++static int hb_skip_frame         = 0;
++static int hb_update_sample_rate = 0;
++static int hb_render_off         = 0;
++
++void hb_ws_run_pre(void)
+ {
+-   int total;
+-   unsigned width, height;
+-   int32 SoundBufSize;
+-   EmulateSpecStruct spec;
+    bool updated   = false;
+    int skip_frame = 0;
+-   int update_sample_rate;
+ 
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+       check_variables(false);
+-   update_sample_rate = update_audio;
++   hb_update_sample_rate = update_audio;
+ 
+    input_poll_cb();
+ 
+@@ -1436,31 +1446,57 @@ void retro_run(void)
+       update_audio_latency = false;
+    }
+ 
+-   if (retro_60hz_enabled)
+-   {
+-      /* If we are running in 60Hz mode, then:
+-       * - Audio data must be buffered
+-       * - On every 4th call of retro_run(), an
+-       *   extra frame must be emulated */
++   /* 앞단이 이 기계를 안 보여 주면 그리기만 건너뜀(에뮬 결과는 같음) */
++   if (hb_render_off)
++      skip_frame = 1;
+ 
++   hb_skip_frame = skip_frame;
++}
++
++/* If we are running in 60Hz mode, then on every 4th call of
++ * retro_run() an extra ('force skipped') frame is emulated first */
++int hb_ws_subframes(void)
++{
++   return (retro_60hz_enabled && retro_60hz_counter == 0) ? 2 : 1;
++}
++
++void hb_ws_emu_begin(int sub, int nsub)
++{
++   if (nsub == 2 && sub == 0)
++   {
+       /* Emulate 'force skipped frame' */
+-      if (retro_60hz_counter == 0)
+-      {
+-         Emulate(&spec, 1, update_sample_rate);
+-         update_sample_rate = 0;
+-         retro_60hz_cache_audio_samples(audio_samples_buf,
+-               spec.SoundBufSize);
+-      }
++      Emulate_begin(&hb_spec, 1, hb_update_sample_rate);
++      hb_update_sample_rate = 0;
++   }
++   else
++      Emulate_begin(&hb_spec, hb_skip_frame, hb_update_sample_rate);
++}
++
++/* 한 줄(256 CPU 사이클). 1 = 이 줄에서 한 장이 끝남(세로 귀선 시작) */
++int hb_ws_emu_line(void)
++{
++   return wsExecuteLine(hb_spec.surface, hb_spec.skip) ? 1 : 0;
++}
+ 
+-      /* Run 'regular' frame */
+-      Emulate(&spec, skip_frame, update_sample_rate);
++void hb_ws_emu_end(int sub, int nsub)
++{
++   Emulate_end(&hb_spec);
++
++   if (retro_60hz_enabled)
++   {
+       retro_60hz_cache_audio_samples(audio_samples_buf,
+-            spec.SoundBufSize);
++            hb_spec.SoundBufSize);
+ 
+-      retro_60hz_counter++;
++      if (sub == nsub - 1)
++         retro_60hz_counter++;
+    }
+-   else
+-      Emulate(&spec, skip_frame, update_sample_rate);
++}
++
++void hb_ws_run_post(void)
++{
++   int total;
++   unsigned width, height;
++   int skip_frame = hb_skip_frame;
+ 
+    if (update_audio || update_video)
+    {
+@@ -1471,8 +1507,8 @@ void retro_run(void)
+       update_video = false;
+    }
+ 
+-   width  = spec.DisplayRect.w;
+-   height = spec.DisplayRect.h;
++   width  = hb_spec.DisplayRect.w;
++   height = hb_spec.DisplayRect.h;
+ 
+    if (hw_rotate_enabled || !rotate_tall)
+    {
+@@ -1534,10 +1570,90 @@ void retro_run(void)
+       retro_60hz_audio.samples_buf_pos -= samples_to_read;
+    }
+    else
+-      for (total = 0; total < spec.SoundBufSize; )
++      for (total = 0; total < hb_spec.SoundBufSize; )
+          total += audio_batch_cb(
+                audio_samples_buf + (total << 1),
+-               spec.SoundBufSize - total);
++               hb_spec.SoundBufSize - total);
++}
++
++void retro_run(void)
++{
++   int n, s;
++
++   hb_ws_run_pre();
++
++   n = hb_ws_subframes();
++   for (s = 0; s < n; s++)
++   {
++      hb_ws_emu_begin(s, n);
++      while (!hb_ws_emu_line());
++      hb_ws_emu_end(s, n);
++   }
++
++   hb_ws_run_post();
++}
++
++/* 한방 10/20: 두 대 앞단용 — 직렬 선 · 그리기 끄기 · 화면 · 내부 EEPROM */
++unsigned hb_ws_api_version(void)
++{
++   return 1;
++}
++
++int hb_ws_link_take(void)
++{
++   return Comm_LinkTake();
++}
++
++void hb_ws_link_give(unsigned v)
++{
++   Comm_LinkGive((uint8)v);
++}
++
++void hb_ws_link_stats(uint32_t *out, unsigned n)
++{
++   Comm_GetStats(out, n);
++}
++
++/* 시험용: CPU 레지스터(mednafen/wswan/v30mz.h 의 NEC_* 번호) */
++unsigned hb_ws_cpu_reg(int regnum)
++{
++   return v30mz_get_reg(regnum);
++}
++
++extern uint32 hb_watch_lo, hb_watch_hi;
++static char hb_watch_tag[8];
++void hb_watch_hit(uint32 A, uint8 V)
++{
++   fprintf(stderr, "[%s 감시] %04X:%04X 쓰기 %05X=%02X SP=%04X SS=%04X\n", hb_watch_tag,
++         v30mz_get_reg(NEC_PS), v30mz_get_reg(NEC_PC), A, V,
++         v30mz_get_reg(NEC_SP), v30mz_get_reg(NEC_SS));
++}
++
++void hb_ws_watch(unsigned lo, unsigned hi, const char *tag)
++{
++   hb_watch_lo = lo;
++   hb_watch_hi = hi;
++   snprintf(hb_watch_tag, sizeof(hb_watch_tag), "%s", tag ? tag : "");
++}
++
++void hb_ws_trace(int on, const char *tag)
++{
++   Comm_SetTrace(on, tag);
++}
++
++void hb_ws_set_render(int on)
++{
++   hb_render_off = !on;
++}
++
++const void *hb_ws_framebuffer(void)
++{
++   return surf ? surf->pixels : NULL;
++}
++
++uint8_t *hb_ws_internal_eeprom(void)
++{
++   return WSwan_InternalEEPROM();
+ }
+ 
+ void retro_get_system_info(struct retro_system_info *info)
+diff --git a/link.T b/link.T
+index b0c262d..7ad3356 100644
+--- a/link.T
++++ b/link.T
+@@ -1,5 +1,5 @@
+ {
+-   global: retro_*;
++   global: retro_*; hb_ws_*;
+    local: *;
+ };
+ 
+diff --git a/mednafen/wswan/eeprom.c b/mednafen/wswan/eeprom.c
+index 681c4de..aba60e2 100644
+--- a/mednafen/wswan/eeprom.c
++++ b/mednafen/wswan/eeprom.c
+@@ -197,6 +197,12 @@ void WSwan_EEPROMWrite(uint32_t A, uint8_t V)
+    }
+ }
+ 
++/* 한방 10/20: 두 대 앞단이 2P 기계의 내부 EEPROM(기기 고유 정보)을 보거나 바꿀 때 */
++uint8_t *WSwan_InternalEEPROM(void)
++{
++   return iEEPROM;
++}
++
+ void WSwan_EEPROMReset(void)
+ {
+    iEEPROM_Command = EEPROM_Command = 0;
+diff --git a/mednafen/wswan/eeprom.h b/mednafen/wswan/eeprom.h
+index a55b0f7..4d7753e 100644
+--- a/mednafen/wswan/eeprom.h
++++ b/mednafen/wswan/eeprom.h
+@@ -15,6 +15,7 @@ int WSwan_EEPROMStateAction(StateMem *sm, int load, int data_only);
+ uint8_t WSwan_EEPROMRead(uint32_t A);
+ void WSwan_EEPROMWrite(uint32_t A, uint8_t V);
+ void WSwan_EEPROMInit(const char *Name, const uint16_t BYear, const uint8_t BMonth, const uint8_t BDay, const uint8_t Sex, const uint8_t Blood);
++uint8_t *WSwan_InternalEEPROM(void);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/mednafen/wswan/wswan-memory.c b/mednafen/wswan/wswan-memory.c
+index 96e3bb2..af00fb7 100644
+--- a/mednafen/wswan/wswan-memory.c
++++ b/mednafen/wswan/wswan-memory.c
+@@ -159,8 +159,14 @@ static INLINE void WriteMemCore(uint32 A, uint8 V, bool ww)
+    }
+ }
+ 
++/* 시험용(한방 10/20): 물리 주소 범위 쓰기 감시 — 켜져 있을 때만 stderr 로 */
++uint32 hb_watch_lo = 0xFFFFFFFF, hb_watch_hi = 0;
++void hb_watch_hit(uint32 A, uint8 V);
++
+ void WSwan_writemem20(uint32 A, uint8 V)
+ {
++   if(A >= hb_watch_lo && A <= hb_watch_hi)
++      hb_watch_hit(A, V);
+    WriteMemCore(A, V, false);
+ }
+ 
+-- 
+2.53.0
+

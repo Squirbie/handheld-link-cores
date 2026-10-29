@@ -1,0 +1,299 @@
+--- a/src/cpu/tms32031/tms32031.c
++++ b/src/cpu/tms32031/tms32031.c
+@@ -15,6 +15,7 @@
+ #include <math.h>
+ #define exp _exp
+ #include "cpuintrf.h"
++#include "state.h"
+ #include "mamedbg.h"
+ #include "tms32031.h"
+ 
+@@ -366,6 +367,18 @@
+ 
+ void tms32031_init(void)
+ {
++	int cpu = cpu_getactivecpu();
++
++	/* r[] holds 36 registers of two 32-bit words (40-bit floats keep the exponent in word 1) */
++	state_save_register_UINT32("tms32031", cpu, "PC", &tms32031.pc, 1);
++	state_save_register_UINT32("tms32031", cpu, "R", &tms32031.r[0].i32[0], 36 * 2);
++	state_save_register_UINT32("tms32031", cpu, "BKMASK", &tms32031.bkmask, 1);
++	state_save_register_UINT32("tms32031", cpu, "PPC", &tms32031.ppc, 1);
++	state_save_register_UINT32("tms32031", cpu, "OP", &tms32031.op, 1);
++	state_save_register_UINT8("tms32031", cpu, "DELAYED", &tms32031.delayed, 1);
++	state_save_register_UINT8("tms32031", cpu, "IRQ_PENDING", &tms32031.irq_pending, 1);
++	state_save_register_UINT8("tms32031", cpu, "MCU_MODE", &tms32031.mcu_mode, 1);
++	state_save_register_int("tms32031", cpu, "INTERRUPT_CYCLES", &tms32031.interrupt_cycles);
+ }
+ 
+ void tms32031_reset(void *param)
+--- a/src/drivers/atarigt.c
++++ b/src/drivers/atarigt.c
+@@ -19,6 +19,7 @@
+ 
+ 
+ #include "driver.h"
++#include "state.h"
+ #include "machine/atarigen.h"
+ #include "vidhrdw/atarirle.h"
+ #include "cpu/m68000/m68000.h"
+@@ -278,6 +279,15 @@
+ 
+ static UINT8 ignore_writes = 0;
+ 
++static void protection_state_register(void)
++{
++	state_save_register_UINT32("atarigt_prot", 0, "protaddr", (UINT32 *)protaddr, ADDRSEQ_COUNT);
++	state_save_register_UINT8("atarigt_prot", 0, "protmode", &protmode, 1);
++	state_save_register_UINT16("atarigt_prot", 0, "protresult", &protresult, 1);
++	state_save_register_UINT8("atarigt_prot", 0, "protdata", protdata, sizeof(protdata));
++	state_save_register_UINT8("atarigt_prot", 0, "ignore_writes", &ignore_writes, 1);
++}
++
+ static void tmek_update_mode(offs_t offset)
+ {
+ 	int i;
+@@ -1146,6 +1156,7 @@
+ 	/* setup protection */
+ 	protection_r = tmek_protection_r;
+ 	protection_w = tmek_protection_w;
++	protection_state_register();
+ 
+ 	/* temp hack */
+ 	install_mem_write32_handler(0, 0xd72000, 0xd75fff, tmek_pf_w);
+@@ -1163,6 +1174,7 @@
+ 	/* install protection */
+ 	protection_r = primrage_protection_r;
+ 	protection_w = primrage_protection_w;
++	protection_state_register();
+ }
+ 
+ static DRIVER_INIT( primrage ) { primrage_init_common(0x42f2); }
+--- a/src/machine/atarigen.c
++++ b/src/machine/atarigen.c
+@@ -8,6 +8,7 @@
+ 
+ 
+ #include "driver.h"
++#include "state.h"
+ #include "atarigen.h"
+ #include "slapstic.h"
+ #include "cpu/m6502/m6502.h"
+@@ -87,6 +88,8 @@
+ static int 			scanlines_per_callback;
+ static double 		scanline_callback_period;
+ static int 			last_scanline;
++static void *		atarigen_vblank_timer;
++static void *		atarigen_scanline_timer;
+ 
+ static int 			actual_vc_latch0;
+ static int 			actual_vc_latch1;
+@@ -144,9 +147,11 @@
+ 	
+ 	/* create a timer for scanlines */
+ 	scanline_interrupt_timer = timer_alloc(scanline_interrupt_callback);
+-	state_save_register_INT32("atarigen", 0, "atarigen_video_int_state", &atarigen_video_int_state, 1);
+-	state_save_register_INT32("atarigen", 0, "atarigen_sound_int_state", &atarigen_sound_int_state, 1);
+-	state_save_register_INT32("atarigen", 0, "atarigen_scanline_int_state", &atarigen_scanline_int_state, 1);
++	/* these are UINT8 variables; saving them as INT32 copied 3 neighbouring bytes as well */
++	state_save_register_UINT8("atarigen", 0, "atarigen_video_int_state", &atarigen_video_int_state, 1);
++	state_save_register_UINT8("atarigen", 0, "atarigen_sound_int_state", &atarigen_sound_int_state, 1);
++	state_save_register_UINT8("atarigen", 0, "atarigen_scanline_int_state", &atarigen_scanline_int_state, 1);
++	timer_save_register("atarigen", 0, "scanline_interrupt_timer", scanline_interrupt_timer);
+ 
+ }
+ 
+@@ -292,6 +297,7 @@
+ void atarigen_eeprom_reset(void)
+ {
+ 	eeprom_unlocked = 0;
++	state_save_register_UINT8("atarigen", 0, "eeprom_unlocked", &eeprom_unlocked, 1);
+ }
+ 
+ 
+@@ -548,8 +554,8 @@
+ 	state_save_register_UINT8("atarigen", 0, "ym2151_int", &ym2151_int, 1);
+ 	state_save_register_UINT8("atarigen", 0, "atarigen_cpu_to_sound", &atarigen_cpu_to_sound, 1);
+ 	state_save_register_UINT8("atarigen", 0, "atarigen_sound_to_cpu", &atarigen_sound_to_cpu, 1);
+-	state_save_register_INT32("atarigen", 0, "atarigen_cpu_to_sound_ready", &atarigen_cpu_to_sound_ready, 1);
+-	state_save_register_INT32("atarigen", 0, "atarigen_sound_to_cpu_ready", &atarigen_sound_to_cpu_ready, 1);
++	state_save_register_UINT8("atarigen", 0, "atarigen_cpu_to_sound_ready", &atarigen_cpu_to_sound_ready, 1);
++	state_save_register_UINT8("atarigen", 0, "atarigen_sound_to_cpu_ready", &atarigen_sound_to_cpu_ready, 1);
+ 
+ }
+ 
+@@ -908,8 +914,15 @@
+ 	/* compute the last scanline */
+ 	last_scanline = (int)(TIME_IN_HZ(Machine->drv->frames_per_second) / cpu_getscanlineperiod());
+ 
++	/* persistent timers (not timer_set) so the save state can carry their phase;
++	   a scanline chain always ends before the next VBLANK starts a new one */
++	atarigen_vblank_timer = timer_alloc(vblank_timer);
++	atarigen_scanline_timer = timer_alloc(scanline_timer);
++	timer_save_register("atarigen", 0, "vblank_timer", atarigen_vblank_timer);
++	timer_save_register("atarigen", 0, "scanline_timer", atarigen_scanline_timer);
++
+ 	/* set a timer to go off on the next VBLANK */
+-	timer_set(cpu_getscanlinetime(Machine->drv->screen_height), 0, vblank_timer);
++	timer_adjust(atarigen_vblank_timer, cpu_getscanlinetime(Machine->drv->screen_height), 0, 0);
+ }
+ 
+ 
+@@ -921,10 +934,10 @@
+ static void vblank_timer(int param)
+ {
+ 	/* set a timer to go off at scanline 0 */
+-	timer_set(TIME_IN_USEC(Machine->drv->vblank_duration), 0, scanline_timer);
++	timer_adjust(atarigen_scanline_timer, TIME_IN_USEC(Machine->drv->vblank_duration), 0, 0);
+ 
+ 	/* set a timer to go off on the next VBLANK */
+-	timer_set(cpu_getscanlinetime(Machine->drv->screen_height), 1, vblank_timer);
++	timer_adjust(atarigen_vblank_timer, cpu_getscanlinetime(Machine->drv->screen_height), 1, 0);
+ }
+ 
+ 
+@@ -943,7 +956,7 @@
+ 		/* generate another? */
+ 		scanline += scanlines_per_callback;
+ 		if (scanline < last_scanline && scanlines_per_callback)
+-			timer_set(scanline_callback_period, scanline, scanline_timer);
++			timer_adjust(atarigen_scanline_timer, scanline_callback_period, scanline, 0);
+ 	}
+ }
+ 
+--- a/src/sndhrdw/cage_sndhrdw.c
++++ b/src/sndhrdw/cage_sndhrdw.c
+@@ -10,6 +10,7 @@
+ 
+ 
+ #include "driver.h"
++#include "state.h"
+ #include "cpu/tms32031/tms32031.h"
+ #include "cage.h"
+ 
+@@ -186,6 +187,20 @@
+ 	
+ 	if (speedup)
+ 		speedup_ram = install_mem_write32_handler(cage_cpu, ADDR_RANGE(speedup, speedup), speedup_w);
++
++	state_save_register_UINT8("cage", 0, "cpu_to_cage_ready", &cpu_to_cage_ready, 1);
++	state_save_register_UINT8("cage", 0, "cage_to_cpu_ready", &cage_to_cpu_ready, 1);
++	state_save_register_UINT32("cage", 0, "buffer_in", &buffer_in, 1);
++	state_save_register_UINT32("cage", 0, "buffer_out", &buffer_out, 1);
++	state_save_register_UINT32("cage", 0, "buffer_out_step", &buffer_out_step, 1);
++	state_save_register_double("cage", 0, "serial_time_per_word", &serial_time_per_word, 1);
++	state_save_register_UINT8("cage", 0, "dma_enabled", &dma_enabled, 1);
++	state_save_register_UINT8("cage", 0, "timer_enabled", timer_enabled, 2);
++	state_save_register_UINT16("cage", 0, "cage_from_main", &cage_from_main, 1);
++	state_save_register_UINT16("cage", 0, "cage_control", &cage_control, 1);
++	timer_save_register("cage", 0, "dma_timer", dma_timer);
++	timer_save_register("cage", 0, "timer0", timer[0]);
++	timer_save_register("cage", 0, "timer1", timer[1]);
+ }
+ 
+ 
+@@ -283,6 +298,8 @@
+ 	sound_buffer = auto_malloc(DAC_BUFFER_SAMPLES * sizeof(INT16));
+ 	if (!sound_buffer)
+ 		return 1;
++	memset(sound_buffer, 0, DAC_BUFFER_SAMPLES * sizeof(INT16));
++	state_save_register_INT16("cage", 0, "sound_buffer", sound_buffer, DAC_BUFFER_SAMPLES);
+ 
+ #if (LOG_WAVE)
+ 	wavfile = wav_open("cage.wav", Machine->sample_rate, 2);
+--- a/src/vidhrdw/atarigt_vidhrdw.c
++++ b/src/vidhrdw/atarigt_vidhrdw.c
+@@ -20,6 +20,7 @@
+ 
+ 
+ #include "driver.h"
++#include "state.h"
+ #include "machine/atarigen.h"
+ #include "atarigt.h"
+ 
+@@ -69,6 +70,8 @@
+ 
+ static UINT8 rshift, gshift, bshift;
+ 
++static void atarigt_postload(void);
++
+ 
+ 
+ /*************************************
+@@ -179,10 +182,38 @@
+ 	playfield_yscroll = 0;
+ 	tram_checksum = 0;
+ 	memset(atarigt_colorram, 0, 0x80000);
++	memset(expanded_mram, 0, sizeof(*expanded_mram) * MRAM_ENTRIES * 3);
++
++	/* color RAM itself is saved by the memory system; expanded_mram and the tilemap settings are rebuilt after a load */
++	state_save_register_UINT8("atarigt_video", 0, "playfield_tile_bank", &playfield_tile_bank, 1);
++	state_save_register_UINT8("atarigt_video", 0, "playfield_color_bank", &playfield_color_bank, 1);
++	state_save_register_UINT16("atarigt_video", 0, "playfield_xscroll", &playfield_xscroll, 1);
++	state_save_register_UINT16("atarigt_video", 0, "playfield_yscroll", &playfield_yscroll, 1);
++	state_save_register_UINT32("atarigt_video", 0, "tram_checksum", &tram_checksum, 1);
++	state_save_register_func_postload(atarigt_postload);
+ 	return 0;
+ }
+ 
+ 
++static void atarigt_postload(void)
++{
++	int i;
++
++	for (i = 0; i < MRAM_ENTRIES; i++)
++	{
++		expanded_mram[0 * MRAM_ENTRIES + i] = (atarigt_colorram[0x20000 + i] >> 8) << rshift;
++		expanded_mram[1 * MRAM_ENTRIES + i] = (atarigt_colorram[0x20000 + i] & 0xff) << gshift;
++		expanded_mram[2 * MRAM_ENTRIES + i] = (atarigt_colorram[0x30000 + i] & 0xff) << bshift;
++	}
++
++	tilemap_set_scrollx(atarigen_playfield_tilemap, 0, playfield_xscroll);
++	tilemap_set_scrolly(atarigen_playfield_tilemap, 0, playfield_yscroll);
++	tilemap_set_palette_offset(atarigen_playfield_tilemap, (playfield_color_bank & 0x1f) << 8);
++	tilemap_mark_all_tiles_dirty(atarigen_playfield_tilemap);
++	tilemap_mark_all_tiles_dirty(atarigen_alpha_tilemap);
++}
++
++
+ 
+ /*************************************
+  *
+--- a/src/vidhrdw/atarirle_vidhrdw.c
++++ b/src/vidhrdw/atarirle_vidhrdw.c
+@@ -19,6 +19,7 @@
+ ##########################################################################*/
+ 
+ #include "driver.h"
++#include "state.h"
+ #include "atarirle.h"
+ 
+ 
+@@ -365,6 +366,27 @@
+ 	}
+ 
+ 	mo->partial_scanline = -1;
++
++	/* the VRAM bitmaps keep sprites drawn on the previous frame, so they are machine state */
++	state_save_register_UINT16("atarirle", map, "spriteram", &mo->spriteram[0].data[0], 8 * mo->spriteramsize);
++	state_save_register_int("atarirle", map, "partial_scanline", &mo->partial_scanline);
++	state_save_register_UINT8("atarirle", map, "control_bits", &mo->control_bits, 1);
++	state_save_register_UINT8("atarirle", map, "command", &mo->command, 1);
++	state_save_register_UINT8("atarirle", map, "is32bit", &mo->is32bit, 1);
++	for (i = 0; i < 4; i++)
++	{
++		struct mame_bitmap *bitmap = mo->vram[i / 2][i % 2];
++		int y;
++
++		if (!bitmap)
++			continue;
++		for (y = 0; y < bitmap->height; y++)
++		{
++			char name[32];
++			sprintf(name, "vram%d%d_%03d", i / 2, i % 2, y);
++			state_save_register_UINT16("atarirle", map, name, (UINT16 *)bitmap->line[y], bitmap->width);
++		}
++	}
+ 	return 1;
+ }
+ 

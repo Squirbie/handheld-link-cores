@@ -1,0 +1,1010 @@
+--- a/dual/libretro_dual.c
++++ b/dual/libretro_dual.c
+@@ -70,7 +70,7 @@
+ #define DUAL_LIBRARY_NAME  "Beetle WonderSwan Dual"
+ /* 넷플레이 버전 칸은 끝 문자 포함 32바이트다.
+  * 자기 세이브 판과 리비전 표시는 유지하고 길이 초과는 빌드 때 막는다. */
+-#define DUAL_VERSION       "1.1-os1"
++#define DUAL_VERSION       "1.2-os4"
+ typedef char hb_version_fits_netplay[(sizeof(DUAL_VERSION GIT_VERSION) <= 32) ? 1 : -1];
+ #define DUAL_EXTENSIONS    "ws|wsc|pc2"
+ #define DUAL_WIDTH         224
+@@ -612,46 +612,26 @@
+    dual_log(RETRO_LOG_INFO, "2P 세이브 읽음(%u 바이트): %s", (unsigned)got, p2SavePath);
+ }
+ 
+-static bool writeAll(const char *path, const uint8_t *data, size_t size)
+-{
+-   FILE *f = fopen(path, "wb");
+-   bool ok;
+-
+-   if (!f)
+-      return false;
+-   ok = fwrite(data, 1, size, f) == size;
+-   ok = fflush(f) == 0 && ok;
+-#ifndef _WIN32
+-   ok = fsync(fileno(f)) == 0 && ok;
+-#endif
+-   ok = fclose(f) == 0 && ok;
+-   return ok;
+-}
+-
+-/* 기기 /userdata 는 FUSE 위 exFAT — fsync 해야 디렉터리 항목까지 확정됨 */
+-static void syncPath(const char *path)
+-{
+-#ifndef _WIN32
+-   int fd = open(path, O_RDONLY);
+-   if (fd >= 0)
+-   {
+-      fsync(fd);
+-      close(fd);
+-   }
+-#else
+-   (void)path;
+-#endif
+-}
+-
+ static void writeP2Save(bool force)
+ {
+-   char tmpPath[DUAL_PATH_MAX + 8];
+    const uint8_t *save;
+-   bool ok;
+ 
+    /* 2P 화면(손님)이면 2P 세이브는 방장 기기 것 · link off 면 2P 기계가 안 돔 */
+    if (!gameLoaded || !linkOn || !p2SavePath[0] || !saveSize)
+       return;
++   /* 손님 역할이면(화면 선택과 상관없이) 2P 칸은 방장 기기 것 */
++   if (hb_own_guest)
++      return;
++   /* 손님 자기 세이브가 든 2P: 방장 2P 칸을 손님 세이브로 바꾸지 않음 */
++   if (hb_own_applied || hb_has_token())
++   {
++      if (!hb_own_p2_skip_logged)
++      {
++         hb_own_p2_skip_logged = true;
++         dual_log(RETRO_LOG_INFO, "손님 세이브가 든 2P — 방장 2P 칸은 그대로: %s", p2SavePath);
++      }
++      return;
++   }
+    save = saveMemory(1);
+    if (!save)
+       return;
+@@ -670,21 +650,13 @@
+    if (selectedScreen() == 1)
+       return;
+ 
+-   snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", p2SavePath);
+-   ok = writeAll(tmpPath, save, saveSize);
+-   if (ok && rename(tmpPath, p2SavePath) != 0)
+-   {
+-      /* 이름 바꾸기로 덮어쓰기를 거부하는 FUSE 면 제자리 쓰기 */
+-      ok = writeAll(p2SavePath, save, saveSize);
+-      remove(tmpPath);
+-   }
+-   if (!ok)
+-   {
+-      dual_log(RETRO_LOG_ERROR, "2P 세이브 쓰기 실패: %s", p2SavePath);
+-      remove(tmpPath);
+-      return;
+-   }
+-   syncPath(p2SavePath);
++   /* 처음 바꾸기 전 지금 파일을 .bak 으로 한 번 · 임시 파일 확인 뒤 이름 바꾸기.
++    * 실패하면 원본을 열어 잘라 쓰지 않고 그대로 둔다(다음 저장 때 다시). */
++   if (!hb_p2_store(p2SavePath, save, saveSize))
++   {
++      dual_log(RETRO_LOG_ERROR, "2P 세이브 쓰기 실패(원본 그대로): %s", p2SavePath);
++      return;
++   }
+    memcpy(p2Written, save, saveSize);
+    p2WrittenSize = saveSize;
+    stats.p2Writes++;
+@@ -815,6 +787,7 @@
+ {
+    int m;
+ 
++   hb_own_deinit();
+    for (m = 1; m >= 0; m--)
+       inner[m].deinit();
+    if (traceFile)
+@@ -894,6 +867,9 @@
+    if (saveSize && !p2Written)
+       saveSize = 0;
+    p2WrittenSize = 0;
++   /* 손님 여부·거래는 2P 칸을 읽기 전에 정한다(한 번만 부름) */
++   hb_logger = dual_log;
++   hb_own_init(game->data, game->size, 2, linkOn ? saveSize : 0);
+    setP2SavePath(game);
+    if (linkOn)
+       loadP2Save();
+@@ -903,7 +879,6 @@
+    stats.linkOn = linkOn;
+    stats.screen = (uint32_t)shown;
+    gameLoaded = true;
+-   hb_own_init(game->data, game->size, 2, linkOn ? saveSize : 0);
+    dual_log(RETRO_LOG_INFO, "켬: 원더스완 %s, 화면 %dP, 세이브 %u 바이트, 상태 %u 바이트",
+          linkOn ? "두 대(통신 케이블 연결)" : "한 대(link off)", shown + 1,
+          (unsigned)saveSize, (unsigned)retro_serialize_size());
+@@ -1070,6 +1045,9 @@
+       p2Countdown = DUAL_P2_SAVE_EVERY;
+       writeP2Save(false);
+    }
++   /* 손님 자기 세이브: 장 번호(상태에 들어감) · 확인된 2P 의 중간 저장 */
++   if (linkOn)
++      hb_own_tick(saveMemory(1), saveSize);
+ }
+ 
+ /* ---- 상태 저장 ---- */
+@@ -1131,9 +1109,10 @@
+ 
+    memset(p, 0, DUAL_HEADER_SIZE);
+    store32(p + 0, DUAL_STATE_MAGIC);
+-   store32(p + 4, hb_has_token() ? 2 : DUAL_STATE_VERSION);
++   store32(p + 4, hb_has_token() ? 3 : DUAL_STATE_VERSION);
+    memcpy(p + 16, hb_own_token, 16);
+    hb_put32(p + 32, hb_own_save_hint);
++   hb_put32(p + 36, hb_has_token() ? hb_own_frame : 0);
+    store32(p + 8, 2);
+    store32(p + 12, (uint32_t)innerSize);
+    if (!inner[0].serialize(p + DUAL_HEADER_SIZE, innerSize))
+@@ -1159,7 +1138,8 @@
+       dual_log(RETRO_LOG_ERROR, "WonderSwan Dual 상태가 아님");
+       return false;
+    }
+-   if ((load32(p + 4) != DUAL_STATE_VERSION && load32(p + 4) != 2) || load32(p + 8) != 2 || load32(p + 12) != innerSize)
++   if ((load32(p + 4) != DUAL_STATE_VERSION && load32(p + 4) != 2 && load32(p + 4) != 3) ||
++         load32(p + 8) != 2 || load32(p + 12) != innerSize)
+    {
+       dual_log(RETRO_LOG_ERROR, "상태 판/크기가 다름");
+       return false;
+@@ -1182,10 +1162,11 @@
+    p2CopyPending = false;
+    memset(hb_own_token, 0, 16);
+    hb_own_save_hint = 0;
+-   if (load32(p + 4) == 2) {
++   if (load32(p + 4) >= 2) {
+       memcpy(hb_own_token, p + 16, 16);
+       hb_own_save_hint = hb_u32(p + 32);
+    }
++   hb_own_restored(load32(p + 4) == 3 ? hb_u32(p + 36) : 0);
+    return true;
+ }
+ 
+@@ -1223,6 +1204,7 @@
+    switch (id)
+    {
+       case RETRO_MEMORY_SAVE_RAM:
++         return hb_own_guest ? NULL : inner[0].get_memory_data(id);
+       case RETRO_MEMORY_SYSTEM_RAM:
+          return inner[0].get_memory_data(id);
+       case DUAL_MEMORY_WRAM:
+@@ -1249,6 +1231,7 @@
+    switch (id)
+    {
+       case RETRO_MEMORY_SAVE_RAM:
++         return hb_own_guest ? 0 : inner[0].get_memory_size(id);
+       case RETRO_MEMORY_SYSTEM_RAM:
+          return inner[0].get_memory_size(id);
+       case DUAL_MEMORY_WRAM:
+--- a/dual/hb_ownsave.h
++++ b/dual/hb_ownsave.h
+@@ -1,18 +1,61 @@
+-/* 손님 자기 세이브: 파일 입출력은 로컬 역할만 보고, 표만 상태에 넣는다. */
++/* 두 대 코어 공통 — 손님 '각자 자기 세이브'(4판, 10/21)
++ *
++ * 방장(--host): /tmp/hb_ownsave/request 를 30장마다 보고, 레트로아크가 대기 중이고 아무도 안 붙었을 때
++ *   한 번만 2P 세이브를 바꾼 뒤 /tmp/hb_ownsave/ack 를 남긴다. 표(16바이트)·장 번호는 상태에 들어가 손님에게 간다.
++ * 손님(--connect): 실행 명령에 --connect 가 있고, 손님 도우미(hb_ownsave.py)가 막 남긴
++ *   /tmp/hb_ownsave/intent(거래 폴더 · 표 · 롬 CRC · 시각)가 맞을 때만 그 거래에 묶인다.
++ *   - 레트로아크는 손님의 1P 세이브를 읽지도 쓰지도 않는다(RETRO_MEMORY_SAVE_RAM 크기 0).
++ *     .netplay 폴더를 못 만들어 레트로아크가 평소 저장 폴더로 돌아가도 원본 .srm 을 덮지 않는다.
++ *   - 기기 레트로아크 기록(stderr)은 에뮬 실행기의 파이프라 파일로 읽을 수 없다. 그래서 이 코어 안에서
++ *     stderr 를 그대로 넘겨주는 작은 스레드가 줄을 보며 '2 플레이어로 입장했습니다'(영어 'You have joined as
++ *     player 2')를 확인한다. 2P 가 아니거나(3P·관전) 게임을 나왔으면 끝까지 '되쓰기 안 함'.
++ *   - 확인된 2P 일 때만: 2P 세이브가 바뀐 뒤 300장(약 5초, 되감기 최대 범위보다 훨씬 김) 그대로면
++ *     카드 거래 폴더에 checkpoint.bin, 정상 종료 때 export.bin(+램 /tmp/hb_ownsave/export)을 남긴다.
++ * 손님·방장 모두 상태에는 표 · 크기 힌트 · 장 번호만 들어간다(표가 있을 때만 상태판 3).
++ */
+ #ifndef HB_OWNSAVE_H
+ #define HB_OWNSAVE_H
+ #include <dirent.h>
+ #include <errno.h>
++#include <poll.h>
++#include <pthread.h>
++#include <signal.h>
+ #include <stdint.h>
+ #include <time.h>
++#include "hb_storage.h"
+ 
+ #define HB_OWN_DIR "/tmp/hb_ownsave"
+ #define HB_OWN_MAX 131072u
++#define HB_OWN_STABLE 300u          /* 2P 세이브가 이 장 수만큼 그대로여야 중간 저장 */
++#define HB_OWN_INTENT_AGE 180       /* 보낸 뒤 이 초 안에 켠 손님만 거래에 묶음 */
++#define HB_OWN_PACKET_HEAD 44u
++
+ static uint8_t hb_own_token[16];
+-static uint32_t hb_own_crc, hb_own_kind, hb_own_max;
+-static uint32_t hb_own_save_hint;
++static uint32_t hb_own_crc, hb_own_kind, hb_own_max, hb_own_save_hint;
+ static unsigned hb_own_countdown;
+-static bool hb_own_applied, hb_own_guest;
++static bool hb_own_applied, hb_own_guest, hb_own_p2_skip_logged;
++static uint8_t hb_generation[8];
++/* 손님 거래 */
++static char hb_tx[4096];
++static uint8_t hb_tx_token[16];
++static uint32_t hb_own_frame, hb_change_frame;
++static uint8_t hb_seen[HB_OWN_MAX], hb_written[HB_OWN_MAX];
++static size_t hb_seen_size, hb_written_size;
++static bool hb_seen_valid;
++/* 레트로아크 기록 넘겨주기(손님 거래가 있을 때만 켬) */
++static int hb_tee_rd = -1, hb_tee_saved = -1;
++static pthread_t hb_tee_thread;
++static bool hb_tee_on;
++static volatile int hb_tee_stop;
++static int hb_role;                 /* 0 모름 · 2 = 2P 확인 · -1 = 2P 아님(관전 · 다른 번호 · 나감 · 오류) */
++static char hb_tee_line[1024];
++static size_t hb_tee_used;
++static bool hb_tee_overflow;
++/* 코어의 기록 함수(레트로아크 기록 → 기기 es_launch_stderr.log). 스레드에서는 부르지 않는다. */
++static void (*hb_logger)(enum retro_log_level, const char *, ...);
++static int hb_role_logged;
++static bool hb_token_logged;
++#define HB_LOG(level, ...) do { if (hb_logger) hb_logger(level, __VA_ARGS__); } while (0)
+ 
+ static uint32_t hb_u32(const uint8_t *p)
+ {
+@@ -30,7 +73,7 @@
+ {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t)) return 0;
+-   return (uint64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
++   return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+ }
+ 
+ static bool hb_has_token(void)
+@@ -43,25 +86,170 @@
+ 
+ static bool hb_atomic(const char *name, const void *data, size_t size)
+ {
+-   char path[256], temp[256];
+-   int fd;
+-   size_t done = 0;
+-   bool ok = false;
+-   snprintf(path, sizeof(path), HB_OWN_DIR "/%s", name);
+-   snprintf(temp, sizeof(temp), HB_OWN_DIR "/%s.%ld.tmp", name, (long)getpid());
+-   fd = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+-   if (fd < 0) return false;
+-   while (done < size) {
+-      ssize_t n = write(fd, (const uint8_t *)data + done, size - done);
+-      if (n < 0 && errno == EINTR) continue;
+-      if (n <= 0) break;
+-      done += n;
+-   }
+-   if (done == size && fsync(fd) == 0) ok = true;
+-   if (close(fd)) ok = false;
+-   if (ok && rename(temp, path)) ok = false;
+-   if (!ok) unlink(temp);
+-   return ok;
++   char path[512];
++   if ((size_t)snprintf(path, sizeof(path), HB_OWN_DIR "/%s", name) >= sizeof(path)) return false;
++   return hb_store_path(path, (const uint8_t *)data, size);
++}
++
++static int hb_role_get(void)
++{
++   return __atomic_load_n(&hb_role, __ATOMIC_SEQ_CST);
++}
++
++static void hb_role_set(int value)
++{
++   /* -1 은 끝까지 유지(한 번이라도 2P 가 아니었으면 되쓰기 안 함) */
++   if (value == 2) {
++      int expected = 0;
++      __atomic_compare_exchange_n(&hb_role, &expected, 2, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++   } else {
++      __atomic_store_n(&hb_role, -1, __ATOMIC_SEQ_CST);
++   }
++}
++
++static bool hb_starts(const char *text, const char *prefix)
++{
++   return !strncmp(text, prefix, strlen(prefix));
++}
++
++/* 레트로아크 1.22.2 넷플레이 문구(영어 · 한국어). 다른 사람 문구('<이름> 사용자가 …', '<이름> has joined …')는 보지 않는다. */
++static void hb_role_parse(const char *line)
++{
++   const char *m = strstr(line, "[Netplay] ");
++   unsigned player = 0;
++   int end = 0;
++   if (!m) return;
++   m += strlen("[Netplay] ");
++   if ((sscanf(m, "You have joined as player %u%n", &player, &end) == 1 && end > 0) ||
++       (sscanf(m, "%u 플레이어로 입장했습니다%n", &player, &end) == 1 && end > 0)) {
++      hb_role_set(player == 2 ? 2 : -1);
++      return;
++   }
++   if (hb_starts(m, "You have left the game") || hb_starts(m, "게임을 나왔습니다") ||
++       hb_starts(m, "You have joined with input devices") ||
++       (strstr(m, "입력장치로 접속했습니다") && !strstr(m, "사용자가")) ||
++       hb_starts(m, "There are no free player slots") || hb_starts(m, "여유 플레이어 슬롯이 없습니다") ||
++       hb_starts(m, "The input devices requested are not available") ||
++       hb_starts(m, "입력장치 요청을 사용할 수 없습니다") ||
++       hb_starts(m, "Cannot switch to play mode") || hb_starts(m, "플레이 모드로 전환하지 못했습니다") ||
++       hb_starts(m, "You do not have permission to play") || hb_starts(m, "플레이 권한이 없습니다"))
++      hb_role_set(-1);
++}
++
++static void hb_tee_feed(const char *data, size_t size)
++{
++   size_t i;
++   for (i = 0; i < size; i++) {
++      if (data[i] == '\n') {
++         hb_tee_line[hb_tee_used] = 0;
++         if (!hb_tee_overflow) hb_role_parse(hb_tee_line);
++         hb_tee_used = 0;
++         hb_tee_overflow = false;
++      } else if (hb_tee_used + 1 < sizeof(hb_tee_line)) {
++         hb_tee_line[hb_tee_used++] = data[i];
++      } else {
++         hb_tee_overflow = true;   /* 아주 긴 줄은 넷플레이 문구가 아니다 — 버림 */
++      }
++   }
++}
++
++/* stderr 로 들어온 것을 원래 대상(에뮬 실행기 파이프 · 시험 기록 파일)에 그대로 넘기며 줄을 본다.
++ * 비정상으로 끝나야 하면 먼저 stderr 를 원래대로 돌려 레트로아크가 막히지 않게 한다. */
++static void *hb_tee_main(void *arg)
++{
++   char buf[4096];
++   sigset_t set;
++   bool broken = false;
++   (void)arg;
++   sigemptyset(&set);
++   sigaddset(&set, SIGPIPE);
++   pthread_sigmask(SIG_BLOCK, &set, NULL);
++   for (;;) {
++      struct pollfd p;
++      int r;
++      ssize_t n;
++      p.fd = hb_tee_rd;
++      p.events = POLLIN;
++      p.revents = 0;
++      r = poll(&p, 1, 100);
++      if (r < 0) {
++         if (errno == EINTR) continue;
++         broken = true;
++         break;
++      }
++      if (r == 0) {
++         if (hb_tee_stop) break;
++         continue;
++      }
++      n = read(hb_tee_rd, buf, sizeof(buf));
++      if (n < 0) {
++         if (errno == EINTR || errno == EAGAIN) continue;
++         broken = true;
++         break;
++      }
++      if (n == 0) break;
++      hb_write_all(hb_tee_saved, (const uint8_t *)buf, (size_t)n);
++      hb_tee_feed(buf, (size_t)n);
++   }
++   if (broken) {
++      dup2(hb_tee_saved, 2);
++      hb_role_set(-1);
++   }
++   return NULL;
++}
++
++static void hb_tee_start(void)
++{
++   int fds[2], saved, flags;
++   if (hb_tee_on) return;
++   if (pipe(fds)) return;
++   fcntl(fds[0], F_SETFD, FD_CLOEXEC);
++   fcntl(fds[1], F_SETFD, FD_CLOEXEC);
++   saved = fcntl(2, F_DUPFD, 3);
++   if (saved < 0) {
++      close(fds[0]);
++      close(fds[1]);
++      return;
++   }
++   fcntl(saved, F_SETFD, FD_CLOEXEC);
++   flags = fcntl(fds[0], F_GETFL);
++   if (flags >= 0) fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
++   fflush(stderr);
++   hb_tee_rd = fds[0];
++   hb_tee_saved = saved;
++   hb_tee_stop = 0;
++   hb_tee_used = 0;
++   hb_tee_overflow = false;
++   if (dup2(fds[1], 2) < 0) {
++      close(saved);
++      close(fds[0]);
++      close(fds[1]);
++      hb_tee_rd = hb_tee_saved = -1;
++      return;
++   }
++   close(fds[1]);
++   if (pthread_create(&hb_tee_thread, NULL, hb_tee_main, NULL)) {
++      dup2(saved, 2);
++      close(saved);
++      close(fds[0]);
++      hb_tee_rd = hb_tee_saved = -1;
++      return;
++   }
++   hb_tee_on = true;
++}
++
++/* 남은 기록까지 넘기고 읽은 뒤 stderr 를 원래대로 */
++static void hb_tee_stop_now(void)
++{
++   if (!hb_tee_on) return;
++   fflush(stderr);
++   dup2(hb_tee_saved, 2);
++   hb_tee_stop = 1;
++   pthread_join(hb_tee_thread, NULL);
++   close(hb_tee_rd);
++   close(hb_tee_saved);
++   hb_tee_rd = hb_tee_saved = -1;
++   hb_tee_on = false;
+ }
+ 
+ static bool hb_own_inode(unsigned long inode)
+@@ -71,7 +259,7 @@
+    bool found = false;
+    if (!dir) return false;
+    while ((entry = readdir(dir))) {
+-      char path[128], value[128];
++      char path[300], value[128];
+       unsigned long candidate = 0;
+       ssize_t n;
+       snprintf(path, sizeof(path), "/proc/self/fd/%s", entry->d_name);
+@@ -107,7 +295,7 @@
+                     local, remote, &state, &inode) != 4) continue;
+          colon = strrchr(local, ':');
+          if (!colon || sscanf(colon + 1, "%x", &lport) != 1 || lport != port) continue;
+-         /* TIME_WAIT는 이미 끝난 연결이다. 접속 중인 소켓도 안전하게 거절한다. */
++         /* TIME_WAIT 는 이미 끝난 연결. 접속 중·접속 시도 중이면 거절 */
+          if (state != 0x0A && state != 0x06) {
+             fclose(f);
+             return false;
+@@ -119,6 +307,7 @@
+    return listening;
+ }
+ 
++/* 넷플레이 손님 표시(hb_direct 감시가 쓴 pid) — 메뉴로 붙은 손님도 2P 칸·1P 세이브를 안 쓰게 */
+ static void hb_guest_check(void)
+ {
+    unsigned pid = 0;
+@@ -128,34 +317,121 @@
+    fclose(f);
+ }
+ 
++static void hb_local_init(void)
++{
++   char command[8192];
++   uint8_t intent[4200];
++   struct stat st;
++   int fd, i;
++   ssize_t n;
++   bool connect = false;
++   uint64_t when;
++   int64_t age;
++
++   fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
++   if (fd >= 0) {
++      n = read(fd, command, sizeof(command) - 1);
++      close(fd);
++      if (n > 0) {
++         command[n] = 0;
++         for (i = 0; i < n;) {
++            const char *arg = command + i;
++            if (!strcmp(arg, "--connect") || !strncmp(arg, "--connect=", 10) || !strcmp(arg, "-C"))
++               connect = true;
++            i += (int)strlen(arg) + 1;
++         }
++      }
++   }
++   if (!connect) return;
++   hb_own_guest = true;
++
++   /* intent: "HBI3" 표[16] CRC[4] 기종[4] 초[8] 거래 폴더 "\n" */
++   fd = open(HB_OWN_DIR "/intent", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
++   if (fd < 0) {
++      HB_LOG(RETRO_LOG_INFO, "각자 세이브: 보낸 세이브 없음 — 보통 손님(1P 세이브는 읽지도 쓰지도 않음)");
++      return;
++   }
++   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 38 || st.st_size >= (off_t)sizeof(intent)) {
++      close(fd);
++      HB_LOG(RETRO_LOG_WARN, "각자 세이브: intent 형식 오류 — 보통 손님");
++      return;
++   }
++   n = read(fd, intent, sizeof(intent) - 1);
++   close(fd);
++   if (n != st.st_size || n < 38 || memcmp(intent, "HBI3", 4) ||
++       hb_u32(intent + 20) != hb_own_crc || hb_u32(intent + 24) != hb_own_kind) {
++      HB_LOG(RETRO_LOG_WARN, "각자 세이브: intent 의 롬 CRC · 기종이 다름 — 보통 손님");
++      return;
++   }
++   when = (uint64_t)hb_u32(intent + 28) | ((uint64_t)hb_u32(intent + 32) << 32);
++   age = (int64_t)time(NULL) - (int64_t)when;
++   if (age < -5 || age > HB_OWN_INTENT_AGE) {
++      HB_LOG(RETRO_LOG_WARN, "각자 세이브: intent 가 오래됨(%lld초) — 보통 손님", (long long)age);
++      return;
++   }
++   intent[n] = 0;
++   if (intent[n - 1] != '\n') return;
++   intent[n - 1] = 0;
++   if (intent[36] != '/' || strstr((const char *)intent + 36, "/../") || strstr((const char *)intent + 36, "/./") ||
++       strlen((const char *)intent + 36) + 32 >= sizeof(hb_tx))
++      return;
++   memcpy(hb_tx_token, intent + 4, 16);
++   snprintf(hb_tx, sizeof(hb_tx), "%s", (const char *)intent + 36);
++   hb_tee_start();
++   HB_LOG(RETRO_LOG_INFO, "각자 세이브: 보낸 거래에 묶임(표 %02x%02x%02x%02x…) · 기록 보기 %s",
++          hb_tx_token[0], hb_tx_token[1], hb_tx_token[2], hb_tx_token[3], hb_tee_on ? "켬" : "못 켬(되쓰기 안 함)");
++}
++
+ static void hb_own_init(const void *rom, size_t size, uint32_t kind, uint32_t maximum)
+ {
+    const uint8_t *p = (const uint8_t *)rom;
+    uint32_t crc = 0xffffffffu;
+-   char capability[128];
++   char capability[160], generation[17];
++   int random_fd;
+    size_t i;
+    unsigned bit;
++
++   hb_tee_stop_now();
+    memset(hb_own_token, 0, sizeof(hb_own_token));
+-   hb_own_applied = hb_own_guest = false;
++   hb_own_applied = hb_own_guest = hb_own_p2_skip_logged = false;
++   hb_p2_backed_up = false;
+    hb_own_save_hint = 0;
+    hb_own_countdown = 1;
+    hb_own_kind = kind;
+    hb_own_max = maximum;
++   hb_tx[0] = 0;
++   memset(hb_tx_token, 0, sizeof(hb_tx_token));
++   __atomic_store_n(&hb_role, 0, __ATOMIC_SEQ_CST);
++   hb_own_frame = hb_change_frame = 0;
++   hb_role_logged = 0;
++   hb_token_logged = false;
++   hb_seen_valid = false;
++   hb_seen_size = hb_written_size = 0;
+    for (i = 0; i < size; i++) {
+       crc ^= p[i];
+       for (bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    hb_own_crc = ~crc;
++   memset(hb_generation, 0, sizeof(hb_generation));
++   random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
++   if (random_fd >= 0) {
++      if (read(random_fd, hb_generation, sizeof(hb_generation)) != (ssize_t)sizeof(hb_generation))
++         memset(hb_generation, 0, sizeof(hb_generation));
++      close(random_fd);
++   }
++   hb_local_init();
+    if (!maximum || maximum > HB_OWN_MAX) return;
+    if (mkdir(HB_OWN_DIR, 0700) && errno != EEXIST) return;
+-   snprintf(capability, sizeof(capability), "HBO1 %u %u %u %u\n",
+-            (unsigned)getpid(), hb_own_crc, maximum, kind);
++   for (i = 0; i < 8; i++) snprintf(generation + 2 * i, 3, "%02x", hb_generation[i]);
++   snprintf(capability, sizeof(capability), "HBO3 %u %u %u %u %s\n",
++            (unsigned)getpid(), hb_own_crc, maximum, kind, generation);
+    hb_atomic("core", capability, strlen(capability));
+ }
+ 
++/* 방장: 30장마다 받은 세이브 요청 확인 → 한 번만 2P 세이브 교체 */
+ static void hb_own_poll(bool enabled, bool (*apply)(const uint8_t *, size_t))
+ {
+-   uint8_t header[44], *data;
++   uint8_t header[52], *data;
+    uint32_t size, port;
+    uint64_t expires;
+    struct stat st;
+@@ -167,28 +443,37 @@
+    hb_own_countdown = 30;
+    hb_guest_check();
+    if (hb_own_applied || hb_own_guest) return;
+-   fd = open(HB_OWN_DIR "/request", O_RDONLY | O_NOFOLLOW);
++   fd = open(HB_OWN_DIR "/request", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return;
+-   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 44 ||
+-         st.st_size > 44 + HB_OWN_MAX) { close(fd); return; }
++   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 52 ||
++       st.st_size > (off_t)(52 + HB_OWN_MAX)) {
++      close(fd);
++      return;
++   }
+    n = read(fd, header, sizeof(header));
+-   if (n != sizeof(header) || memcmp(header, "HBQ1", 4) ||
+-         hb_u32(header + 4) != (unsigned)getpid() || hb_u32(header + 8) != hb_own_crc) {
+-      close(fd); return;
++   if (n != (ssize_t)sizeof(header) || memcmp(header, "HBQ3", 4) ||
++       memcmp(header + 44, hb_generation, 8) ||
++       hb_u32(header + 4) != (unsigned)getpid() || hb_u32(header + 8) != hb_own_crc) {
++      close(fd);
++      return;
+    }
+    size = hb_u32(header + 12);
+    port = hb_u32(header + 16);
+    expires = hb_u32(header + 20) | ((uint64_t)hb_u32(header + 24) << 32);
+    for (i = 28; i < 44; i++) if (header[i]) token_ok = true;
+-   if (!token_ok || size > hb_own_max || st.st_size != 44 + size || port > 65534 ||
+-         !port || !hb_millis() || hb_millis() > expires || !hb_host_waiting(port)) {
+-      close(fd); return;
++   if (!token_ok || size > hb_own_max || st.st_size != (off_t)(52 + size) || port > 65534 ||
++       !port || !hb_millis() || hb_millis() > expires || !hb_host_waiting(port)) {
++      close(fd);
++      return;
+    }
+    data = (uint8_t *)malloc(size ? size : 1);
+-   if (!data) { close(fd); return; }
++   if (!data) {
++      close(fd);
++      return;
++   }
+    n = size ? read(fd, data, size) : 0;
+    close(fd);
+-   if (n == size && hb_millis() <= expires && hb_host_waiting(port)) {
++   if (n == (ssize_t)size && hb_millis() <= expires && hb_host_waiting(port)) {
+       /* 레트로아크의 같은 실행 스레드 안: 접속 처리보다 앞선 한 번만 바꾼다. */
+       unlink(HB_OWN_DIR "/request");
+       if (apply(data, size)) {
+@@ -196,7 +481,8 @@
+          memcpy(hb_own_token, header + 28, 16);
+          hb_own_save_hint = size;
+          hb_own_applied = true;
+-         memcpy(ack, "HBA1", 4);
++         hb_own_frame = 0;
++         memcpy(ack, "HBA3", 4);
+          memcpy(ack + 4, hb_own_token, 16);
+          hb_atomic("ack", ack, sizeof(ack));
+       }
+@@ -204,20 +490,114 @@
+    free(data);
+ }
+ 
+-static void hb_own_export(const uint8_t *save, size_t size)
++/* 손님 거래 폴더에 묶음 하나: 머리 44 + 세이브 + SHA-256 32
++ * 머리 = 종류[4] CRC[4] 기종[4] 크기[4] 표[16] 장[4] 역할(2)[4] 세이브 CRC32[4] */
++static bool hb_packet(const char *name, const char *magic, const uint8_t *save, size_t size, uint32_t frame)
+ {
+    uint8_t *packet;
+-   hb_guest_check();
+-   if (!hb_own_guest || !hb_has_token() || !save || !size || size > HB_OWN_MAX) return;
+-   packet = (uint8_t *)malloc(32 + size);
+-   if (!packet) return;
+-   memcpy(packet, "HBE1", 4);
++   char path[4160];
++   bool ok;
++   if (!hb_tx[0] || !save || !size || size > HB_OWN_MAX) return false;
++   packet = (uint8_t *)malloc(HB_OWN_PACKET_HEAD + size + 32);
++   if (!packet) return false;
++   memcpy(packet, magic, 4);
+    hb_put32(packet + 4, hb_own_crc);
+    hb_put32(packet + 8, hb_own_kind);
+-   hb_put32(packet + 12, size);
++   hb_put32(packet + 12, (uint32_t)size);
+    memcpy(packet + 16, hb_own_token, 16);
+-   memcpy(packet + 32, save, size);
+-   hb_atomic("export", packet, 32 + size);
++   hb_put32(packet + 32, frame);
++   hb_put32(packet + 36, 2);
++   hb_put32(packet + 40, hb_crc32(save, size));
++   memcpy(packet + HB_OWN_PACKET_HEAD, save, size);
++   hb_sha256(packet, HB_OWN_PACKET_HEAD + size, packet + HB_OWN_PACKET_HEAD + size);
++   ok = (size_t)snprintf(path, sizeof(path), "%s/%s.bin", hb_tx, name) < sizeof(path) &&
++        hb_store_path(path, packet, HB_OWN_PACKET_HEAD + size + 32);
++   if (!strcmp(name, "export"))
++      ok = hb_atomic("export", packet, HB_OWN_PACKET_HEAD + size + 32) || ok;   /* 카드가 실패해도 램 사본으로 종료 훅이 살림 */
+    free(packet);
++   return ok;
++}
++
++static bool hb_own_eligible(void)
++{
++   return hb_has_token() && hb_tx[0] && hb_own_guest &&
++          !memcmp(hb_own_token, hb_tx_token, 16) && hb_role_get() == 2;
++}
++
++/* 손님 정상 종료: 기록 줄을 끝까지 읽은 뒤, 확인된 2P 면 2P 세이브를 내보낸다 */
++static void hb_own_export(const uint8_t *save, size_t size)
++{
++   hb_tee_stop_now();
++   if (!hb_tx[0]) return;
++   if (!hb_own_eligible() || !save || !size || size > HB_OWN_MAX) {
++      HB_LOG(RETRO_LOG_INFO, "각자 세이브: 종료 — 이 판은 되쓰지 않음(%s)",
++             !hb_has_token() ? "방장 표 없음" : memcmp(hb_own_token, hb_tx_token, 16) ? "받은 표가 보낸 거래와 다름" :
++             hb_role_get() == 2 ? "2P 세이브 없음" : hb_role_get() < 0 ? "2P 아님(관전 · 3P · 나감)" : "2P 확인 못 함");
++      return;
++   }
++   if (hb_packet("export", "HBE3", save, size, hb_own_frame))
++      HB_LOG(RETRO_LOG_INFO, "각자 세이브: 종료 2P 세이브 %u바이트 남김(장 %u)", (unsigned)size, hb_own_frame);
++   else
++      HB_LOG(RETRO_LOG_ERROR, "각자 세이브: 종료 2P 세이브 남기기 실패: %s", hb_tx);
++}
++
++/* 매 장 끝(방장 · 손님 같음): 표가 있으면 장 번호를 센다(상태에 들어가므로 두 기기가 똑같이).
++ * 확인된 2P 손님만, 바뀐 2P 세이브가 HB_OWN_STABLE 장 그대로면 카드에 중간 저장. */
++static void hb_own_tick(const uint8_t *save, size_t size)
++{
++   int role;
++   if (!hb_has_token()) return;
++   hb_own_frame++;
++   if (!hb_tx[0] || !hb_own_guest) return;
++   role = hb_role_get();
++   if (role != hb_role_logged) {
++      hb_role_logged = role;
++      if (role == 2)
++         HB_LOG(RETRO_LOG_INFO, "각자 세이브: 넷플레이 2P 확인 — 이 판 2P 진행을 내 세이브로 남김");
++      else
++         HB_LOG(RETRO_LOG_WARN, "각자 세이브: 2P 아님(관전 · 3P · 나감) — 이 판은 되쓰지 않음");
++   }
++   if (!hb_token_logged && memcmp(hb_own_token, hb_tx_token, 16)) {
++      hb_token_logged = true;
++      HB_LOG(RETRO_LOG_WARN, "각자 세이브: 받은 상태의 표가 보낸 거래와 다름 — 되쓰지 않음");
++   }
++   if (!hb_own_eligible() || !save || !size || size > HB_OWN_MAX) return;
++   if (!hb_seen_valid) {
++      /* 2P 확인 뒤 첫 장: 받은 세이브를 기준으로 삼는다(바뀐 것이 없으면 중간 저장 안 함) */
++      memcpy(hb_seen, save, size);
++      memcpy(hb_written, save, size);
++      hb_seen_size = hb_written_size = size;
++      hb_seen_valid = true;
++      hb_change_frame = hb_own_frame;
++      return;
++   }
++   if (size != hb_seen_size || memcmp(hb_seen, save, size)) {
++      memcpy(hb_seen, save, size);
++      hb_seen_size = size;
++      hb_change_frame = hb_own_frame;
++      return;
++   }
++   if (hb_own_frame - hb_change_frame < HB_OWN_STABLE) return;
++   if (hb_written_size == size && !memcmp(hb_written, save, size)) return;
++   if (hb_packet("checkpoint", "HBC3", save, size, hb_change_frame)) {
++      memcpy(hb_written, save, size);
++      hb_written_size = size;
++      HB_LOG(RETRO_LOG_INFO, "각자 세이브: 2P 중간 저장 %u바이트(장 %u에 바뀜)", (unsigned)size, hb_change_frame);
++   } else {
++      HB_LOG(RETRO_LOG_ERROR, "각자 세이브: 2P 중간 저장 실패 — 300장 뒤 다시: %s", hb_tx);
++      hb_change_frame = hb_own_frame;   /* 카드 쓰기 실패: 300장 뒤 다시 */
++   }
++}
++
++/* 상태 불러오기(넷플레이 되감기 포함): 장 번호를 상태 값으로. 바뀐 장 이전으로 돌아가면 다시 셈. */
++static void hb_own_restored(uint32_t frame)
++{
++   hb_own_frame = frame;
++   if (frame < hb_change_frame) hb_change_frame = frame;
++}
++
++static void hb_own_deinit(void)
++{
++   hb_tee_stop_now();
+ }
+ #endif
+--- /dev/null
++++ b/dual/hb_storage.h
+@@ -0,0 +1,217 @@
++/* 두 대 코어 공통 — 카드·램 파일 쓰기(자기 세이브 4판, 10/21)
++ *
++ * 지키는 것
++ * - 기존 파일을 직접 열어 잘라 쓰지 않는다. 같은 폴더의 고정 임시 이름(<이름>.hbtmp)에 쓰고
++ *   fsync → 다시 읽어 확인 → 이름 바꾸기 → 최종 파일 fsync·다시 읽어 확인 → 폴더 동기화.
++ * - 이름 바꾸기에 실패하면 원본은 그대로 두고, 완전한 새 내용이 든 임시 파일만 남긴다.
++ *   임시 이름이 고정이라 실패가 되풀이돼도 파일이 쌓이지 않는다(다음 쓰기가 덮음).
++ * - 폴더 fsync 가 '지원 안 함'(EINVAL·ENOTSUP·EOPNOTSUPP·ENOSYS)일 때만 syncfs 로 대신한다.
++ *   EIO·ENOSPC·EROFS 같은 진짜 오류는 실패로 돌려준다.
++ */
++#ifndef HB_STORAGE_H
++#define HB_STORAGE_H
++#include <errno.h>
++#include <fcntl.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#ifndef O_CLOEXEC
++#define O_CLOEXEC 0
++#endif
++
++static uint32_t hb_crc32(const void *data, size_t size)
++{
++   const uint8_t *p = (const uint8_t *)data;
++   uint32_t crc = ~0u;
++   unsigned bit;
++   while (size--) {
++      crc ^= *p++;
++      for (bit = 0; bit < 8; bit++)
++         crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
++   }
++   return ~crc;
++}
++
++static uint32_t hb_rotr(uint32_t n, unsigned b)
++{
++   return (n >> b) | (n << (32 - b));
++}
++
++/* SHA-256(FIPS 180-4). 내보내기 묶음 머리까지 해시해 표·역할·크기 손상도 거절한다. */
++static void hb_sha256(const uint8_t *data, size_t size, uint8_t out[32])
++{
++   static const uint32_t k[64] = {
++      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
++      0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
++      0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
++      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
++      0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
++      0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
++      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
++      0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
++   };
++   uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
++                    0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
++   size_t padded = (size + 9 + 63) & ~(size_t)63, at;
++   unsigned i;
++   for (at = 0; at < padded; at += 64) {
++      uint8_t block[64];
++      uint32_t w[64], a, b, c, d, e, f, g, v;
++      for (i = 0; i < 64; i++) {
++         size_t n = at + i;
++         block[i] = n < size ? data[n] : n == size ? 0x80 : 0;
++         if (n >= padded - 8)
++            block[i] = (uint8_t)(((uint64_t)size * 8) >> (8 * (padded - 1 - n)));
++      }
++      for (i = 0; i < 16; i++)
++         w[i] = ((uint32_t)block[4*i] << 24) | ((uint32_t)block[4*i+1] << 16) |
++                ((uint32_t)block[4*i+2] << 8) | block[4*i+3];
++      for (i = 16; i < 64; i++)
++         w[i] = w[i-16] + (hb_rotr(w[i-15],7) ^ hb_rotr(w[i-15],18) ^ (w[i-15] >> 3)) +
++                w[i-7] + (hb_rotr(w[i-2],17) ^ hb_rotr(w[i-2],19) ^ (w[i-2] >> 10));
++      a = h[0]; b = h[1]; c = h[2]; d = h[3]; e = h[4]; f = h[5]; g = h[6]; v = h[7];
++      for (i = 0; i < 64; i++) {
++         uint32_t t1 = v + (hb_rotr(e,6) ^ hb_rotr(e,11) ^ hb_rotr(e,25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
++         uint32_t t2 = (hb_rotr(a,2) ^ hb_rotr(a,13) ^ hb_rotr(a,22)) + ((a & b) ^ (a & c) ^ (b & c));
++         v = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++      }
++      h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += v;
++   }
++   for (i = 0; i < 32; i++)
++      out[i] = (uint8_t)(h[i / 4] >> (24 - 8 * (i % 4)));
++}
++
++static bool hb_write_all(int fd, const uint8_t *data, size_t size)
++{
++   size_t at = 0;
++   while (at < size) {
++      ssize_t n = write(fd, data + at, size - at);
++      if (n < 0 && errno == EINTR) continue;
++      if (n <= 0) return false;
++      at += (size_t)n;
++   }
++   return true;
++}
++
++/* 폴더 동기화: '지원 안 함'만 syncfs 로 대신하고 진짜 오류는 실패 */
++static bool hb_sync_dir(const char *path)
++{
++   int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), rc, code;
++   if (fd < 0) return false;
++   rc = fsync(fd);
++   code = errno;
++   if (rc && (code == EINVAL || code == ENOTSUP || code == EOPNOTSUPP || code == ENOSYS)) {
++#ifdef SYS_syncfs
++      rc = (int)syscall(SYS_syncfs, fd);
++#endif
++   }
++   close(fd);
++   return rc == 0;
++}
++
++static bool hb_file_equal(const char *path, const uint8_t *data, size_t size)
++{
++   struct stat st;
++   uint8_t buf[4096];
++   size_t at = 0;
++   int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
++   if (fd < 0) return false;
++   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != (uint64_t)size) {
++      close(fd);
++      return false;
++   }
++   while (at < size) {
++      size_t count = size - at < sizeof(buf) ? size - at : sizeof(buf);
++      ssize_t n = read(fd, buf, count);
++      if (n < 0 && errno == EINTR) continue;
++      if (n <= 0 || memcmp(buf, data + at, (size_t)n)) {
++         close(fd);
++         return false;
++      }
++      at += (size_t)n;
++   }
++   close(fd);
++   return true;
++}
++
++static bool hb_store_path(const char *path, const uint8_t *data, size_t size)
++{
++   char temp[4160], parent[4160], *slash;
++   int fd;
++   bool ok;
++   if (!path || (size_t)snprintf(temp, sizeof(temp), "%s.hbtmp", path) >= sizeof(temp) ||
++       (size_t)snprintf(parent, sizeof(parent), "%s", path) >= sizeof(parent))
++      return false;
++   slash = strrchr(parent, '/');
++   if (!slash || slash == parent) return false;
++   *slash = 0;
++   fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
++   if (fd < 0) return false;
++   ok = hb_write_all(fd, data, size);
++   if (fsync(fd)) ok = false;
++   if (close(fd)) ok = false;
++   if (!ok || !hb_file_equal(temp, data, size)) {
++      /* 덜 쓴 임시 파일은 쓸모가 없다. 원본은 손대지 않았다. */
++      unlink(temp);
++      return false;
++   }
++   if (rename(temp, path))
++      return false;   /* 원본 그대로 + 완전한 새 내용(임시 파일) 보존 */
++   fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++   if (fd < 0) return false;
++   ok = fsync(fd) == 0;
++   close(fd);
++   return ok && hb_file_equal(path, data, size) && hb_sync_dir(parent);
++}
++
++/* 방장 2P 칸(.p2.srm · .p2.sav): 이번 실행에서 처음 바꾸기 전에 지금 파일을 <이름>.bak 으로 한 번 남긴다.
++ * 백업을 못 남기면 바꾸지 않는다. */
++static bool hb_p2_backed_up;
++static bool hb_p2_store(const char *path, const uint8_t *data, size_t size)
++{
++   char backup[4160];
++   if (!hb_p2_backed_up) {
++      struct stat st;
++      int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
++      if (fd >= 0) {
++         uint8_t *old;
++         ssize_t n;
++         size_t at = 0;
++         if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > 262144) {
++            close(fd);
++            return false;
++         }
++         old = (uint8_t *)malloc(st.st_size ? (size_t)st.st_size : 1);
++         if (!old) {
++            close(fd);
++            return false;
++         }
++         while (at < (size_t)st.st_size) {
++            n = read(fd, old + at, (size_t)st.st_size - at);
++            if (n < 0 && errno == EINTR) continue;
++            if (n <= 0) break;
++            at += (size_t)n;
++         }
++         close(fd);
++         if (at != (size_t)st.st_size ||
++             (size_t)snprintf(backup, sizeof(backup), "%s.bak", path) >= sizeof(backup) ||
++             !hb_store_path(backup, old, at)) {
++            free(old);
++            return false;
++         }
++         free(old);
++      } else if (errno != ENOENT) {
++         return false;
++      }
++      hb_p2_backed_up = true;
++   }
++   return hb_store_path(path, data, size);
++}
++#endif

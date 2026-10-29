@@ -1,0 +1,46 @@
+Subject: Libretro dual: name the 2P save after the file inside an archive
+Series-Step: 7/19 (mgba_dual 1.6-os4)
+Origin: hanbang (this project)
+요약: 압축 파일 안 롬 이름으로 2P 세이브(.p2.srm) 이름을 붙임.
+
+RetroArch names saves after the file inside "x.zip#y.gba"; do the same
+for <name>.p2.srm, and refuse (log) a 2P save path that would be cut off.
+
+---
+diff --git a/src/platform/libretro/dual/libretro_dual.c b/src/platform/libretro/dual/libretro_dual.c
+index 1e6200525c84..e856fab77e4c 100644
+--- a/src/platform/libretro/dual/libretro_dual.c
++++ b/src/platform/libretro/dual/libretro_dual.c
+@@ -432,7 +432,18 @@ static void _setP2SavePath(const struct retro_game_info* game) {
+ #endif
+ 	base = base ? base + 1 : game->path;
+ 	char name[PATH_MAX];
+-	snprintf(name, sizeof(name), "%s", base);
++	/* RetroArch names saves after the file inside an archive ("x.zip#y.gba" -> "y") */
++	const char* inner = NULL;
++	const char* hash;
++	for (hash = strchr(base, '#'); hash; hash = strchr(hash + 1, '#')) {
++		size_t at = hash - base;
++		if ((at >= 4 && (!strncasecmp(hash - 4, ".zip", 4) || !strncasecmp(hash - 4, ".apk", 4))) ||
++		    (at >= 3 && !strncasecmp(hash - 3, ".7z", 3))) {
++			inner = hash + 1;
++			break;
++		}
++	}
++	snprintf(name, sizeof(name), "%s", inner && inner[0] ? inner : base);
+ 	char* dot = strrchr(name, '.');
+ 	if (dot && dot != name) {
+ 		*dot = '\0';
+@@ -444,7 +455,11 @@ static void _setP2SavePath(const struct retro_game_info* game) {
+ 		dir = romDir;
+ 	}
+ 	size_t len = strlen(dir);
+-	snprintf(p2SavePath, sizeof(p2SavePath), "%s%s%s.p2.srm", dir, (len && dir[len - 1] != '/') ? "/" : "", name);
++	int written = snprintf(p2SavePath, sizeof(p2SavePath), "%s%s%s.p2.srm", dir, (len && dir[len - 1] != '/') ? "/" : "", name);
++	if (written < 0 || (size_t) written >= sizeof(p2SavePath)) {
++		_log(RETRO_LOG_ERROR, "2P save path too long, 2P save disabled");
++		p2SavePath[0] = '\0';
++	}
+ }
+ 
+ /* --- libretro API --- */

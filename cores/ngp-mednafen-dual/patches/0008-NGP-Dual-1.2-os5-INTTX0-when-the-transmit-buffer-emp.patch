@@ -1,0 +1,134 @@
+From fe738830cd43b62390f39f1364edb1911e67ddc5 Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Sun, 25 Oct 2026 22:40:02 +0900
+Subject: [PATCH 8/9] NGP Dual 1.2-os5: INTTX0 when the transmit buffer empties
+
+The serial transmit-end interrupt (INTTX0) is now raised when the byte in
+SC0BUF moves into the shift register (buffer empty), deferred to the end
+of the current instruction, instead of after the whole byte was shifted
+out. Bytes on the wire keep the same spacing; the BIOS send ring now
+empties one byte earlier.
+
+Delta Warp builds its time packet (D8 F5 time 00) only when
+COMSENDSTATUS is 0, right after its keep-alive packet; with the late
+interrupt one byte was always still queued, the packet was dropped and
+both players waited at YOU 01'30"00. Koi Koi Mahjong needed no core
+change (one player picks 1P, the other 2P).
+
+---
+ dual/libretro_dual.c   |  2 +-
+ mednafen/ngp/hb_link.c | 27 +++++++++++++++++++++++++--
+ mednafen/ngp/hb_link.h |  3 +++
+ 3 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/dual/libretro_dual.c b/dual/libretro_dual.c
+index 5150117..d64c05b 100644
+--- a/dual/libretro_dual.c
++++ b/dual/libretro_dual.c
+@@ -44,7 +44,7 @@
+ #ifndef GIT_VERSION
+ #define GIT_VERSION ""
+ #endif
+-#define DUAL_VERSION "1.1-os4" GIT_VERSION
++#define DUAL_VERSION "1.2-os5" GIT_VERSION
+ /* 넷플레이 버전 칸은 끝 글자 포함 32바이트 */
+ typedef char hb_version_fits_netplay[(sizeof(DUAL_VERSION) <= 32) ? 1 : -1];
+ 
+diff --git a/mednafen/ngp/hb_link.c b/mednafen/ngp/hb_link.c
+index 9fcd77c..f966de1 100644
+--- a/mednafen/ngp/hb_link.c
++++ b/mednafen/ngp/hb_link.c
+@@ -36,6 +36,9 @@ static uint8_t sio_txbyte, sio_txnext, sio_txhasnext, sio_txwait;
+ static int32_t sio_txleft = -1;            /* 보내는 중이면 남은 사이클, 쉬면 -1 */
+ static uint8_t sio_out[16];                /* 다 보낸 바이트(래퍼가 상대로 넘김) */
+ static uint8_t sio_outn;
++/* (10/25) '보낼 칸 빔' INTTX0 걸 차례(명령 · HLE 한가운데서 바로 걸지 않고 그 명령 뒤 hb_sio_tick 끝에서). 늘 그 명령의
++ * hb_sio_tick 에서 0 이 되므로 장 끝(상태 저장 때)엔 늘 0 — 상태에 안 넣음(불러올 때 0) */
++static uint8_t sio_txint;
+ 
+ /* 바이오스 작업 메모리(SNK 직렬 처리기와 같은 자리) */
+ #define COM_TXBUF  0x6C80
+@@ -75,6 +78,7 @@ void hb_sio_reset(void)
+    sio_txbyte = sio_txnext = sio_txhasnext = sio_txwait = 0;
+    sio_txleft = -1;
+    sio_outn = 0;
++   sio_txint = 0;
+ }
+ 
+ /* 한 바이트 보내는 시간(CPU 사이클 6.144MHz). BR0CR 0x15(φT2 ÷5) = 19200bps = 비트 320 사이클을 기준으로
+@@ -105,6 +109,11 @@ static void tx_start(uint8_t data)
+    {
+       sio_txwait = 0;
+       sio_txleft = byte_cycles();
++      /* (10/25) SC0BUF 가 밀어내기 레지스터로 넘어가 비었음 → INTTX0(보낼 칸 빔). 처리기는 다음 바이트를 SC0BUF 에 미리 넣고
++       * (sio_txnext 한 칸), 줄 위 바이트 사이 간격은 예전과 같음. 예전엔 바이트를 다 보낸 뒤에야 INTTX0 이 와서 BIOS 보낼 고리가
++       * 한 바이트 늦게 비었고, 델타 워프(시간 고르기에서 COMSENDSTATUS 가 0 일 때만 'D8 F5 시간 00' 을 만듦)는 늘 1 이 남아
++       * 자기 시간을 못 보내 'YOU 01'30"00' 에서 둘 다 기다렸음 */
++      sio_txint = 1;
+    }
+ }
+ 
+@@ -165,7 +174,18 @@ int hb_sio_io_write(uint32_t address, uint8_t data)
+    return 0;
+ }
+ 
++static void hb_sio_tick_(int32_t cycles);
+ void hb_sio_tick(int32_t cycles)
++{
++   hb_sio_tick_(cycles);
++   if (sio_txint)
++   {
++      sio_txint = 0;
++      TestIntHDMA(12, 0x19);
++   }
++}
++
++static void hb_sio_tick_(int32_t cycles)
+ {
+    hb_rtc_cycles += (uint32_t)cycles;
+    if (sio_txwait)
+@@ -174,6 +194,7 @@ void hb_sio_tick(int32_t cycles)
+       {
+          sio_txwait = 0;
+          sio_txleft = byte_cycles();
++         sio_txint = 1;           /* (10/25) CTS 를 기다리던 바이트가 이제 밀어내기 시작 → 보낼 칸 빔 */
+       }
+       else
+          return;
+@@ -191,9 +212,9 @@ void hb_sio_tick(int32_t cycles)
+    if (sio_txhasnext)
+    {
+       sio_txhasnext = 0;
+-      tx_start(sio_txnext);
++      tx_start(sio_txnext);      /* 다음 바이트가 밀어내기로 넘어가며 INTTX0 (tx_start 안) */
+    }
+-   TestIntHDMA(12, 0x19);
++   /* (10/25) 다음 바이트가 없으면 INTTX0 없음 — 보낼 칸은 앞 바이트가 넘어갈 때 이미 비었다고 알렸음 */
+ }
+ 
+ void hb_sio_receive(uint8_t data)
+@@ -446,5 +467,7 @@ int hb_sio_StateAction(void *data, int load, int data_only)
+       return 0;
+    if (load && sio_outn > sizeof(sio_out))
+       sio_outn = sizeof(sio_out);
++   if (load)
++      sio_txint = 0;
+    return 1;
+ }
+diff --git a/mednafen/ngp/hb_link.h b/mednafen/ngp/hb_link.h
+index 37ef404..8fa3206 100644
+--- a/mednafen/ngp/hb_link.h
++++ b/mednafen/ngp/hb_link.h
+@@ -17,6 +17,9 @@
+  *    수준(INTES0 0x77)을 6 으로 켬. 처리기를 스스로 까는 게임(SNK 라이브러리 — KOF · SvC 는 둘 다, 빅뱅 프로레슬링 등은
+  *    받기만)은 COMINIT 바로 뒤에 덮어써서 그대로이고, 바이오스 처리기에 기대는 게임(포켓 테니스 · 츠나게테 퐁 · 매지컬 드롭 …)은
+  *    이제 보냄 끝마다 고리에서 다음 바이트가 나가고, 받은 바이트가 받은 고리에 쌓여 COMGETDATA 로 읽힘.
++ *  - (10/25 1.2-os5) INTTX0 은 '보낼 칸 빔' 때(SC0BUF 바이트가 밀어내기 레지스터로 넘어가는 순간)에 걸림 — 처리기가 다음 바이트를
++ *    미리 넣어 두는 꼴. 예전엔 다 보낸 뒤에 걸려 BIOS 보낼 고리가 한 바이트 늦게 비었음(델타 워프 시간 꾸러미가 버려졌음).
++ *    줄 위 바이트 간격 · 받기는 그대로.
+  */
+ #ifndef HB_LINK_H
+ #define HB_LINK_H
+-- 
+2.39.5
+

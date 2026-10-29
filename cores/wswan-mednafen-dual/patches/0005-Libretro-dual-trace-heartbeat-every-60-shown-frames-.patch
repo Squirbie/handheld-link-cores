@@ -1,0 +1,52 @@
+From f01a69886f15f0ea81fd4d51ee8e95514c098902 Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Tue, 20 Oct 2026 02:02:21 +0900
+Subject: [PATCH 5/5] Libretro dual: trace heartbeat every 60 shown frames
+ (WSWAN_DUAL_TRACE only)
+
+Test scripts schedule netplay inputs on the host's frame count; frames
+re-run by a netplay rollback (video disabled) are not counted.
+
+---
+ dual/libretro_dual.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/dual/libretro_dual.c b/dual/libretro_dual.c
+index 77c3fb6..0f53dc3 100644
+--- a/dual/libretro_dual.c
++++ b/dual/libretro_dual.c
+@@ -235,6 +235,7 @@ static int shown;              /* 이번 장에 내보내는 기계 */
+ static bool audioOn = true;
+ static size_t innerSize;       /* 기계 하나의 상태 크기 */
+ static struct DualStats stats;
++static uint32_t shownFrames;   /* 화면을 낸 retro_run 수(시험용 맥박) */
+ 
+ static char p2SavePath[DUAL_PATH_MAX];
+ static uint8_t *p2Written;     /* 마지막으로 쓴(또는 읽은) .p2.sav 내용 */
+@@ -716,6 +717,7 @@ bool retro_load_game(const struct retro_game_info *game)
+    }
+ 
+    memset(&stats, 0, sizeof(stats));
++   shownFrames = 0;
+    stats.magic = 0x54535748u; /* "HWST" */
+    stats.version = 1;
+    memset(seenStates, 0, sizeof(seenStates));
+@@ -920,6 +922,15 @@ void retro_run(void)
+    stats.frames++;
+    inner[0].link_stats(stats.comm[0], 10);
+    inner[1].link_stats(stats.comm[1], 10);
++   if (videoOn)
++      shownFrames++;
++   if (traceFile && videoOn && shownFrames % 60 == 0)
++   {
++      /* 시험용 맥박: 보인 장(넷플레이 되감아 다시 돈 장 빼고) · 전체 장 · 오간 바이트 */
++      fprintf(traceFile, "f=%u 장 · 보인 장 %u · 넘긴 바이트 1P->2P %u 2P->1P %u · 화면 %dP\n", stats.frames,
++            shownFrames, stats.bytes[0], stats.bytes[1], shown + 1);
++      fflush(traceFile);
++   }
+ 
+    if (linkOn && --p2Countdown == 0)
+    {
+-- 
+2.53.0
+

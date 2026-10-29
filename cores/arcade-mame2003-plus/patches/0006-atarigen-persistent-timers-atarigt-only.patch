@@ -1,0 +1,130 @@
+diff --git a/src/drivers/atarigt.c b/src/drivers/atarigt.c
+index 4131763..c5df014 100644
+--- a/src/drivers/atarigt.c
++++ b/src/drivers/atarigt.c
+@@ -77,7 +77,7 @@ static MACHINE_INIT( atarigt )
+ {
+ 	atarigen_eeprom_reset();
+ 	atarigen_interrupt_reset(update_interrupts);
+-	atarigen_scanline_timer_reset(atarigt_scanline_update, 8);
++	atarigen_scanline_timer_reset_persistent(atarigt_scanline_update, 8);	/* hanbang 10/21: saved timers only on this board */
+ }
+ 
+ 
+diff --git a/src/machine/atarigen.c b/src/machine/atarigen.c
+index 6b04322..8ff2474 100644
+--- a/src/machine/atarigen.c
++++ b/src/machine/atarigen.c
+@@ -90,6 +90,7 @@ static double 		scanline_callback_period;
+ static int 			last_scanline;
+ static void *		atarigen_vblank_timer;
+ static void *		atarigen_scanline_timer;
++static int			atarigen_timers_persistent;	/* hanbang 10/21: 1 = atarigt only (primrage/tmek); others keep timer_set exactly */
+ 
+ static int 			actual_vc_latch0;
+ static int 			actual_vc_latch1;
+@@ -904,7 +905,7 @@ static READ_HANDLER( m6502_speedup_r )
+ 	atarigen_scanline_timer_reset: Sets up the scanline timer.
+ ---------------------------------------------------------------*/
+ 
+-void atarigen_scanline_timer_reset(atarigen_scanline_callback update_graphics, int frequency)
++static void atarigen_scanline_timer_reset_common(atarigen_scanline_callback update_graphics, int frequency)
+ {
+ 	/* set the scanline callback */
+ 	scanline_callback = update_graphics;
+@@ -914,15 +915,34 @@ void atarigen_scanline_timer_reset(atarigen_scanline_callback update_graphics, i
+ 	/* compute the last scanline */
+ 	last_scanline = (int)(TIME_IN_HZ(Machine->drv->frames_per_second) / cpu_getscanlineperiod());
+ 
+-	/* persistent timers (not timer_set) so the save state can carry their phase;
+-	   a scanline chain always ends before the next VBLANK starts a new one */
+-	atarigen_vblank_timer = timer_alloc(vblank_timer);
+-	atarigen_scanline_timer = timer_alloc(scanline_timer);
+-	timer_save_register("atarigen", 0, "vblank_timer", atarigen_vblank_timer);
+-	timer_save_register("atarigen", 0, "scanline_timer", atarigen_scanline_timer);
++	if (atarigen_timers_persistent)
++	{
++		/* persistent timers (not timer_set) so the save state can carry their phase;
++		   a scanline chain always ends before the next VBLANK starts a new one (true for atarigt) */
++		atarigen_vblank_timer = timer_alloc(vblank_timer);
++		atarigen_scanline_timer = timer_alloc(scanline_timer);
++		timer_save_register("atarigen", 0, "vblank_timer", atarigen_vblank_timer);
++		timer_save_register("atarigen", 0, "scanline_timer", atarigen_scanline_timer);
++
++		/* set a timer to go off on the next VBLANK */
++		timer_adjust(atarigen_vblank_timer, cpu_getscanlinetime(Machine->drv->screen_height), 0, 0);
++	}
++	else
++		/* set a timer to go off on the next VBLANK (original behaviour, other Atari boards) */
++		timer_set(cpu_getscanlinetime(Machine->drv->screen_height), 0, vblank_timer);
++}
++
++/* hanbang 10/21: same as atarigen_scanline_timer_reset but with saved persistent timers (atarigt only) */
++void atarigen_scanline_timer_reset_persistent(atarigen_scanline_callback update_graphics, int frequency)
++{
++	atarigen_timers_persistent = 1;
++	atarigen_scanline_timer_reset_common(update_graphics, frequency);
++}
+ 
+-	/* set a timer to go off on the next VBLANK */
+-	timer_adjust(atarigen_vblank_timer, cpu_getscanlinetime(Machine->drv->screen_height), 0, 0);
++void atarigen_scanline_timer_reset(atarigen_scanline_callback update_graphics, int frequency)
++{
++	atarigen_timers_persistent = 0;
++	atarigen_scanline_timer_reset_common(update_graphics, frequency);
+ }
+ 
+ 
+@@ -933,11 +953,22 @@ void atarigen_scanline_timer_reset(atarigen_scanline_callback update_graphics, i
+ 
+ static void vblank_timer(int param)
+ {
+-	/* set a timer to go off at scanline 0 */
+-	timer_adjust(atarigen_scanline_timer, TIME_IN_USEC(Machine->drv->vblank_duration), 0, 0);
++	if (atarigen_timers_persistent)
++	{
++		/* set a timer to go off at scanline 0 */
++		timer_adjust(atarigen_scanline_timer, TIME_IN_USEC(Machine->drv->vblank_duration), 0, 0);
++
++		/* set a timer to go off on the next VBLANK */
++		timer_adjust(atarigen_vblank_timer, cpu_getscanlinetime(Machine->drv->screen_height), 1, 0);
++	}
++	else
++	{
++		/* set a timer to go off at scanline 0 */
++		timer_set(TIME_IN_USEC(Machine->drv->vblank_duration), 0, scanline_timer);
+ 
+-	/* set a timer to go off on the next VBLANK */
+-	timer_adjust(atarigen_vblank_timer, cpu_getscanlinetime(Machine->drv->screen_height), 1, 0);
++		/* set a timer to go off on the next VBLANK */
++		timer_set(cpu_getscanlinetime(Machine->drv->screen_height), 1, vblank_timer);
++	}
+ }
+ 
+ 
+@@ -956,7 +987,12 @@ static void scanline_timer(int scanline)
+ 		/* generate another? */
+ 		scanline += scanlines_per_callback;
+ 		if (scanline < last_scanline && scanlines_per_callback)
+-			timer_adjust(atarigen_scanline_timer, scanline_callback_period, scanline, 0);
++		{
++			if (atarigen_timers_persistent)
++				timer_adjust(atarigen_scanline_timer, scanline_callback_period, scanline, 0);
++			else
++				timer_set(scanline_callback_period, scanline, scanline_timer);
++		}
+ 	}
+ }
+ 
+diff --git a/src/machine/atarigen.h b/src/machine/atarigen.h
+index 2aa429a..8e3c767 100644
+--- a/src/machine/atarigen.h
++++ b/src/machine/atarigen.h
+@@ -223,6 +223,7 @@ WRITE16_HANDLER( atarigen_playfield2_latched_msb_w );
+ ---------------------------------------------------------------*/
+ 
+ void atarigen_scanline_timer_reset(atarigen_scanline_callback update_graphics, int frequency);
++void atarigen_scanline_timer_reset_persistent(atarigen_scanline_callback update_graphics, int frequency);	/* hanbang 10/21: atarigt only */
+ int atarigen_get_hblank(void);
+ WRITE16_HANDLER( atarigen_halt_until_hblank_0_w );
+ WRITE16_HANDLER( atarigen_666_paletteram_w );

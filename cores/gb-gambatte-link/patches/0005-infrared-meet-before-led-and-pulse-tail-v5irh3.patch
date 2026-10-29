@@ -1,0 +1,90 @@
+Subject: Gambatte: infrared: meet before the LED turns on; only pulses read twice or less linger (v5irh3)
+Series-Step: 5/5 (gambatte link v5irh3)
+Origin: hanbang (this project); record name hanbang_gb_v5irh3_from_v5irh2.diff
+요약: 나의 캠프장(적외선 교환) 고침 — 듣는 상대가 있으면 LED 를 켜기 직전에 만나고, 긴 펄스 꼬리는 받는 쪽이 2번 이하 읽었을 때만 남김.
+
+Boku no Camp-jou sends its hello pulse before it ever reads RP; the pulse was over before the two sides met, so the
+receiver never saw it. A Game Boy that turns its LED on while not tied, with the other side listening, now meets it at
+that point (the stop is made with the LED still off, so the pulse starts after the meeting point for both); events at the
+stop itself are applied after the tie. The "long pulse lingers" rule now applies only to a pulse the reader saw lit at
+most twice (HB_IR_HOLD_READS): that game counts its 288/928-unit bit pulses in 22-unit polls (12+ lit reads each) and the
+linger made them read as bad lengths, while a Mystery Gift hello caught once still lingers. Only infrared functions
+change; the cable code is untouched.
+
+---
+diff --git a/libgambatte/libretro/hb_netpacket_serial.h b/libgambatte/libretro/hb_netpacket_serial.h
+index 1f81db67b92c..5d57b2303cc7 100644
+--- a/libgambatte/libretro/hb_netpacket_serial.h
++++ b/libgambatte/libretro/hb_netpacket_serial.h
+@@ -142,6 +142,9 @@ struct retro_netpacket_callback
+                                   * double speed: 256 ticks = 16384 units for an answer, 3904 of them its own pause) */
+ #define HB_IR_HOLD_DEF 128UL     /* units: a long pulse stays seen this long after it ends */
+ #define HB_IR_HOLD_MIN 256UL     /* units: pulses at least this long linger (Mystery Gift hello: 320) */
++#define HB_IR_HOLD_READS 2       /* v5irh3: only a pulse the reader saw lit at most this many times lingers: Boku no
++                                  * Camp-jou counts its 288/928-unit bit pulses in 22-unit polls (12+ lit reads each) and
++                                  * the linger made them read as bad lengths; a Mystery Gift hello caught once still lingers */
+ #define HB_IR_IDLE 140448UL      /* units (two frames): a port not read this long counts as not listening */
+ #define HB_IR_WAIT_MS 3000UL     /* longest a Game Boy stays paused for the other's IR report */
+ #define HB_IR_BARRIER_MS 1500UL  /* longest it waits at the meeting point */
+@@ -806,6 +809,15 @@ public:
+       bool act = (val & 0xC0) == 0xC0 || (val & 1);
+       unsigned char led = val & 1;
+       bool changed = act != ir_act_ || led != ir_led_;
++      /* v5irh3: a Game Boy that turns its LED on while not tied and the other one listens meets it
++       * first, at this point (Boku no Camp-jou sends its hello pulse before it ever reads RP; that
++       * pulse was over before the two met, so the receiver never saw it). The stop is made with the
++       * LED still off, so the pulse starts after the meeting point for both. */
++      if (act && led && !ir_led_ && ir_act_ && ir_map_ != 2 && irLinked() && ir_pact_ && ir_pread_) {
++         ir_reading_ = true; ir_last_rd_any_ = t;
++         tr("ir-tx-meet", 0, 0, (unsigned)t);
++         irBarrier(t);
++      }
+       ir_act_ = act; ir_led_ = led;
+       if (!act) ir_reading_ = false;
+       if (!irLinked()) return;
+@@ -851,7 +863,8 @@ public:
+       /* the receiver keeps seeing a pulse for a short while after it ends (HB_IR_HOLD): the
+        * Mystery Gift role loop polls RP every 260 units and then waits a timer tick, so a
+        * 320-unit hello pulse caught late was gone by its next read and the hello was missed */
+-      bool seen = ir_seen_led_ || (ir_off_valid_ && (int64_t)need >= ir_off_at_ && (int64_t)need - ir_off_at_ < (int64_t)ir_hold_);
++      if (ir_seen_led_ && ir_pulse_reads_ < 255) ++ir_pulse_reads_;   /* v5irh3 */
++      bool seen = ir_seen_led_ || (ir_pulse_reads_ <= HB_IR_HOLD_READS && ir_off_valid_ && (int64_t)need >= ir_off_at_ && (int64_t)need - ir_off_at_ < (int64_t)ir_hold_);
+       if (seen != ir_last_ret_ || t - ir_last_rd_ > 4096 || ir_rdall_) { tr(seen ? "ir-rd-light" : "ir-rd-dark", 0, 0, (unsigned)t); }
+       ir_last_ret_ = seen; ir_last_rd_ = t;
+       return seen;
+@@ -882,7 +895,7 @@ private:
+       ir_qh_ = ir_qt_ = 0; ir_map_ = 0; ir_off_ = 0; ir_seen_led_ = false;
+       ir_my_s_ = 0; ir_my_bs_ = 0; ir_bs_ = 0; ir_ps_ok_ = false; ir_ps_rt_ = 0; ir_ps_bs_ = 0;
+       ir_map_pbs_ = 0; ir_t_bs_ = 0; ir_t_ok_ = false; ir_t_rt_ = 0;
+-      ir_off_valid_ = false; ir_off_at_ = ir_on_at_ = 0; ir_last_ret_ = false; ir_reading_ = ir_pread_ = false; ir_last_rd_any_ = 0; ir_last_rd_ = 0; ir_backoff_ms_ = 0; ir_waits_ = 0;
++      ir_off_valid_ = false; ir_off_at_ = ir_on_at_ = 0; ir_last_ret_ = false; ir_reading_ = ir_pread_ = false; ir_last_rd_any_ = 0; ir_last_rd_ = 0; ir_pulse_reads_ = 0; ir_backoff_ms_ = 0; ir_waits_ = 0;
+    }
+    uint64_t irTime(unsigned long abs, bool ds)
+    {
+@@ -909,7 +922,7 @@ private:
+    }
+    void irFold(uint64_t upto)
+    {
+-      while (ir_qh_ != ir_qt_ && ir_q_[ir_qh_].rt <= upto) {
++      while (ir_qh_ != ir_qt_ && ir_q_[ir_qh_].rt < upto) {   /* v5irh3: '<': what happens at the stop itself is applied after the tie */
+          ir_seen_led_ = ir_q_[ir_qh_].act && ir_q_[ir_qh_].led;
+          ir_qh_ = (ir_qh_ + 1) & (HB_IR_Q - 1);
+       }
+@@ -958,7 +971,7 @@ private:
+          IrEv &e = ir_q_[ir_qh_];
+          ir_qh_ = (ir_qh_ + 1) & (HB_IR_Q - 1);
+          if ((e.act && e.led) != ir_seen_led_) tr("ir-see", e.act && e.led, 0, (unsigned)(e.rt + ir_off_));
+-         if (!ir_seen_led_ && e.act && e.led) ir_on_at_ = (int64_t)e.rt + ir_off_;
++         if (!ir_seen_led_ && e.act && e.led) { ir_on_at_ = (int64_t)e.rt + ir_off_; ir_pulse_reads_ = 0; }
+          if (ir_seen_led_ && !(e.act && e.led)) {
+             /* only a long pulse lingers (Pokemon Pinball's pulses are 32-224 units with gaps as short) */
+             ir_off_at_ = (int64_t)e.rt + ir_off_;
+@@ -1025,7 +1038,7 @@ private:
+    uint32_t ir_my_bs_, ir_bs_, ir_ps_bs_, ir_map_pbs_, ir_t_bs_;
+    bool ir_t_ok_;
+    uint64_t ir_t_rt_;
+-   bool ir_rdall_, ir_off_valid_, ir_last_ret_, ir_reading_, ir_pread_; uint64_t ir_last_rd_any_; int64_t ir_off_at_, ir_on_at_; unsigned long ir_hold_; uint64_t ir_last_rd_;
++   bool ir_rdall_, ir_off_valid_, ir_last_ret_, ir_reading_, ir_pread_; uint64_t ir_last_rd_any_; int64_t ir_off_at_, ir_on_at_; unsigned long ir_hold_; uint64_t ir_last_rd_; unsigned ir_pulse_reads_;
+    void (*ir_refresh_)(void); unsigned long ir_refresh_ms_;
+    IrEv ir_q_[HB_IR_Q];
+    unsigned ir_qh_, ir_qt_;

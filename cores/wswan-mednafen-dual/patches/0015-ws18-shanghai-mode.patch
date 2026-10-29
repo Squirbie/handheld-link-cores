@@ -1,0 +1,509 @@
+diff -ruN src_fix/dual/libretro_dual.c src_ws18/dual/libretro_dual.c
+--- src_fix/dual/libretro_dual.c	2026-10-21 20:03:30.740959884 +0900
++++ src_ws18/dual/libretro_dual.c	2026-10-21 22:29:49.971431381 +0900
+@@ -73,6 +73,15 @@
+  * - CPU 반복 끝내기(10/21, 1.7): v30mz_execute 의 반복은 명령마다 사이클이 줄어야 끝나는데, FF /7 처럼 사이클을 안 세는
+  *   명령(없는 꼴)이 이어지면(게임이 안 채워진 쪽 FF 영역으로 뛰어 들면) 한 장이 끝나지 않아 레트로아크가 멈췄음(상해 포켓
+  *   두 기기 세이브가 모두 비었을 때 방장이 A 를 누르면 손님 기계가 그렇게 됨). 사이클이 안 줄어든 명령은 1사이클로 셈.
++ * - 직렬 정확한 시각(10/21, 1.8): 줄마다 넘기는 방식은 바이트가 상대에게 닿기까지 1056~1311사이클(실물 800)이라, 바이트마다
++ *   메아리를 0x80번 폴링(약 3200사이클)만 기다리는 상해 포켓은 받는 쪽이 세로 귀선 처리 중이면 메아리가 늦어 묶음이
++ *   어긋났고(게임이 반쯤 받은 묶음을 안 지움 → 길이 1 묶음 → 8375:0182 가 N-4 = FFFD 바이트를 베껴 스택을 덮음) 손님이
++ *   멈췄음. 롬 머리가 상해 포켓(선소프트 0x0C · 흑백 · 게임 0x01)이고 link on 이면 두 기계에 '상해 포켓 모드'를 켬:
++ *   ① 직렬 정확한 시각(comm.c: 쓴 순간 도착 예정과 함께 넘기고 받는 쪽 CPU 가 그 사이클에 받음)
++ *   ② 인터럽트 높은 번호부터(interrupt.c, ares · Mesen2 와 같음 — 헛 수신 처리기가 세로 귀선을 밀지 않게)
++ *   ③ 박자 half(옵션과 상관없이 — 두 기계가 사이클까지 같은 박자면 둘이 같은 장에 누를 때 같은 순간에 보내 부딪혀
++ *      'つうしんエラー') ④ 손님 세이브를 받아 2P 를 다시 켤 때 1P UART 는 끄지 않음(켤 때 한 번만 UART 를 켜는 게임).
++ *   상태가 더 커져(HBCX) 1.7 과는 서로 거절.
+  *
+  * 시험용 환경 변수: WSWAN_DUAL_RENDER_BOTH=1(두 기계 다 그림) ·
+  * WSWAN_DUAL_TRACE=<파일>(밖에서 온 상태 · 2P 세이브 기록).
+@@ -104,8 +113,9 @@
+  * 1.5(10/21) = 1.4 의 반 장 박자를 게임별 옵션으로(기본 same = 1.3 과 같은 박자 · 같은 상태 바이트)
+  * 1.6(10/21) = 1.5 + 손님 세이브를 받아 2P 를 다시 켤 때 2P 60Hz 셈을 1P 와 맞춤(판 칸 그대로)
+  * 1.7(10/21) = 1.6 + 직렬 수신 버퍼가 찼을 때 새 바이트가 안 읽은 바이트를 덮어씀(쿠루파라!) + 시간이 안 가는 명령만
+- *              이어져 코어가 멈추는 것 막기(상해 포켓) (판 칸 그대로) */
+-#define DUAL_VERSION       "1.7-os4"
++ *              이어져 코어가 멈추는 것 막기(상해 포켓) (판 칸 그대로)
++ * 1.8(10/21) = 1.7 + 상해 포켓(두 대)만 직렬 바이트를 정확한 사이클에 넘김(그 밖의 게임 · 혼자는 1.7 과 같은 길 · 같은 상태) */
++#define DUAL_VERSION       "1.8-os4"
+ typedef char hb_version_fits_netplay[(sizeof(DUAL_VERSION GIT_VERSION) <= 32) ? 1 : -1];
+ #define DUAL_EXTENSIONS    "ws|wsc|pc2"
+ #define DUAL_WIDTH         224
+@@ -164,7 +174,8 @@
+    void P##hb_ws_set_frame_end(int); \
+    const void *P##hb_ws_framebuffer(void); \
+    unsigned P##hb_ws_60hz_counter(void); \
+-   void P##hb_ws_set_60hz_counter(unsigned);
++   void P##hb_ws_set_60hz_counter(unsigned); \
++   void P##hb_ws_set_link_exact(int);
+ 
+ INNER_DECLS(wsA_)
+ INNER_DECLS(wsB_)
+@@ -205,6 +216,7 @@
+    const void *(*framebuffer)(void);
+    unsigned (*get_60hz_counter)(void);
+    void (*set_60hz_counter)(unsigned);
++   void (*set_link_exact)(int);
+ };
+ 
+ #define INNER_TABLE(P) { \
+@@ -220,7 +232,7 @@
+    P##hb_ws_emu_line, P##hb_ws_emu_end, P##hb_ws_run_post, \
+    P##hb_ws_link_take, P##hb_ws_link_give, P##hb_ws_link_stats, \
+    P##hb_ws_set_render, P##hb_ws_set_frame_end, P##hb_ws_framebuffer, \
+-   P##hb_ws_60hz_counter, P##hb_ws_set_60hz_counter }
++   P##hb_ws_60hz_counter, P##hb_ws_set_60hz_counter, P##hb_ws_set_link_exact }
+ 
+ static const struct Inner inner[2] = { INNER_TABLE(wsA_), INNER_TABLE(wsB_) };
+ 
+@@ -282,6 +294,7 @@
+ static bool gameLoaded;
+ static bool linkOn = true;
+ static bool phaseHalf;         /* 옵션 wswan_dual_link_phase = half 이고 link on(불러올 때 정함) */
++static bool linkExact;         /* 1.8: 직렬 정확한 시각(상해 포켓 · link on, 불러올 때 정함) */
+ static int screenOption;       /* 옵션: 0 = 1P, 1 = 2P */
+ static int shown;              /* 이번 장에 내보내는 기계 */
+ static bool audioOn = true;
+@@ -1026,12 +1039,28 @@
+    if (size) memcpy(saveMemory(1), data, size);
+    inner[1].reset();
+    inner[1].set_60hz_counter(inner[0].get_60hz_counter());
+-   wsA_Comm_Reset();
++   /* 1.8: 상해 포켓 모드에서는 1P UART 를 끄지 않음 — 그 게임은 켤 때 한 번만 UART 를 켜서(831C:000D), 여기서 1P 를
++    * 끄면 1P 가 다시는 못 보내 손님 세이브를 받은 뒤 두 대가 영영 안 붙었음(1.5~1.7 같음). 2P 는 전원을 다시 켜므로 초기화.
++    * 그 밖의 게임은 1.7 그대로(두 기계 다 초기화). */
++   if (!linkExact)
++      wsA_Comm_Reset();
+    wsB_Comm_Reset();
+    dual_log(RETRO_LOG_INFO, "손님 자기 세이브 받음: %u 바이트, 2P 전원과 케이블 초기화", (unsigned)size);
+    return true;
+ }
+ 
++/* 1.8: 직렬 바이트를 정확한 사이클에 넘길 게임 — 롬 머리(마지막 10바이트: 제작사 · 컬러 · 게임 번호)로 봄.
++ * 상해 포켓 = 선소프트(0x0C) · 흑백(0x00) · 0x01. 바뀐 롬(번역 등)도 머리는 그대로라 체크섬은 안 봄. */
++static bool exactSerialGame(const uint8_t *data, size_t size)
++{
++   const uint8_t *h;
++
++   if (!data || size < 65536)
++      return false;
++   h = data + size - 10;
++   return h[0] == 0x0C && h[1] == 0x00 && h[2] == 0x01;
++}
++
+ bool retro_load_game(const struct retro_game_info *game)
+ {
+    const char *value;
+@@ -1073,11 +1102,16 @@
+       return false;
+    }
+ 
+-   /* 1P 는 예전처럼 세로 귀선에서 장 끝. 2P 는 half 일 때만 박자 반 장 어긋나게(same · link off = 0010 그대로) */
++   /* 1P 는 예전처럼 세로 귀선에서 장 끝. 2P 는 half 일 때만 박자 반 장 어긋나게(same · link off = 0010 그대로)
++    * 1.8: 상해 포켓(두 대)은 '상해 포켓 모드' — 직렬 정확한 시각 · 인터럽트 높은 번호부터 · 박자 half(옵션과 상관없이).
++    * 상태 크기를 재기 전에 정함. 그 밖의 게임 · 혼자 = 1.7 그대로 */
++   linkExact = linkOn && exactSerialGame(game->data, game->size);
+    value = getVariable("wswan_dual_link_phase");
+-   phaseHalf = linkOn && value && !strcmp(value, "half");
++   phaseHalf = linkOn && ((value && !strcmp(value, "half")) || linkExact);
+    inner[0].set_frame_end(-1);
+    inner[1].set_frame_end(phaseHalf ? DUAL_P2_FRAME_END : -1);
++   inner[0].set_link_exact(linkExact);
++   inner[1].set_link_exact(linkExact);
+ 
+    innerSize = inner[0].serialize_size();
+    sizeB = inner[1].serialize_size();
+@@ -1119,8 +1153,9 @@
+    stats.linkOn = linkOn;
+    stats.screen = (uint32_t)shown;
+    gameLoaded = true;
+-   dual_log(RETRO_LOG_INFO, "켬: 원더스완 %s, 화면 %dP, 세이브 %u 바이트, 상태 %u 바이트",
++   dual_log(RETRO_LOG_INFO, "켬: 원더스완 %s%s, 화면 %dP, 세이브 %u 바이트, 상태 %u 바이트",
+          !linkOn ? "한 대(link off)" : phaseHalf ? "두 대(통신 케이블 연결, 박자 half)" : "두 대(통신 케이블 연결)",
++         linkExact ? " · 상해 포켓 모드(직렬 정확한 시각 · 인터럽트 높은 번호부터 · 박자 half)" : "",
+          shown + 1,
+          (unsigned)saveSize, (unsigned)retro_serialize_size());
+    return true;
+diff -ruN src_fix/libretro.c src_ws18/libretro.c
+--- src_fix/libretro.c	2026-10-21 10:56:14.208357787 +0900
++++ src_ws18/libretro.c	2026-10-21 22:29:49.971431381 +0900
+@@ -1660,7 +1660,15 @@
+ 
+ void hb_ws_link_give(unsigned v)
+ {
+-   Comm_LinkGive((uint8)v);
++   Comm_LinkGive(v);
++}
++
++/* 한방 10/21(1.8): 상해 포켓 두 대 모드 켜기(두 대 앞단이 게임을 불러올 때) —
++ * 직렬 정확한 시각(comm.c) + 인터럽트 높은 번호부터(interrupt.c). 끄면 1.7 과 같음 */
++void hb_ws_set_link_exact(int on)
++{
++   Comm_SetExact(on != 0);
++   WSwan_InterruptSetHighFirst(on != 0);
+ }
+ 
+ void hb_ws_link_stats(uint32_t *out, unsigned n)
+diff -ruN src_fix/mednafen/wswan/comm.c src_ws18/mednafen/wswan/comm.c
+--- src_fix/mednafen/wswan/comm.c	2026-10-21 19:26:32.044096096 +0900
++++ src_ws18/mednafen/wswan/comm.c	2026-10-21 22:29:49.971431381 +0900
+@@ -38,7 +38,15 @@
+  *  - 전송 중인 바이트 · 남은 사이클 · 넘겨줄 바이트까지 모두 상태 저장에 들어감
+  *    (넷플레이 되감기 · 런어헤드에서 같은 결과).
+  * 상대가 없으면(한 대짜리 코어) 보낸 바이트는 그냥 사라지고 아무것도 안 옴 —
+- * 예전과 같은 '혼자' 동작. */
++ * 예전과 같은 '혼자' 동작.
++ *
++ * 1.8(10/21) 정확한 시각(Comm_SetExact, 두 대 앞단이 상해 포켓에만 켬): 위 방식은 바이트가
++ * '다 나간' 줄의 다음 줄 시작에야 나감이 되고 앞단은 그 줄이 끝난 뒤 넘겨서, 상대가 받는 때가
++ * 쓴 때부터 1056~1311사이클(실물 800 · 38400bps)이었음. 정확한 시각에서는 0xB1 에 쓰는 순간
++ * 바이트를 '도착 예정(쓴 줄 시작부터 사이클)'과 함께 앞단에 넘기고, 받는 쪽은 그 사이클에 CPU
++ * 반복(v30mz.c)이 수신 버퍼를 채움(HLT 중이어도 그때 깸). 보낸 쪽 '송신 비어 있음'도 정확히
++ * 800(9600bps = 3200)사이클 뒤. 꺼져 있으면(기본) 1.7 과 같은 길 · 같은 상태 바이트이고,
++ * 켜져 있으면 상태에 'HBCX' 덩어리(오는 중인 바이트)가 더 붙음. */
+ 
+ #include <stdio.h>
+ #include <string.h>
+@@ -65,6 +73,18 @@
+ static uint8 OutQ[COMM_OUTQ];
+ static uint8 OutCount;
+ 
++/* 1.8 정확한 시각 */
++#define COMM_INQ 8
++static bool Exact;
++static int32 OutDue[COMM_OUTQ];   /* 넘길 바이트의 도착 예정(쓴 줄 시작부터 사이클) */
++static uint8 InQ[COMM_INQ];       /* 오는 중인 바이트 */
++static int32 InDue[COMM_INQ];     /* 이 줄 시작부터 도착까지 사이클 */
++static uint8 InCount;
++uint32 Comm_EventTS;              /* CPU 반복이 보는 다음 직렬 일 시각(v30mz_timestamp, 이 줄 기준) */
++bool Comm_EventOn;
++static void Arrive(uint8 V);
++static void Recalc(void);
++
+ /* 통계(시험용 · 상태 저장 안 함 · 에뮬 결과에 영향 없음) */
+ static uint32 StatSent, StatRecv, StatOverrun, StatLost, StatTxIgnored;
+ 
+@@ -118,16 +138,79 @@
+    Overrun     = false;
+    LineStartTS = v30mz_timestamp;
+    OutCount    = 0;
++   InCount     = 0;
++   Comm_EventOn = false;
+ 
+    UpdateIRQ();
+ }
+ 
++/* 1.8: 정확한 시각 켜기 · 끄기(게임을 불러올 때 두 대 앞단이 부름) */
++void Comm_SetExact(bool on)
++{
++   Exact        = on;
++   InCount      = 0;
++   Comm_EventOn = false;
++   if(Exact)
++      Recalc();
++}
++
++/* 1.8: 다음 직렬 일(송신 끝 · 바이트 도착) 시각 */
++static void Recalc(void)
++{
++   int32 best = 0x7FFFFFFF;
++   unsigned i;
++
++   if(SendBusy && SendRemain < best)
++      best = SendRemain;
++   for(i = 0; i < InCount; i++)
++      if(InDue[i] < best)
++         best = InDue[i];
++   Comm_EventOn = Exact && best != 0x7FFFFFFF;
++   Comm_EventTS = LineStartTS + (uint32)(best > 0 ? best : 0);
++}
++
++/* 1.8: CPU 가 다음 일 시각에 닿으면 부름(줄 시작에도): 송신 끝 → 송신 비어 있음 · 예정된 바이트 도착 */
++void Comm_Event(void)
++{
++   int32 rel = (int32)(v30mz_timestamp - LineStartTS);
++
++   if(SendBusy && SendRemain <= rel)
++   {
++      SendBusy = false;
++      StatSent++;
++      UpdateIRQ();
++   }
++   while(InCount && InDue[0] <= rel)
++   {
++      uint8 V = InQ[0];
++
++      InCount--;
++      memmove(&InQ[0], &InQ[1], InCount);
++      memmove(&InDue[0], &InDue[1], InCount * sizeof(InDue[0]));
++      Arrive(V);
++   }
++   Recalc();
++}
++
+ /* wsExecuteLine() 이 줄마다 CPU 를 돌리기 전에 부름. 한 줄 = 256 사이클
+  * (CPU 가 넘겨 쓴 사이클은 다음 줄에서 빠지므로 평균은 정확히 256). */
+ void Comm_Process(void)
+ {
+    LineStartTS = v30mz_timestamp;
+ 
++   if(Exact)
++   {
++      unsigned i;
++
++      /* 남은 사이클을 이 줄 시작 기준으로 · 이미 닿은 것은 지금 처리 · 이 줄 안의 다음 일 시각 */
++      if(SendBusy)
++         SendRemain -= 256;
++      for(i = 0; i < InCount; i++)
++         InDue[i] -= 256;
++      Comm_Event();
++      return;
++   }
++
+    if(SendBusy)
+    {
+       SendRemain -= 256;
+@@ -182,6 +265,17 @@
+          SendBusy   = true;
+          /* 이 줄 안에서 이미 지난 사이클만큼 더해, 다음 줄들에서 256 씩 뺌 */
+          SendRemain = ByteCycles() + (int32)(v30mz_timestamp - LineStartTS);
++         if(Exact)
++         {
++            /* 1.8: 쓰는 순간 앞단에 넘김 — 상대는 (이 줄 시작부터) SendRemain 사이클에 받음 */
++            if(OutCount < COMM_OUTQ)
++            {
++               OutQ[OutCount]   = V;
++               OutDue[OutCount] = SendRemain;
++               OutCount++;
++            }
++            Recalc();
++         }
+       }
+       else
+          StatTxIgnored++;
+@@ -208,7 +302,8 @@
+    UpdateIRQ();
+ }
+ 
+-/* 앞단(두 대 묶는 쪽): 다 보낸 바이트 하나 꺼내기. 없으면 -1. */
++/* 앞단(두 대 묶는 쪽): 다 보낸 바이트 하나 꺼내기. 없으면 -1.
++ * 1.8 정확한 시각이면 위 비트에 도착 예정(쓴 줄 시작부터 사이클)을 붙임: 바이트 | (예정 << 8). */
+ int Comm_LinkTake(void)
+ {
+    int ret;
+@@ -217,15 +312,48 @@
+       return -1;
+ 
+    ret = OutQ[0];
++   if(Exact)
++      ret |= OutDue[0] << 8;
+    OutCount--;
+    if(OutCount)
++   {
+       memmove(&OutQ[0], &OutQ[1], OutCount);
++      memmove(&OutDue[0], &OutDue[1], OutCount * sizeof(OutDue[0]));
++   }
+ 
+    return ret;
+ }
+ 
+-/* 앞단: 상대가 보낸 바이트가 선을 타고 도착함. */
+-void Comm_LinkGive(uint8 V)
++/* 앞단: 상대가 보낸 바이트(아래 8비트). 위 비트 = 도착 예정(1.8 정확한 시각, 상대가 쓴 줄 시작부터 —
++ * 그 줄은 두 기계가 방금 같이 끝낸 줄이라 이쪽의 지금 줄 기준과 같음). 없거나 끔 = 지금 도착(1.7). */
++void Comm_LinkGive(unsigned packed)
++{
++   uint8 V = packed & 0xFF;
++   int32 due = (int32)(packed >> 8);
++
++   if(!Exact || due <= 0)
++   {
++      Arrive(V);
++      return;
++   }
++   if(InCount == COMM_INQ)
++   {
++      /* 가득(한 기계만 도는 장 등): 가장 먼저 온 것을 지금 도착시켜 자리 만듦 */
++      uint8 first = InQ[0];
++
++      InCount--;
++      memmove(&InQ[0], &InQ[1], InCount);
++      memmove(&InDue[0], &InDue[1], InCount * sizeof(InDue[0]));
++      Arrive(first);
++   }
++   InQ[InCount]  = V;
++   InDue[InCount] = due;
++   InCount++;
++   Recalc();
++}
++
++/* 바이트가 선을 타고 도착함(1.7 의 Comm_LinkGive 본문 그대로). */
++static void Arrive(uint8 V)
+ {
+    if(!(Control & 0x80))
+    {
+@@ -292,12 +420,32 @@
+    if(!MDFNSS_StateAction(sm, load, data_only, StateRegs, "COMM", false))
+       return 0;
+ 
++   /* 1.8 정확한 시각일 때만 덩어리 하나 더(끄면 1.7 과 같은 상태 바이트) */
++   if(Exact)
++   {
++      SFORMAT ExactRegs[] =
++      {
++         SFARRAY32N(OutDue, COMM_OUTQ, "OutDue"),
++         SFARRAYN(InQ, COMM_INQ, "InQ"),
++         SFARRAY32N(InDue, COMM_INQ, "InDue"),
++         SFVARN(InCount, "InCount"),
++         { 0, 0, 0, 0 }
++      };
++
++      if(!MDFNSS_StateAction(sm, load, data_only, ExactRegs, "HBCX", false))
++         return 0;
++   }
++
+    if(load)
+    {
+       Control &= 0xC0;
+       if(OutCount > COMM_OUTQ)
+          OutCount = COMM_OUTQ;
++      if(InCount > COMM_INQ)
++         InCount = COMM_INQ;
+       UpdateIRQ();
++      if(Exact)
++         Recalc();
+    }
+ 
+    return 1;
+diff -ruN src_fix/mednafen/wswan/comm.h src_ws18/mednafen/wswan/comm.h
+--- src_fix/mednafen/wswan/comm.h	2026-10-21 22:29:49.971431381 +0900
++++ src_ws18/mednafen/wswan/comm.h	2026-10-21 22:29:49.971431381 +0900
+@@ -16,7 +16,12 @@
+ 
+ /* 한방 10/20: 두 대 잇기 — 다 보낸 바이트 꺼내기(-1 = 없음) · 상대 바이트 받기 · 시험용 통계 */
+ int Comm_LinkTake(void);
+-void Comm_LinkGive(uint8 V);
++void Comm_LinkGive(unsigned packed);
++/* 1.8 정확한 시각(두 대 앞단이 게임을 불러올 때 켬) · CPU 반복이 보는 다음 일 */
++void Comm_SetExact(bool on);
++void Comm_Event(void);
++extern uint32 Comm_EventTS;
++extern bool Comm_EventOn;
+ void Comm_GetStats(uint32 *out, unsigned n);
+ void Comm_SetTrace(int on, const char *tag);
+ void Comm_TraceIRQ(const char *what, unsigned a, unsigned v);
+diff -ruN src_fix/mednafen/wswan/interrupt.c src_ws18/mednafen/wswan/interrupt.c
+--- src_fix/mednafen/wswan/interrupt.c	2026-10-21 22:29:49.971431381 +0900
++++ src_ws18/mednafen/wswan/interrupt.c	2026-10-21 22:29:49.971431381 +0900
+@@ -18,9 +18,17 @@
+ static uint32 IOn_Which;
+ static uint32 IVector_Cache;
+ 
++/* 1.8(상해 포켓 · 두 대 앞단이 켬): 여럿이 걸려 있으면 번호가 높은 것부터(ares · Mesen2 와 같음 —
++ * 7 가로 타이머 · 6 세로 귀선 … 0 송신). 끄면(기본) 예전처럼 낮은 번호부터(1.7 과 같음).
++ * 근거(10/21): 송신을 폴링으로 끝낸 기계에 이미 읽어 비운 수신 인터럽트(3)가 걸린 채 세로 귀선(6)이
++ * 겹치면, 낮은 번호부터는 헛 수신 처리기(약 3200사이클 IF=0)가 세로 귀선을 밀어 다음 바이트 응답이 늦었음. */
++static bool HighFirst;
++
++void WSwan_InterruptSetHighFirst(bool on);
++
+ static void RecalcInterrupt(void)
+ {
+-   unsigned i;
++   unsigned n;
+ 
+    IStatus |= (IAsserted & LevelTriggeredMask) & IEnable;
+ 
+@@ -28,8 +36,10 @@
+    IOn_Which     = 0;
+    IVector_Cache = 0;
+ 
+-   for(i = 0; i < 8; i++)
++   for(n = 0; n < 8; n++)
+    {
++      unsigned i = HighFirst ? 7 - n : n;
++
+       if(IStatus & IEnable & (1 << i))
+       {
+          IOn_Cache     = true;
+@@ -40,6 +50,12 @@
+    }
+ }
+ 
++void WSwan_InterruptSetHighFirst(bool on)
++{
++   HighFirst = on;
++   RecalcInterrupt();
++}
++
+ void WSwan_InterruptAssert(int which, bool asserted)
+ {
+    uint8 prev_IAsserted = IAsserted;
+diff -ruN src_fix/mednafen/wswan/interrupt.h src_ws18/mednafen/wswan/interrupt.h
+--- src_fix/mednafen/wswan/interrupt.h	2026-10-21 22:29:49.971431381 +0900
++++ src_ws18/mednafen/wswan/interrupt.h	2026-10-21 22:29:49.971431381 +0900
+@@ -27,6 +27,7 @@
+ void WSwan_InterruptCheck(void);
+ int WSwan_InterruptStateAction(StateMem *sm, int load, int data_only);
+ void WSwan_InterruptReset(void);
++void WSwan_InterruptSetHighFirst(bool on);
+ 
+ #ifdef __cplusplus
+ }
+diff -ruN src_fix/mednafen/wswan/v30mz.c src_ws18/mednafen/wswan/v30mz.c
+--- src_fix/mednafen/wswan/v30mz.c	2026-10-21 20:03:30.740959884 +0900
++++ src_ws18/mednafen/wswan/v30mz.c	2026-10-21 22:29:49.971431381 +0900
+@@ -34,6 +34,7 @@
+ #include "wswan-memory.h"
+ 
+ #include "v30mz.h"
++#include "comm.h"
+ 
+ #include "../state_inline.h"
+ 
+@@ -641,11 +642,27 @@
+    I.sregs[PS] = (uint16)dest_seg;
+ }
+ 
++/* 1.8: HLT 중에도 이번 조각 안의 직렬 일(정확한 시각) 시각에 처리 — 바이트 도착 인터럽트로 깸.
++ * 정확한 시각이 꺼져 있으면 Comm_EventOn 이 늘 거짓이라 아무것도 안 함(1.7 과 같음). */
++static void HltSerialWait(void)
++{
++   while(InHLT && Comm_EventOn && (int32)(Comm_EventTS - v30mz_timestamp) < v30mz_ICount)
++   {
++      int32 d = (int32)(Comm_EventTS - v30mz_timestamp);
++
++      if(d > 0)
++         CLK(d);
++      Comm_Event();
++      WSwan_InterruptCheck();
++   }
++}
++
+ static bool CheckInHLT(void)
+ {
+    if(InHLT)
+    {
+       WSwan_InterruptCheck();
++      HltSerialWait();
+       if(InHLT)
+       {
+          int32 tmp = v30mz_ICount;
+@@ -1466,6 +1483,7 @@
+    if(InHLT)
+    {
+       WSwan_InterruptCheck();
++      HltSerialWait();
+       if(InHLT)
+       {
+          int32 tmp = v30mz_ICount;
+@@ -1481,6 +1499,9 @@
+    {
+       int32 before = v30mz_ICount;
+ 
++      /* 1.8 정확한 시각: 직렬 일(송신 끝 · 바이트 도착) 시각에 닿았으면 먼저 처리 */
++      if(Comm_EventOn && (int32)(v30mz_timestamp - Comm_EventTS) >= 0)
++         Comm_Event();
+       WSwan_InterruptCheck();
+ 
+       DoOP(FETCHOP);

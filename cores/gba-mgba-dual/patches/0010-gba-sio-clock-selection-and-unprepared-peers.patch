@@ -1,0 +1,115 @@
+Subject: GBA SIO: honor clock selection and ignore unarmed peers
+Series-Step: 10/19 (mgba_dual 1.6-os4)
+Origin: hanbang (this project)
+요약: SIOCNT 의 클록 · 전송 속도 비트를 먼저 반영한 뒤 전송을 시작하고, 아직 준비 안 한 상대는 건드리지 않음(젤다 · 유희왕 등 통신 메뉴 정확도).
+
+Start transfers after committing the current SIOCNT clock/baud bits. Keep external-clock Normal transfers armed
+until a clock arrives, and keep MULTI child busy read-only. A queued start only clocks peers in the same mode (and armed
+external receivers in Normal mode). Reset a participating MULTI child's receive registers and avoid counting event
+lateness twice when scheduling its completion.
+
+No new serialized fields are introduced. This is a partial correctness fix, not a fix for the KOF EX2 phase-dependent
+disconnect (see 0016 for the SD line and start-bit handling).
+
+---
+diff --git a/src/gba/sio.c b/src/gba/sio.c
+index 22b79675e796..9f725d07add7 100644
+--- a/src/gba/sio.c
++++ b/src/gba/sio.c
+@@ -163,6 +163,7 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
+ 	int id = 0;
+ 	int connected = 0;
+ 	bool handled = false;
++	bool start = false;
+ 	if (sio->driver) {
+ 		handled = sio->driver->handlesMode(sio->driver, sio->mode);
+ 		if (handled) {
+@@ -197,9 +198,11 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
+ 				sio->p->memory.io[GBA_REG(SIOMULTI2)] = 0xFFFF;
+ 				sio->p->memory.io[GBA_REG(SIOMULTI3)] = 0xFFFF;
+ 				sio->rcnt = GBASIORegisterRCNTClearSc(sio->rcnt);
+-				_startTransfer(sio);
++				start = true;
+ 			} else {
+-				// TODO
++				// In MULTI a child's busy bit is driven by the parent's
++				// clock, not by writes to its own SIOCNT.
++				value = GBASIOMultiplayerClearBusy(value);
+ 			}
+ 		}
+ 		break;
+@@ -210,8 +213,11 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
+ 		if (GBASIONormalGetSc(value)) {
+ 			sio->rcnt = GBASIORegisterRCNTFillSc(sio->rcnt);
+ 		}
+-		if (GBASIONormalIsStart(value) && !GBASIONormalIsStart(sio->siocnt)) {
+-			_startTransfer(sio);
++		if (GBASIONormalIsStart(value) && !GBASIONormalIsStart(sio->siocnt)
++		    && GBASIONormalGetSc(value)) {
++			// An external-clock start only arms the shifter. Without
++			// an incoming clock it must remain busy, with no SIO IRQ.
++			start = true;
+ 		}
+ 		break;
+ 	default:
+@@ -236,6 +242,11 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
+ 		}
+ 	}
+ 	sio->siocnt = value;
++	if (start) {
++		// The driver and the completion timer must use this write's
++		// baud/clock selection, including a mode-and-start write.
++		_startTransfer(sio);
++	}
+ }
+ 
+ uint16_t GBASIOWriteRegister(struct GBASIO* sio, uint32_t address, uint16_t value) {
+diff --git a/src/gba/sio/lockstep.c b/src/gba/sio/lockstep.c
+index 55c9636f80da..94448c32b572 100644
+--- a/src/gba/sio/lockstep.c
++++ b/src/gba/sio/lockstep.c
+@@ -919,6 +919,7 @@ void _enqueueEvent(struct GBASIOLockstepCoordinator* coordinator, const struct G
+ }
+ 
+ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) {
++	UNUSED(cyclesLate);
+ 	struct GBASIOLockstepDriver* lockstep = context;
+ 	struct GBASIOLockstepCoordinator* coordinator = lockstep->coordinator;
+ 	MutexLock(&coordinator->mutex);
+@@ -993,11 +994,31 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 				mLOG(GBA_SIO, DEBUG, "Discarding stale transfer start from timestamp %X", event->timestamp);
+ 				break;
+ 			}
+-			_setData(coordinator, player->playerId, sio);
+-			nextEvent = _cycleDiff(event->finishCycle, GBASIOLockstepTime(player)) - cyclesLate;
+-			player->driver->d.p->siocnt |= 0x80;
+-			mTimingDeschedule(&sio->p->timing, &sio->completeEvent);
+-			mTimingSchedule(&sio->p->timing, &sio->completeEvent, nextEvent);
++			// Attachment alone does not connect a shifter. A unit in
++			// GPIO/another mode must not supply stale data or receive
++			// a phantom completion. Normal mode additionally requires
++			// an armed external-clock receiver.
++			bool participating = player->mode == coordinator->transferMode;
++			if (player->mode == GBA_SIO_NORMAL_8 || player->mode == GBA_SIO_NORMAL_32) {
++				participating = participating && GBASIONormalIsStart(sio->siocnt)
++				                && !GBASIONormalGetSc(sio->siocnt);
++			}
++			if (participating) {
++				_setData(coordinator, player->playerId, sio);
++				// CurrentTime already includes callback lateness. Do not
++				// subtract cyclesLate a second time from an absolute end.
++				nextEvent = _cycleDiff(event->finishCycle, GBASIOLockstepTime(player));
++				sio->siocnt |= 0x80;
++				if (player->mode == GBA_SIO_MULTI) {
++					int i;
++					for (i = 0; i < MAX_GBAS; ++i) {
++						sio->p->memory.io[GBA_REG(SIOMULTI0) + i] = 0xFFFF;
++					}
++					sio->rcnt = GBASIORegisterRCNTClearSc(sio->rcnt);
++				}
++				mTimingDeschedule(&sio->p->timing, &sio->completeEvent);
++				mTimingSchedule(&sio->p->timing, &sio->completeEvent, nextEvent);
++			}
+ 			GBASIOLockstepCoordinatorAckPlayer(coordinator, player);
+ 			break;
+ 		case SIO_EV_MODE_SET:

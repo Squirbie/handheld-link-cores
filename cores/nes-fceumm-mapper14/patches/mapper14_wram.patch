@@ -1,0 +1,19 @@
+--- a/src/mappers/mapper014.c	2026-10-12 08:43:10
++++ b/src/mappers/mapper014.c	2026-10-12 08:43:11
+@@ -98,11 +98,14 @@
+ 
+ static void UNLSL1632Power(void) {
+ 	GenMMC3Power();
+-	SetWriteHandler(0x4100, 0xFFFF, UNLSL1632CMDWrite);
++	/* hanbang: leave $6000-$7FFF to the work RAM handlers set by GenMMC3Power */
++	SetWriteHandler(0x4100, 0x5FFF, UNLSL1632CMDWrite);
++	SetWriteHandler(0x8000, 0xFFFF, UNLSL1632CMDWrite);
+ }
+ 
+ void UNLSL1632_Init(CartInfo *info) {
+-	GenMMC3_Init(info, 256, 512, 0, 0);
++	/* hanbang: 8KB work RAM at $6000 (Downtown Special Korean 512K/512K hack uses it; Mesen gives it too) */
++	GenMMC3_Init(info, 512, 512, 8, info->battery);
+ 	cwrap = UNLSL1632CW;
+ 	info->Power = UNLSL1632Power;
+ 	GameStateRestore = StateRestore;

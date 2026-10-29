@@ -1,0 +1,294 @@
+From 3ef18954a9d97a929541ed2b24b6fe392678dcfd Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Thu, 22 Oct 2026 01:04:32 +0900
+Subject: [PATCH 2/2] GG Dual: plain UART serial (NMI on RX-ready & enable
+ edge), same-frame press split for 2P, step test, stats (hanbang 10/22)
+
+---
+ dual/libretro_dual.c | 116 +++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 96 insertions(+), 20 deletions(-)
+
+diff --git a/dual/libretro_dual.c b/dual/libretro_dual.c
+index bb015ab..c0c57f4 100644
+--- a/dual/libretro_dual.c
++++ b/dual/libretro_dual.c
+@@ -7,10 +7,14 @@
+  *    붙여(objcopy) 전역 변수가 따로인 두 대.
+  *  - 한 장 안에서 두 기계를 '가로줄 하나씩' 번갈아 돌림(262줄). 줄 사이에서 케이블을 처리:
+  *      병렬(포트 0x01/0x02): 읽을 때마다 상대 출력 핀을 엇갈림(0<->2, 1<->3, 4<->5, 6<->6)으로 보여 줌.
+- *      직렬(포트 0x03~0x05): 보낸 바이트는 속도(4800/2400/1200/300bps, 10비트)만큼 줄이 지난 뒤
+- *      상대 받기 칸으로 — 상대가 아직 안 읽었으면 읽을 때까지 기다림(손 맞춤 · 바이트 안 버림).
+- *      상대가 받기를 켰고(비트5) NMI 허용(비트3)이면 그 기계 다음 줄 앞에서 NMI.
++ *      직렬(포트 0x03~0x05): 보통 UART — 보낸 바이트는 속도(4800/2400/1200/300bps, 10비트)만큼 줄이
++ *      지나면 보냄 비트(0)가 꺼지고 상대 받기 칸(포트 4)에 들어감(상대가 안 읽었으면 덮어씀). 상대가
++ *      받기(비트5)를 켰을 때만. NMI 선 = 받음(비트1) 그리고 NMI 허용(비트3) — 이 선이 0→1 이 되면
++ *      (바이트가 왔을 때 또는 받은 채로 NMI 를 켰을 때) 그 기계 다음 줄 앞에서 NMI 한 번.
+  *  - 0번 패드 = 1P 기계(방장), 1번 패드 = 2P 기계(손님). 보이는 화면 · 소리 = gg_dual_screen(에뮬엔 영향 없음).
++ *  - 같은 장 누름 풀기: 두 사람이 같은 장에 같은 버튼을 새로 누르면 2P 쪽만 1장 늦게 넣음(실제 두 기계는 박자가
++ *    늘 어긋나 있음 — 완전히 같은 박자면 소닉 드리프트 2 · 슈퍼 모나코 GP 등이 둘 다 1P 라고 여김). 입력에만
++ *    기대므로 넷플레이 두 기기가 같은 결과(값은 상태 저장의 케이블 칸에).
+  *  - gg_dual_link = off 면 2P 기계를 아예 안 돌리고 1P 는 원래 retro_run 그대로 = 원래 코어와 같은 그림 · 소리.
+  *  - 세이브: 1P = 보통 .srm(레트로아크가 RETRO_MEMORY_SAVE_RAM 으로) · 2P = <세이브 폴더>/<롬 이름>.p2.sav —
+  *    방장(1P 화면 · link on)만 읽고 씀(없으면 새 카트 = 1P 세이브를 복사하지 않음, 원칙 '각자 자기 세이브').
+@@ -145,6 +149,7 @@ struct LinkSide
+    uint8_t txByte;
+    uint8_t pendNmi;     /* 이 기계 다음 줄 앞에서 NMI */
+    uint8_t pc6Seen;     /* 이 기계 PC6 핀에 보인 마지막 값(병렬 NMI 가장자리) */
++   uint8_t nmiLevel;    /* 직렬 NMI 선 = 받음(비트1) 그리고 NMI 허용(비트3) — 0→1 일 때 NMI 한 번 */
+    uint32_t txLines;    /* 남은 줄 */
+ };
+ 
+@@ -152,7 +157,7 @@ struct DualStats
+ {
+    uint32_t magic, version, frames, linkOn, screen;
+    uint32_t bytes[2];        /* 1P→2P · 2P→1P 넘긴 바이트 */
+-   uint32_t waits[2];        /* 상대가 아직 안 읽어 기다린 줄 수 */
++   uint32_t waits[2];        /* 넘침: 상대가 앞 바이트를 안 읽은 채 새 바이트가 감(덮어씀) */
+    uint32_t drops[2];        /* 상대가 받기를 안 켜서 버린 바이트 */
+    uint32_t nmis[2];         /* 기계마다 받은 NMI(직렬) */
+    uint32_t parNmis[2];      /* 기계마다 받은 NMI(병렬 PC6) */
+@@ -161,6 +166,7 @@ struct DualStats
+    uint32_t p2Loaded, p2Writes;
+    uint32_t fbW, fbH;
+    uint32_t lastTx[2];       /* 마지막 보낸 바이트 */
++   uint32_t sameFrameSplits; /* 같은 장 누름을 2P 1장 미룸으로 푼 횟수 */
+ };
+ 
+ static retro_environment_t environCallback;
+@@ -175,10 +181,17 @@ static int screen;               /* 0 = 1P, 1 = 2P */
+ static bool loaded;
+ static uint32_t romHash;
+ static struct LinkSide side[2];
++/* 같은 장 누름 풀기(상태 저장에 들어감) */
++static uint16_t padPrev[2];      /* 지난 장 날 입력 */
++static uint16_t padDeferred;     /* 지난 장에 2P 에서 1장 미룬 비트 — 이번 장에 넣음 */
++static uint16_t padNow[2];       /* 이번 장 1P 날 입력 · 2P 실제로 넣는 입력 */
++static uint32_t sameFrameSplits; /* 미룬 횟수(통계) */
++static bool useBitmasks;
+ static struct DualStats stats;
+ static FILE *traceFile, *portLog;
+ static int parNmiOn = 1;         /* 병렬 PC6 NMI(시험용 GG_DUAL_PARNMI=0 으로 끔) */
+ static int byteLinesFixed;       /* 시험용 GG_DUAL_BYTE_LINES=<줄> — 0 이면 속도대로 */
++static int stepTest;             /* 시험용 GG_DUAL_STEPTEST=1: link off 에서도 줄 단위 길로(원래 retro_run 과 같은지 보기) */
+ 
+ /* 기계마다 화면 · 소리 받기 */
+ static uint16_t frameBuf[2][FB_W * FB_H];
+@@ -273,7 +286,9 @@ static bool innerEnvironment(int m, unsigned cmd, void *data)
+       case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
+       case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL:
+       case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
++#ifdef RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK
+       case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK:
++#endif
+       case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
+       case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
+       case RETRO_ENVIRONMENT_SET_CONTENT_INFO_OVERRIDE:
+@@ -365,9 +380,39 @@ static int16_t inputA(unsigned port, unsigned device, unsigned index, unsigned i
+ 
+ static int16_t inputB(unsigned port, unsigned device, unsigned index, unsigned id)
+ {
+-   if (!inputStateCallback || port != 0)
++   if (port != 0 || device != RETRO_DEVICE_JOYPAD || index != 0)
+       return 0;
+-   return inputStateCallback(1, device, index, id);
++   if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
++      return (int16_t)padNow[1];
++   return (int16_t)((padNow[1] >> id) & 1);
++}
++
++static uint16_t readPadRaw(unsigned port)
++{
++   uint16_t v = 0;
++   unsigned i;
++   if (!inputStateCallback)
++      return 0;
++   if (useBitmasks)
++      return (uint16_t)inputStateCallback(port, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
++   for (i = 0; i <= RETRO_DEVICE_ID_JOYPAD_R3; i++)
++      if (inputStateCallback(port, RETRO_DEVICE_JOYPAD, 0, i))
++         v |= (uint16_t)(1u << i);
++   return v;
++}
++
++/* 장 머리: 두 패드를 읽고, 같은 장에 같이 새로 누른 버튼은 2P 만 1장 미룸 */
++static void readPads(void)
++{
++   uint16_t raw1 = readPadRaw(0), raw2 = readPadRaw(1);
++   uint16_t both = (uint16_t)((raw1 & ~padPrev[0]) & (raw2 & ~padPrev[1]));
++   padNow[0] = raw1;
++   padNow[1] = (uint16_t)((raw2 & ~both) | padDeferred);
++   if (both)
++      sameFrameSplits++;
++   padDeferred = both;
++   padPrev[0] = raw1;
++   padPrev[1] = raw2;
+ }
+ 
+ static const char *getVar(const char *key)
+@@ -465,16 +510,27 @@ static void linkTx(void *ctx, uint8_t data)
+    r[5] |= 0x01;
+ }
+ 
++/* 직렬 NMI 선(받음 · 허용)이 0→1 이면 다음 줄 앞에서 NMI */
++static void updateNmi(int m)
++{
++   const uint8_t *r = inner[m].io_reg();
++   uint8_t level = (uint8_t)((r[5] & 0x0A) == 0x0A);
++   if (level && !side[m].nmiLevel)
++      side[m].pendNmi = 1;
++   side[m].nmiLevel = level;
++}
++
+ static void linkRxRead(void *ctx)
+ {
+    int m = (int)(intptr_t)ctx;
+    inner[m].io_reg()[5] &= (uint8_t)~0x02;
++   updateNmi(m);
+ }
+ 
+ static void linkCtrl(void *ctx)
+ {
+    int m = (int)(intptr_t)ctx;
+-   (void)m;
++   updateNmi(m);
+ }
+ 
+ static const struct hb_gg_link_ops linkOps[2] = {
+@@ -497,26 +553,20 @@ static void tickTx(int m)
+    side[m].txLines = 0;
+    r = inner[m].io_reg();
+    ro = inner[o].io_reg();
++   /* 다 보냄 → 보냄 비트 끔 */
++   side[m].txActive = 0;
++   r[5] &= (uint8_t)~0x01;
+    if (!(ro[5] & 0x20))
+    {
+       /* 상대 받기 꺼짐 → 선 위로 나가고 사라짐 */
+-      side[m].txActive = 0;
+-      r[5] &= (uint8_t)~0x01;
+       stats.drops[m]++;
+       return;
+    }
+    if (ro[5] & 0x02)
+-   {
+-      /* 상대가 앞 바이트를 아직 안 읽음 → 기다림(손 맞춤) */
+-      stats.waits[m]++;
+-      return;
+-   }
++      stats.waits[m]++;       /* 넘침: 상대가 앞 바이트를 아직 안 읽음 → 덮어씀 */
+    ro[4] = side[m].txByte;
+    ro[5] |= 0x02;
+-   if (ro[5] & 0x08)
+-      side[o].pendNmi = 1;
+-   side[m].txActive = 0;
+-   r[5] &= (uint8_t)~0x01;
++   updateNmi(o);
+    stats.bytes[m]++;
+ }
+ 
+@@ -683,6 +733,7 @@ void retro_init(void)
+    const char *e;
+    int m;
+    logCallback = (environCallback && environCallback(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log)) ? log.log : NULL;
++   useBitmasks = environCallback && environCallback(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL);
+    if (environCallback)
+       environCallback(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &quirks);
+    e = getenv("GG_DUAL_TRACE");
+@@ -695,6 +746,8 @@ void retro_init(void)
+    parNmiOn = !(e && !strcmp(e, "0"));
+    e = getenv("GG_DUAL_BYTE_LINES");
+    byteLinesFixed = (e && e[0]) ? atoi(e) : 0;
++   e = getenv("GG_DUAL_STEPTEST");
++   stepTest = (e && !strcmp(e, "1"));
+    for (m = 0; m < 2; m++)
+    {
+       inner[m].set_video_refresh(m ? videoB : videoA);
+@@ -767,8 +820,13 @@ bool retro_load_game(const struct retro_game_info *info)
+ 
+    memset(&stats, 0, sizeof(stats));
+    memset(side, 0, sizeof(side));
++   memset(padPrev, 0, sizeof(padPrev));
++   memset(padNow, 0, sizeof(padNow));
++   padDeferred = 0;
++   sameFrameSplits = 0;
+    stats.magic = 0x47474444; /* 'GGDD' */
+    stats.version = 1;
++   stats.screen = (uint32_t)screen;
+    p2SavePath[0] = '\0';
+ 
+    if (!inner[0].load_game(info))
+@@ -878,7 +936,15 @@ void retro_run(void)
+    inputPollCallback();
+    soundFrames[0] = soundFrames[1] = 0;
+ 
+-   if (!linkOn)
++   if (!linkOn && stepTest && inner[0].is_8bit())
++   {
++      int done = 0, lines = 0;
++      inner[0].frame_begin();
++      while (!done && ++lines < 4096)
++         done = inner[0].run_line();
++      inner[0].frame_end();
++   }
++   else if (!linkOn)
+    {
+       /* 혼자: 원래 Genesis Plus GX 의 retro_run 그대로 */
+       inner[0].run();
+@@ -886,6 +952,7 @@ void retro_run(void)
+    else
+    {
+       int doneA = 0, doneB = 0, lines = 0;
++      readPads();
+       inner[0].frame_begin();
+       inner[1].frame_begin();
+       while ((!doneA || !doneB) && ++lines < 4096)
+@@ -916,9 +983,10 @@ void retro_run(void)
+    sendAudio(soundBuf[shown], soundFrames[shown]);
+ 
+    stats.frames++;
++   stats.sameFrameSplits = sameFrameSplits;
+    if (traceFile && stats.frames % 60 == 0)
+    {
+-      fprintf(traceFile, "f=%u 넘김 1P->2P %u 2P->1P %u 기다림 %u/%u 버림 %u/%u NMI %u/%u 병렬NMI %u/%u 밖에서온상태 %u\n",
++      fprintf(traceFile, "f=%u 넘김 1P->2P %u 2P->1P %u 넘침 %u/%u 버림 %u/%u NMI %u/%u 병렬NMI %u/%u 밖에서온상태 %u\n",
+             stats.frames, stats.bytes[0], stats.bytes[1], stats.waits[0], stats.waits[1], stats.drops[0], stats.drops[1],
+             stats.nmis[0], stats.nmis[1], stats.parNmis[0], stats.parNmis[1], stats.outsideLoads);
+       fflush(traceFile);
+@@ -947,6 +1015,9 @@ static void putLink(uint8_t *p)
+ {
+    int m;
+    memset(p, 0, LINK_SIZE);
++   put32(p + 32, padPrev[0]);
++   put32(p + 36, padPrev[1]);
++   put32(p + 40, padDeferred);
+    for (m = 0; m < 2; m++)
+    {
+       uint8_t *q = p + m * 16;
+@@ -955,12 +1026,16 @@ static void putLink(uint8_t *p)
+       q[2] = side[m].pendNmi;
+       q[3] = side[m].pc6Seen;
+       put32(q + 4, side[m].txLines);
++      q[8] = side[m].nmiLevel;
+    }
+ }
+ 
+ static void getLink(const uint8_t *p)
+ {
+    int m;
++   padPrev[0] = (uint16_t)get32(p + 32);
++   padPrev[1] = (uint16_t)get32(p + 36);
++   padDeferred = (uint16_t)get32(p + 40);
+    for (m = 0; m < 2; m++)
+    {
+       const uint8_t *q = p + m * 16;
+@@ -969,6 +1044,7 @@ static void getLink(const uint8_t *p)
+       side[m].pendNmi = q[2];
+       side[m].pc6Seen = q[3];
+       side[m].txLines = get32(q + 4);
++      side[m].nmiLevel = q[8];
+    }
+ }
+ 
+-- 
+2.53.0
+

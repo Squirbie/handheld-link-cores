@@ -1,0 +1,1552 @@
+Subject: Gambatte link cable + infrared over RetroArch netplay, all five patches in one (v5irh3)
+Series-Step: all-in-one (gambatte link v5irh3)
+Origin: hanbang (this project); apply to libretro/gambatte-libretro 4041d5a6c474d2d01b4cb1e81324b06b51d0147b (tree a28a8644a1c4)
+요약: 0001 ~ 0005 를 차례로 얹은 결과와 바이트까지 같은 한 덩어리 패치. 개별 패치와 함께 쓰지 말 것(둘 중 하나만).
+
+---
+diff --git a/libgambatte/libretro/hb_netpacket_serial.h b/libgambatte/libretro/hb_netpacket_serial.h
+new file mode 100644
+index 000000000000..5d57b2303cc7
+--- /dev/null
++++ b/libgambatte/libretro/hb_netpacket_serial.h
+@@ -0,0 +1,1048 @@
++#ifndef HB_NETPACKET_SERIAL_H
++#define HB_NETPACKET_SERIAL_H
++
++/* Hanbang pack (2026-10-08): Game Boy link cable over RetroArch netplay.
++ *
++ * With this, link games (Pokemon trades and battles, 2P Tetris, ...) connect
++ * the same way as GBA (gpSP) and DS (melonDS DS): one player hosts a netplay
++ * room, the other joins it. Each side keeps running its own game and save; only
++ * the serial bytes travel, as RetroArch "netpacket" packets.
++ *
++ * The exchange follows NetSerial (net_serial.cpp, the TCP 'GB Link' options):
++ * the side that starts a transfer with its internal clock sends its byte and
++ * waits for the next byte from the other side; a side waiting on the external
++ * clock answers a received byte with its own. Differences:
++ *  - a send gives up after HB_NP_TIMEOUT_MS and returns 0xFF ("nobody on the
++ *    cable"), as the netpacket API asks, instead of freezing forever. It also
++ *    tells the other side to drop that byte if it has not read it yet, and a
++ *    late answer to it is ignored, so the byte stream stays in step.
++ *  - only two players: a third one trying to join the room is refused.
++ *  - (2026-10-15) timing. Each Game Boy runs a whole frame in a burst and then
++ *    sleeps, so without help the waiting side sees the bytes of a transfer a
++ *    frame or more apart, and games with a time limit between bytes give up
++ *    (Yu-Gi-Oh! DM1, Metal Gear Ghost Babel VS battle). So each byte carries
++ *    the Game Boy time its sender let pass since its previous byte. The
++ *    waiting side guesses the next gap from the gaps so far (games repeat
++ *    them: one byte a frame, or a fixed round such as 3 bytes a frame), and
++ *    once that much of its own Game Boy time has passed after answering, it
++ *    waits for the next byte with its game paused (up to HB_NP_WAIT_MS). Both
++ *    games then see about the same gaps as on a cable. After the first byte,
++ *    or a gap not seen before, it waits after one 240 Hz timer tick at most.
++ *  - (2026-10-15) the other way round: a Game Boy that is behind the sender
++ *    (it waited for a byte that did not come, or found it already queued)
++ *    runs on until it reaches the time the byte was sent, then answers; the
++ *    sender is paused until then anyway. The gap is counted from the last byte
++ *    either way and sent as 32 bits (World Heroes 2 Jet: after the 4-second VS
++ *    screen the waiting side was 2 frames behind, answered from the wrong
++ *    screen and the game reset; during a fight it fell 2.8 frames behind in 43
++ *    bytes and reset when the round ended).
++ *  - (2026-10-15) startup uncertainty: the first byte is discovered by polling,
++ *    not at an independently scheduled cable edge. The full gap alone cannot
++ *    preserve the first byte phase relative to the receiving main loop. Use
++ *    a half normal-speed frame allowance ONCE, for the first short gap of
++ *    an incoming run. Preserve the rest of that gap; do not collapse it to
++ *    zero (Beach Volley needs its main loop to see the first byte). Subsequent
++ *    bytes and long gaps retain full catch-up, so no per-byte drift is added.
++ *    This is a bounded compatibility policy, not cycle-exact cable emulation.
++ *  - (2026-10-15) a byte that comes soon after one this side sent may only be
++ *    the other side's turn: when both send in turn (Tetris DX VS: one byte each
++ *    a frame), its next byte comes after this side's next one. So after such a
++ *    byte this side does not wait for another, and its gap is not used to guess
++ *    (the wait ran out every frame and slowed the hosting Game Boy to a third).
++ * Outside a netplay session nothing changes (the GB Link options still work). */
++
++#include <stddef.h>
++#include <stdint.h>
++#include <time.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <string.h>
++#include <libretro.h>
++#include <gambatte.h>
++#include "gambatte_log.h"
++
++#ifndef RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE
++#define RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE 78
++#define RETRO_NETPACKET_UNRELIABLE  0
++#define RETRO_NETPACKET_RELIABLE    (1 << 0)
++#define RETRO_NETPACKET_UNSEQUENCED (1 << 1)
++#define RETRO_NETPACKET_FLUSH_HINT  (1 << 2)
++#define RETRO_NETPACKET_BROADCAST 0xFFFF
++typedef void (RETRO_CALLCONV *retro_netpacket_send_t)(int flags, const void* buf, size_t len, uint16_t client_id);
++typedef void (RETRO_CALLCONV *retro_netpacket_poll_receive_t)();
++typedef void (RETRO_CALLCONV *retro_netpacket_start_t)(uint16_t client_id, retro_netpacket_send_t send_fn, retro_netpacket_poll_receive_t poll_receive_fn);
++typedef void (RETRO_CALLCONV *retro_netpacket_receive_t)(const void* buf, size_t len, uint16_t client_id);
++typedef void (RETRO_CALLCONV *retro_netpacket_stop_t)(void);
++typedef void (RETRO_CALLCONV *retro_netpacket_poll_t)(void);
++typedef bool (RETRO_CALLCONV *retro_netpacket_connected_t)(uint16_t client_id);
++typedef void (RETRO_CALLCONV *retro_netpacket_disconnected_t)(uint16_t client_id);
++struct retro_netpacket_callback
++{
++   retro_netpacket_start_t        start;
++   retro_netpacket_receive_t      receive;
++   retro_netpacket_stop_t         stop;
++   retro_netpacket_poll_t         poll;
++   retro_netpacket_connected_t    connected;
++   retro_netpacket_disconnected_t disconnected;
++   const char* protocol_version;
++};
++#endif
++
++#define HB_NP_PROTOCOL   "gambatte-hb-link-6"  /* v4bt: typed, generation-tagged cold-boot/reset barrier (v4bu: same wire format) */
++#define HB_NP_UNIT_LEN   25       /* type, seq(2), data, flags, gap(4), timestamp(8), own generation(4), peer generation(4), little endian */
++#define HB_NP_TIMEOUT_MS 5000    /* longest a send waits for the other Game Boy */
++#define HB_NP_QUEUE      1024    /* received units not read yet (power of two) */
++#define HB_NP_WAIT_MS    40      /* longest a waiting Game Boy stays paused for the byte it expects */
++#define HB_NP_GAP_UNIT   16      /* cycles per unit of the gap sent with a byte */
++#define HB_NP_GAP_NONE   0xFFFFFFFFu  /* first byte: nothing to count from */
++#define HB_NP_GAP_LONG   0xFFFF  /* units (about 15 frames): a gap this long starts a new run of bytes */
++#define HB_NP_STARTUP_SLACK 35112UL /* half a normal-speed frame; once per incoming run */
++#define HB_NP_SECOND_LONG 70224UL   /* v5irh2: cycles (a normal-speed frame): a gap this long before the second byte of a run
++                                  * means the sender waited for this side's game (see check()) */
++#define HB_NP_CATCHUP    2106720 /* cycles (30 frames): a Game Boy further behind the sender than this answers at once */
++#define HB_NP_LATE       140448  /* two frames of cycles: a byte later than this after its expected time is not waited for */
++#define HB_NP_HIST       16      /* gaps remembered to guess the next one */
++#define HB_NP_POLL_LATE  16512   /* v4bw: cycles (two 4128-cycle runs at double speed): a byte accepted at most this
++                                  * long after it was due counts as on time (the core only checks an armed port at its
++                                  * events, so a game polling RAM saw each byte up to a run late, and the lateness piled
++                                  * up: Bikkuri Nekketsu's waiting Game Boy slipped 9 lines a frame until a bank switch
++                                  * raced its LY 112 sound interrupt and it restarted) */
++#define HB_NP_UNARMED    140448  /* v4bw: cycles (two frames, one at double speed) a byte may wait while this side does not
++                                  * listen before it gets FF back (Monster Capsule GB calls with $60 every 16 frames and
++                                  * listens in between; held 5 s, its call crossed the other player's) */
++#define HB_NP_GAP_NEW    1088    /* units (17408 cycles, one 240 Hz timer tick): the most a waiting Game Boy runs on
++                                  * after the first byte of a transfer or after a gap it has not seen before, so it
++                                  * does not run ahead of a sender that sends again soon (Pokemon TCG: the receiver
++                                  * gives up after 4 ticks without a byte, the sender waits 20 ms once after $29/$12) */
++
++#define HB_NP_BOOT_WAIT_MS 20000UL
++/* v4bu (2026-10-18, device): a RetroArch CLIENT runs frames before its netpacket start() (the host does not),
++ * so v4bt never let the client into the cold barrier and both menus lost VERSUS. A Game Boy that ran less than
++ * this many frames since its ROM loaded (and loaded no state) now restarts itself into the cold barrier at start(),
++ * and a solo Game Boy restarts when a newly joined peer offers a cold boot (bounded = the three beatmania ROMs). */
++#define HB_NP_AUTO_COLD_RUNS 1800UL
++#define HB_NP_EV_LINKED 1
++#define HB_NP_EV_SOLO 2
++#define HB_NP_EV_PEER_JOIN 3
++
++/* Hanbang v5ir (2026-10-26): Game Boy Color infrared (RP, FF56) over the same netplay room.
++ * Each Game Boy keeps running its own game; while a game has its IR port on, each side sends
++ * reports (its own time in 4194304 Hz units, LED on/off, port on/off). When both ports are on,
++ * the two meet once (barrier: each stops at its next RP read until the other one's stop is
++ * known) and from then the two Game Boy times are tied. A Game Boy reading RP at time t sees the
++ * other LED as it was at t - HB_IR_LAG, and if the other side's reports do not reach that far
++ * yet, it waits there with its game paused (conservative lockstep, only while both ports are on).
++ * The lag is like a longer distance between the two: Pokemon Gold/Silver/Crystal Mystery Gift
++ * waits 256 timer ticks (11.7 ms) for each answer and measures bits by the time between edges,
++ * so a fixed 2 ms delay each way is still well inside it. Packets are 20 bytes ('I'), so cores
++ * without this ignore them (old cores never see light, as before). */
++#define HB_IR_LEN 20
++#define HB_IR_LAG_DEF 4096UL     /* units of 1/4194304 s: 0.98 ms seen-delay each way (Mystery Gift runs at
++                                  * double speed: 256 ticks = 16384 units for an answer, 3904 of them its own pause) */
++#define HB_IR_HOLD_DEF 128UL     /* units: a long pulse stays seen this long after it ends */
++#define HB_IR_HOLD_MIN 256UL     /* units: pulses at least this long linger (Mystery Gift hello: 320) */
++#define HB_IR_HOLD_READS 2       /* v5irh3: only a pulse the reader saw lit at most this many times lingers: Boku no
++                                  * Camp-jou counts its 288/928-unit bit pulses in 22-unit polls (12+ lit reads each) and
++                                  * the linger made them read as bad lengths; a Mystery Gift hello caught once still lingers */
++#define HB_IR_IDLE 140448UL      /* units (two frames): a port not read this long counts as not listening */
++#define HB_IR_WAIT_MS 3000UL     /* longest a Game Boy stays paused for the other's IR report */
++#define HB_IR_BARRIER_MS 1500UL  /* longest it waits at the meeting point */
++#define HB_IR_Q 16384            /* reports kept (power of two) */
++
++class NetpacketSerial : public gambatte::SerialIO
++{
++public:
++   NetpacketSerial() : send_fn_(NULL), poll_fn_(NULL), peer_(-1), is_host_(false),
++      seq_(0), head_(0), tail_(0), last_poll_ms_(0), clock_(0), last_xfer_clock_(0),
++      expect_(0), held_seq_(0x10000), hist_n_(0), after_send_(false), trace_(NULL), peer_clock_(0), sent_clock_(0), peer_seen_(false), sent_progress_(false), epoch_(0), epoch_set_(false), timing_(false), fresh_(true), boot_pending_(false), link_ready_(false), peer_boot_(false), generation_(0), peer_generation_(0), used_peer_generation_(0), peer_ack_(0), boot_reset_(false), peer_boot_reset_(false), boot_deadline_(0), boot_tx_ms_(0), runs_(0), auto_cold_(false), state_loaded_(false), event_(0), progressed_(false), ever_linked_(false), armed_clock_(0), late_(0), unarmed_from_(0), unarmed_seq_(0x10000), turn_seen_(false), frames_(0), first_frame_(0), frame_clock_(0), new_frame_(false) { irReset(); ir_lag_=HB_IR_LAG_DEF; ir_hold_=HB_IR_HOLD_DEF; ir_rdall_=false; ir_refresh_=NULL; ir_refresh_ms_=0; }
++
++   /* v4bv: automatic cold start is confined to the untouched startup window.
++    * Input delivered to a running game, a loaded state, or an established
++    * link closes that window. Explicit local reset remains user-authorized. */
++   void loaded() { fresh_=true; runs_=0; auto_cold_=false; state_loaded_=false; progressed_=ever_linked_=false; }
++   void noteInput(unsigned buttons) {
++      if (buttons && !waitingForBoot()) progressed_=true;
++   }
++   bool canAutoCold() const {
++      return !state_loaded_ && !progressed_ && !ever_linked_ && runs_ < HB_NP_AUTO_COLD_RUNS;
++   }
++   void stateLoaded() {
++      fresh_=false; state_loaded_=true; auto_cold_=false;
++      if (timeline() && started()) {
++         boot_pending_=false; link_ready_=false; clear();
++         if (peer_ >= 0) put('D',0,0,0,0);
++         debugState("state-loaded-link-suspended");
++      }
++   }
++   void localReset() {
++      debugState("before-local-reset");
++      clear();
++      if (timeline() && started()) {
++         ++generation_; if (!generation_) ++generation_;
++         boot_pending_=true; link_ready_=false; boot_reset_=true;
++         boot_deadline_=now_ms()+HB_NP_BOOT_WAIT_MS; boot_tx_ms_=0;
++      }
++      fresh_=true; runs_=0; progressed_=ever_linked_=false;
++      debugState("after-local-reset");
++   }
++   bool beforeRun() {
++      ++frames_; new_frame_ = true;   /* v5irh2: see check() */
++      bool run = beforeRunInner();
++      if (run && runs_ < 0xFFFFFFFFUL) ++runs_;
++      return run;
++   }
++   /* v4bu: the Game Boy was just reset (SRAM/RTC kept by the caller) to enter a cold barrier */
++   void coldRestarted() {
++      clear();
++      if (timeline() && started()) {
++         if (!fresh_) { ++generation_; if (!generation_) ++generation_; }
++         boot_pending_=true; link_ready_=false; boot_reset_=false;
++         boot_deadline_=now_ms()+HB_NP_BOOT_WAIT_MS; boot_tx_ms_=0;
++      }
++      fresh_=true; runs_=0;
++      debugState("auto-cold-restart");
++   }
++   bool takeAutoCold() { bool a=auto_cold_ && timeline() && started() && canAutoCold(); auto_cold_=false; return a; }
++   int takeEvent() { int e=event_; event_=0; return e; }
++   unsigned long bootLeftMs() const { if (!boot_pending_) return 0; unsigned long n=now_ms(); return boot_deadline_>n ? boot_deadline_-n : 0; }
++   bool beforeRunInner() {
++      if (!timeline() || !started() || !boot_pending_) { fresh_=false; return true; }
++      poll_fn_();
++      unsigned long now=now_ms();
++      if (now >= boot_deadline_) {
++         boot_pending_=false; link_ready_=false; fresh_=false;
++         if (peer_ >= 0) put('D',0,0,0,0);
++         debugState("boot-timeout-solo"); event_=HB_NP_EV_SOLO;
++         return true;
++      }
++      if (peer_ >= 0) {
++         if (!boot_tx_ms_ || now-boot_tx_ms_ >= 100) {
++            put('B',0,boot_reset_ ? 1 : 0,0,0); boot_tx_ms_=now;
++         }
++         if (peer_boot_ && peer_boot_reset_==boot_reset_ && peer_generation_ != used_peer_generation_ && peer_ack_==generation_) {
++            /* Cold-start readiness is NOT consent for a later explicit reset.
++             * Matching kinds prevents an old cold offer from releasing the
++             * first reset while the user is still resetting the other side.
++             * This last echo lets the other matching endpoint pass too. */
++            put('B',0,boot_reset_ ? 1 : 0,0,0);
++            used_peer_generation_=peer_generation_;
++            boot_pending_=false; link_ready_=true; fresh_=false; ever_linked_=true;
++            debugState("boot-release"); event_=HB_NP_EV_LINKED;
++            return true;
++         }
++      }
++      return false;
++   }
++   bool waitingForBoot() const { return timeline() && boot_pending_; }
++   void debugState(const char *why) {
++      if (trace_) fprintf(trace_, "STATE %s clock=%lu epoch=%llu epoch_set=%d peer_clock=%llu peer_seen=%d sent=%llu queue=%u expect=%lu held=%u hist=%u after_send=%d seq=%u gen=%u peer_gen=%u peer_ack=%u pending=%d ready=%d kind=%d peer_kind=%d\n",
++         why,clock_,(unsigned long long)epoch_,epoch_set_,(unsigned long long)peer_clock_,peer_seen_,(unsigned long long)sent_clock_,(tail_-head_)&(HB_NP_QUEUE-1),expect_,held_seq_,hist_n_,after_send_,seq_,generation_,peer_generation_,peer_ack_,boot_pending_,link_ready_,boot_reset_,peer_boot_reset_);
++   }
++
++   void setTiming(bool enabled) { if (!started()) timing_ = enabled; }
++
++   /* netplay session callbacks */
++   void start(uint16_t client_id, retro_netpacket_send_t send_fn, retro_netpacket_poll_receive_t poll_fn)
++   {
++      send_fn_ = send_fn;
++      poll_fn_ = poll_fn;
++      is_host_ = client_id == 0;
++      peer_    = is_host_ ? -1 : 0;     /* a client only talks to the host (id 0) */
++      clear();
++      /* Optional diagnostics, explicitly selected directory; no file writes by default. */
++      const char *trace_dir = getenv("HB_NP_TRACE_DIR");
++      if (!trace_dir && access("/tmp/hb_np_trace", W_OK) == 0) trace_dir = "/tmp/hb_np_trace"; /* device RAM, only if made by hand */
++      if (!trace_ && trace_dir) {
++         char path[1024]; snprintf(path, sizeof(path), "%s/np_%d.tsv", trace_dir, getpid());
++         trace_ = fopen(path, "a");
++         if (trace_)
++            setvbuf(trace_, NULL, _IOLBF, 0);
++      }
++      irReset();
++      { const char *lag=getenv("HB_IR_LAG"); ir_lag_ = lag && atol(lag) > 0 ? (unsigned long)atol(lag) : HB_IR_LAG_DEF; }
++      { const char *h=getenv("HB_IR_HOLD"); ir_hold_ = h ? (unsigned long)atol(h) : HB_IR_HOLD_DEF; }
++      ir_rdall_ = getenv("HB_IR_RDALL") != NULL;
++      generation_=1; peer_generation_=used_peer_generation_=peer_ack_=0;
++      peer_boot_=false; link_ready_=false; boot_reset_=peer_boot_reset_=false;
++      boot_pending_=timeline() && !state_loaded_ && !progressed_ && (fresh_ || canAutoCold());
++      auto_cold_=boot_pending_ && !fresh_;   /* v4bu: restart first, then wait (see HB_NP_AUTO_COLD_RUNS) */
++      boot_deadline_=now_ms()+HB_NP_BOOT_WAIT_MS; boot_tx_ms_=0;
++      tr("start", is_host_ ? 1 : 0, 0, 0);
++      debugState("session-start");
++   }
++   void stop()
++   {
++      tr("stop", 0, 0, 0);
++      irReset();
++      send_fn_ = NULL; poll_fn_ = NULL; peer_ = -1; clear();
++      boot_pending_=link_ready_=peer_boot_=false; auto_cold_=false;
++      if (trace_) { fclose(trace_); trace_ = NULL; }
++   }
++   bool started() const { return send_fn_ != NULL; }
++   bool connected(uint16_t client_id)
++   {
++      if (!is_host_ || peer_ >= 0)
++         return false;                  /* the cable has two ends */
++      peer_ = client_id;
++      clear(); irReset();
++      peer_generation_=used_peer_generation_=peer_ack_=0; peer_boot_=false; link_ready_=false;
++      debugState("transport-connected");
++      return true;
++   }
++   void disconnected(uint16_t client_id)
++   {
++      if (peer_ == (int)client_id) { peer_ = -1; clear(); irReset(); link_ready_=peer_boot_=false; debugState("transport-disconnected"); }
++   }
++   void receive(const void* buf, size_t len, uint16_t client_id)
++   {
++      const unsigned char* p = (const unsigned char*)buf;
++      if (len == HB_IR_LEN && p[0] == 'I') {   /* v5ir */
++         if (peer_ >= 0 && (int)client_id == peer_) irReceive(p);
++         return;
++      }
++      if (peer_ < 0 || (int)client_id != peer_ || len != (timeline() ? HB_NP_UNIT_LEN : 17))
++         return;
++      unsigned seq = p[1] | (p[2] << 8);
++      uint64_t at = 0;
++      for (unsigned i=0;i<8;i++) at |= (uint64_t)p[9+i] << (8*i);
++      if (((p[4] & 0x40) != 0) != timeline()) {
++         tr("mode-mismatch",seq,p[3],0);
++         return;
++      }
++      if (timeline()) {
++         uint32_t gen=0,ack=0;
++         for (unsigned i=0;i<4;++i) { gen|=(uint32_t)p[17+i]<<(8*i); ack|=(uint32_t)p[21+i]<<(8*i); }
++         if (p[0]=='B') {
++            if (gen < peer_generation_) { tr("stale-boot",gen,0,ack); return; }
++            if (gen != peer_generation_) {
++               if (link_ready_) { link_ready_=false; clear(); }
++               peer_generation_=gen; peer_boot_=true; peer_ack_=ack; peer_boot_reset_=p[3] != 0;
++               debugState("peer-boot");
++               if (boot_pending_) { put('B',0,boot_reset_ ? 1 : 0,0,0); boot_tx_ms_=now_ms(); }
++               else if (!peer_boot_reset_ && canAutoCold()) {
++                  /* A late peer may restart only untouched, unlinked startup.
++                   * Never discard player progress or restart an old session. */
++                  auto_cold_=true; event_=HB_NP_EV_PEER_JOIN; debugState("peer-cold-join");
++               }
++            } else { peer_ack_=ack; }
++            return;
++         }
++         if (p[0]=='D') {
++            if (gen >= peer_generation_) {
++               peer_generation_=gen; peer_boot_=false; link_ready_=false; clear();
++               debugState("peer-link-suspended");
++            }
++            return;
++         }
++         if ((!link_ready_ && !boot_pending_) || !peer_boot_ || gen!=peer_generation_ || ack!=generation_) {
++            tr("stale-generation",gen,p[3],ack); return;
++         }
++         if (!peer_seen_ || at > peer_clock_) peer_clock_ = at;
++         peer_seen_ = true;
++      }
++      if (p[0] == 'P') return;
++      if (p[0] == 'C') {                /* the sender gave up on that byte: drop it if still unread */
++         for (unsigned i = head_; i != tail_; i = (i + 1) & (HB_NP_QUEUE - 1))
++            if (q_[i].type == 'Q' && q_[i].seq == seq)
++               q_[i].type = 0;
++         return;
++      }
++      if (p[0] != 'Q' && p[0] != 'R')
++         return;
++      unsigned gap = (unsigned)p[5] | ((unsigned)p[6] << 8) | ((unsigned)p[7] << 16) | ((unsigned)p[8] << 24);
++      tr(p[0] == 'Q' ? "rxQ" : "rxR", seq, p[3], gap);
++      unsigned next = (tail_ + 1) & (HB_NP_QUEUE - 1);
++      if (next == head_)
++         return;                        /* cannot happen in practice: one byte waits for one answer */
++      q_[tail_].type = p[0];
++      q_[tail_].seq  = seq;
++      q_[tail_].data = p[3];
++      q_[tail_].flag = p[4];
++      q_[tail_].gap  = gap;
++      q_[tail_].at = at;
++      tail_ = next;
++   }
++
++   /* gambatte::SerialIO */
++   virtual void setClock(unsigned long cycles) {
++      if (timeline() && epoch_set_ && cycles < epoch_) {
++         /* Never let an unannounced time rewind become UINT64_MAX lead. */
++         debugState("clock-rewind-link-suspended");
++         link_ready_=false; clear();
++         if (started() && peer_ >= 0) put('D',0,0,0,0);
++      }
++      clock_ = timeline() && epoch_set_ ? cycles - epoch_ : cycles;
++      if (new_frame_) { new_frame_ = false; frame_clock_ = clock_; }   /* v5irh2: first time seen in this frame */
++   }
++
++   virtual void setArmed(unsigned long cycles) { armed_clock_ = cycles; }
++   virtual unsigned long lateCycles() { unsigned long l = late_; late_ = 0; return l; }
++
++   virtual unsigned char send(unsigned char data, bool fastCgb)
++   {
++      if (timeline()) return time_send(data, fastCgb);
++      if (!active())
++         return 0xFF;                   /* nobody on the other end yet */
++      unsigned seq = seq_ = (seq_ + 1) & 0xFFFF;
++      unsigned gap = HB_NP_GAP_NONE;
++      if (last_xfer_clock_ && clock_ >= last_xfer_clock_ && (clock_ - last_xfer_clock_) / HB_NP_GAP_UNIT < HB_NP_GAP_NONE)
++         gap = (unsigned)((clock_ - last_xfer_clock_) / HB_NP_GAP_UNIT);
++      last_xfer_clock_ = clock_;        /* this Game Boy is paused until the answer: the next gap counts from here */
++      if (after_send_)
++         turn_seen_ = false;            /* v4bw: it did not answer our last byte with one of its own */
++      /* v4bw: sending now. If the other side answered our last byte with a byte of its own
++       * (Monster Capsule GB: the two take turns as master, and the one listening gives up after
++       * 262144 cycles), stop and wait for that byte once this side ran one 240 Hz tick, instead
++       * of running on: catching up a few frames at once after a slow answer, it timed out before
++       * the other side's byte came ('통신 오류입니다'). The hold in check() then takes the byte at
++       * its own time. Its gaps vary (1334 to 9777 units within one exchange), so not from them.
++       * Otherwise not waiting. */
++      expect_ = turn_seen_ ? (unsigned long)HB_NP_GAP_NEW * HB_NP_GAP_UNIT + 1 : 0;
++      after_send_ = true;
++      put('Q', seq, data, fastCgb ? 1 : 0, gap);
++      unsigned long deadline = now_ms() + HB_NP_TIMEOUT_MS;
++      bool crossed = false;
++      for (;;) {
++         for (unsigned i = head_; i != tail_; i = (i + 1) & (HB_NP_QUEUE - 1)) {
++            Unit &u = q_[i];
++            if (u.type == 'R' && u.seq == seq) {
++               unsigned char got = u.data;
++               u.type = 0;
++               drop_used();
++               tr("gotR", seq, got, 0);
++               return got;              /* the other side's answer */
++            }
++            if (u.type == 'Q') {
++               /* v4bw: both started a transfer. On a cable one starts first and the other,
++                * a master itself by then, is not listening, so the host's byte goes first:
++                * the client answers it with FF and waits for its own answer; the host keeps
++                * the client's byte for when it listens. (v4bv gave each the other's byte, and
++                * two Game Boys retrying a call on the same beat crossed every time: Monster
++                * Capsule GB '통신 준비가 되어 있지 않습니다'.) */
++               /* v5irh: 00, not FF: the client had not started yet and a Game Boy whose port
++                * is off gives 0 bits on a cable (SameBoy's link model; FF is only for no Game
++                * Boy at all). Hamster Paradise starts both Game Boys as masters sending FA every
++                * frame and drops the race on an FF ('케이블이 연결되어 있지 않습니다'); Monster
++                * Capsule GB only looks for $61 here, so 00 does what FF did. */
++               if (!is_host_) {
++                  put('R', u.seq, 0x00, 128, 0);
++                  u.type = 0;
++                  tr("crossQ-00", u.seq, u.data, seq);
++               } else if (!crossed) {
++                  crossed = true;
++                  tr("crossQ-keep", u.seq, u.data, seq);
++               }
++            }
++         }
++         drop_used();
++         if (!active())
++            return 0xFF;                /* the other player left */
++         if (now_ms() > deadline) {
++            tr("timeout", seq, 0, 0);
++            put('C', seq, 0, 0, 0);
++            gambatte_log(RETRO_LOG_INFO, "GB link over netplay: no answer from the other Game Boy for %d ms, sent 0xFF\n", HB_NP_TIMEOUT_MS);
++            return 0xFF;
++         }
++         poll_fn_();
++         if (head_ == tail_)
++            sleep_us(200);
++      }
++   }
++
++   virtual bool check(unsigned char out, unsigned char& in, bool& fastCgb)
++   {
++      if (timeline()) return time_check(out, in, fastCgb);
++      if (!active())
++         return false;
++      if (head_ == tail_) {
++         if (expect_ && clock_ >= last_xfer_clock_ && clock_ - last_xfer_clock_ >= expect_
++               && clock_ - last_xfer_clock_ <= expect_ + HB_NP_LATE) {
++            /* The other Game Boy kept this gap before its last byte, so its next one
++             * is due now: wait for it here with this game paused. */
++            unsigned long deadline = now_ms() + HB_NP_WAIT_MS;
++            for (;;) {
++               poll_fn_();
++               if (!active())
++                  return false;
++               if (head_ != tail_)
++                  break;
++               if (now_ms() >= deadline) {
++                  tr("waitend", 0, 0, 0);
++                  expect_ = 0;          /* it did not come: back to plain polling */
++                  return false;
++               }
++               sleep_us(200);
++            }
++         } else {
++            unsigned long t = now_ms();
++            if (t == last_poll_ms_)
++               return false;            /* RetroArch also reads packets every frame; this only shortens the wait */
++            last_poll_ms_ = t;
++            poll_fn_();
++            if (!active())
++               return false;
++         }
++      }
++      while (head_ != tail_) {
++         Unit u = q_[head_];
++         if (u.type != 'Q') {
++            head_ = (head_ + 1) & (HB_NP_QUEUE - 1);
++            continue;                   /* stale answer, nobody waits for it */
++         }
++         /* The frontend batches frames; exact first-byte phase is unavailable.
++          * Keep the remaining gap, including for the second byte, but do not
++          * apply this allowance to a direction change after our own send.
++          * guess_gap() consumes this one-shot state when the byte is accepted. */
++         unsigned long late = 0;
++         if (u.gap != HB_NP_GAP_NONE && last_xfer_clock_ && clock_ >= last_xfer_clock_) {
++            unsigned long due = (unsigned long)u.gap * HB_NP_GAP_UNIT, ran = clock_ - last_xfer_clock_;
++            bool slack = hist_n_ == 0 && !after_send_ && u.gap < HB_NP_GAP_LONG;
++            /* v5irh2: the first byte of a run that came while the frontend slept between frames is
++             * found at the start of this side's frame, after the game's own frame-start work, where
++             * on a cable it came during the frame before. A game that reads it once a frame (copied
++             * to RAM by its serial interrupt) then reads it only at the next frame, so when the
++             * sender waits about a frame or more before its second byte, the second byte must not
++             * come before that: Pokemon Card GB2's START side waits a $1000 loop after the 21
++             * answer (0.9 to 1.1 frames), the slack below brought its next byte inside the same
++             * frame, it overwrote the first one and the game never became the client
++             * ('통신 오류입니다'). So such a second byte also waits until this side's next frame
++             * has run half a 240 Hz tick (Pokemon Card GB 1: 1.4 frames, its client gives up if
++             * the byte is more than about a third of a frame later than that). */
++            bool next_frame = slack && due >= HB_NP_SECOND_LONG;
++            if (next_frame) {
++               if (frames_ == first_frame_ || clock_ < frame_clock_
++                     || clock_ - frame_clock_ < (unsigned long)HB_NP_GAP_NEW * HB_NP_GAP_UNIT / 2) {
++                  if (u.seq != held_seq_) {
++                     held_seq_ = u.seq;
++                     tr("hold2f", u.seq, u.data, (unsigned)(ran / HB_NP_GAP_UNIT));
++                  }
++                  return false;
++               }
++            }
++            if (slack)
++               due = due > HB_NP_STARTUP_SLACK ? due - HB_NP_STARTUP_SLACK : 0;
++            if (ran < due && due - ran <= HB_NP_CATCHUP) {
++               if (u.seq != held_seq_) {
++                  held_seq_ = u.seq;
++                  tr("hold", u.seq, u.data, (unsigned)((due - ran) / HB_NP_GAP_UNIT));
++               }
++               return false;
++            }
++            /* v4bw: the byte was on the wire when 'due' passed (this side armed by then),
++             * not when this check came: count from then so the lateness does not pile up. */
++            if (!slack && u.gap < HB_NP_GAP_LONG && ran > due) {
++               late = ran - due;
++               if (armed_clock_ > clock_ - late)
++                  late = armed_clock_ < clock_ ? clock_ - armed_clock_ : 0;
++               if (late > HB_NP_POLL_LATE)
++                  late = 0;             /* really late (the other side or this one was busy): as before */
++            }
++         }
++         head_ = (head_ + 1) & (HB_NP_QUEUE - 1);
++         in      = u.data;
++         fastCgb = (u.flag & 1) != 0;
++         tr(late ? "ansQlate" : "ansQ", u.seq, u.data, late ? (unsigned)late : u.gap);
++         put('R', u.seq, out, 128, 0);
++         last_xfer_clock_ = clock_ - late;
++         late_ = late;
++         bool turn = after_send_ && u.gap < HB_NP_GAP_LONG;
++         if (turn)
++            turn_seen_ = true;          /* v4bw: see send() */
++         if (u.gap >= HB_NP_GAP_LONG)
++            first_frame_ = frames_;     /* v5irh2: first byte of a run, see above */
++         after_send_ = false;
++         expect_ = turn ? 0             /* its turn soon after ours: its next byte follows our next one */
++                        : (unsigned long)guess_gap(u.gap) * HB_NP_GAP_UNIT + 1;
++         return true;
++      }
++      return false;
++   }
++
++virtual void service(unsigned long cycles, unsigned char out, unsigned char sc)
++   {
++      if (!timeline()) { unarmed(cycles, sc); return; }
++      if (!active()) return;
++      if (!epoch_set_) { epoch_=cycles; epoch_set_=true; debugState("epoch-established"); }
++      setClock(cycles);
++      if (!sent_progress_ || clock_ - sent_clock_ >= 32768) {
++         put('P', 0, out, sc, 0);
++         sent_clock_ = clock_; sent_progress_ = true;
++      }
++      poll_fn_();
++      // Let the lagging machine catch up. A queued request is serviced first,
++      // including a request from a peer currently blocked inside send().
++      unsigned long deadline = now_ms() + HB_NP_TIMEOUT_MS;
++      while (active() && (!peer_seen_ || clock_ > peer_clock_ + 70224) && head_ == tail_) {
++         poll_fn_();
++         if (now_ms() >= deadline) { tr("lead-timeout",0,0,0); break; }
++         sleep_us(200);
++      }
++      // A transfer that ended while this endpoint was not armed cannot wait
++      // indefinitely for a future receive window.
++      while (head_ != tail_) {
++         const Unit &u = q_[head_];
++         if (u.type != 'Q') { head_=(head_+1)&(HB_NP_QUEUE-1); continue; }
++         uint64_t end = u.at + ((u.flag & 1) ? 128 : 4096);
++         if ((sc & 0x81) != 0x80 && clock_ >= end) {
++            tr("unarmed",u.seq,u.data,(unsigned)(clock_-u.at));
++            put('R',u.seq,0xFF,128,0);
++            head_=(head_+1)&(HB_NP_QUEUE-1);
++            continue;
++         }
++         break;
++      }
++   }
++
++private:
++   /* Bounded session timeline, selected only for the three audited beatmania
++    * ROMs by Auto. This is byte-level compatibility, not exact clock-edge
++    * emulation. Both peers must start from corresponding game states and use
++    * the same CPU speed. Progress packets cap lead to 70224 CPU cycles plus
++    * one core event interval. A listening peer may accept a late byte; a peer
++    * observed unarmed after its interval returns FF. Internal sends overlap
++    * only when their timestamp intervals overlap. Legacy v3j remains intact
++    * for other ROMs. State loads suspend this link; explicit resets use the boot barrier. */
++   struct Unit { unsigned char type, data, flag; unsigned seq, gap; uint64_t at; };
++
++   unsigned char time_send(unsigned char data, bool fastCgb)
++   {
++      if (!active()) return 0xFF;
++      unsigned seq=seq_=(seq_+1)&0xFFFF;
++      unsigned gap=last_xfer_clock_ ? (unsigned)((clock_-last_xfer_clock_)/16) : HB_NP_GAP_NONE;
++      last_xfer_clock_=clock_;
++      put('Q',seq,data,fastCgb ? 1 : 0,gap);
++      unsigned long deadline=now_ms()+HB_NP_TIMEOUT_MS;
++      for (;;) {
++         while(head_!=tail_) {
++            Unit u=q_[head_];
++            if(u.type=='Q') {
++               uint64_t duration=fastCgb ? 128 : 4096;
++               uint64_t other_duration=(u.flag&1) ? 128 : 4096;
++               if(u.at >= clock_+duration) {
++                  tr("self-earlier",seq,u.data,(unsigned)(u.at-clock_));
++                  return 0xFF; // leave the later request for the external receive path
++               }
++               head_=(head_+1)&(HB_NP_QUEUE-1);
++               if(clock_ >= u.at+other_duration) {
++                  tr("peer-earlier",u.seq,u.data,(unsigned)(clock_-u.at));
++                  put('R',u.seq,0xFF,128,0);
++                  continue;
++               }
++               tr("overlap",seq,u.data,(unsigned)(clock_ > u.at ? clock_-u.at : u.at-clock_));
++               return u.data;
++            }
++            head_=(head_+1)&(HB_NP_QUEUE-1);
++            if(u.type=='R' && u.seq==seq) { tr("gotR",seq,u.data,0); return u.data; }
++         }
++         if(!active()) return 0xFF;
++         if(now_ms()>=deadline) { put('C',seq,0,0,0); tr("timeout",seq,0,0); return 0xFF; }
++         poll_fn_(); sleep_us(200);
++      }
++   }
++   bool time_check(unsigned char out,unsigned char &in,bool &fastCgb)
++   {
++      if(!active()) return false;
++      poll_fn_();
++      while(head_!=tail_) {
++         Unit u=q_[head_];
++         if(u.type!='Q') { head_=(head_+1)&(HB_NP_QUEUE-1); continue; }
++         if(clock_ < u.at) return false;
++         head_=(head_+1)&(HB_NP_QUEUE-1);
++         in=u.data; fastCgb=(u.flag&1)!=0;
++         tr("timeQ",u.seq,u.data,(unsigned)(clock_-u.at));
++         put('R',u.seq,out,128,0);
++         last_xfer_clock_=clock_;
++         return true;
++      }
++      return false;
++   }
++   bool active() const { return send_fn_ != NULL && peer_ >= 0 && (!timeline() || link_ready_); }
++   /* v4bw: drop answered units and stale answers at the head; a byte from the other side stays */
++   void drop_used() { while (head_ != tail_ && q_[head_].type != 'Q') head_ = (head_ + 1) & (HB_NP_QUEUE - 1); }
++   /* v4bw: a byte the other Game Boy clocked out while this one is not listening (SC not armed
++    * for an external clock) gets FF back once this side ran HB_NP_UNARMED cycles past when it
++    * was due (or first seen), as on a cable, instead of holding the sender up to HB_NP_TIMEOUT_MS.
++    * v5irh: 00 instead of FF: a Game Boy that is there but not shifting gives 0 bits (SameBoy's
++    * link model; only a missing one reads FF, see send()). Hamster Paradise's master took the FF
++    * for '케이블이 연결되어 있지 않습니다' while the other one still waited its random 8 to 39
++    * frames or had just switched back to master. Monster Capsule GB compares with $61/$62 only. */
++   void unarmed(unsigned long cycles, unsigned char sc)
++   {
++      if (!active())
++         return;
++      drop_used();
++      if (head_ == tail_ || (sc & 0x81) == 0x80) {
++         unarmed_seq_ = 0x10000;        /* nothing waiting, or listening: check() decides */
++         return;
++      }
++      const Unit &u = q_[head_];
++      if (unarmed_seq_ != u.seq) {
++         unarmed_seq_ = u.seq;
++         unarmed_from_ = cycles;
++         if (u.gap != HB_NP_GAP_NONE && u.gap < HB_NP_GAP_LONG && last_xfer_clock_) {
++            unsigned long due = last_xfer_clock_ + (unsigned long)u.gap * HB_NP_GAP_UNIT;
++            if (due > cycles)
++               unarmed_from_ = due;     /* not due yet: this side may still start listening in time */
++         }
++      }
++      if (cycles >= unarmed_from_ && cycles - unarmed_from_ >= HB_NP_UNARMED) {
++         clock_ = cycles;
++         put('R', u.seq, 0x00, 128, 0);
++         tr("unarmed00", u.seq, u.data, (unsigned)(cycles - unarmed_from_));
++         head_ = (head_ + 1) & (HB_NP_QUEUE - 1);
++         unarmed_seq_ = 0x10000;
++      }
++   }
++   void clear() { clock_=0; last_poll_ms_=0; epoch_set_=false; epoch_=0; peer_seen_=false; sent_progress_=false; peer_clock_=0; sent_clock_=0; head_ = tail_ = 0; last_xfer_clock_ = 0; expect_ = 0; held_seq_ = 0x10000; hist_n_ = 0; after_send_ = false; late_ = 0; unarmed_seq_ = 0x10000; turn_seen_ = false; }
++   static bool similar(unsigned a, unsigned b)
++   {
++      unsigned d = a > b ? a - b : b - a, m = a > b ? a : b;
++      return d <= m / 8 + 4;
++   }
++   /* Remember the gap before the byte just answered and guess the one before the next
++    * byte: what followed the last similar gap, else the same gap again but at most
++    * HB_NP_GAP_NEW (waiting too early only costs a short pause, running ahead can
++    * make the game give up). */
++   unsigned guess_gap(unsigned gap)
++   {
++      if (gap >= HB_NP_GAP_LONG) {
++         hist_n_ = 0;                   /* a new transfer starts: old gaps say nothing */
++         return HB_NP_GAP_NEW;
++      }
++      if (hist_n_ == HB_NP_HIST) {
++         for (unsigned i = 1; i < HB_NP_HIST; i++)
++            hist_[i - 1] = hist_[i];
++         hist_n_--;
++      }
++      hist_[hist_n_++] = gap;
++      for (int i = (int)hist_n_ - 2; i >= 0; i--)
++         if (similar(hist_[i], gap))
++            return hist_[i + 1];
++      return gap < HB_NP_GAP_NEW ? gap : HB_NP_GAP_NEW;
++   }
++   void tr(const char* what, unsigned a, unsigned b, unsigned gap)
++   {
++      if (!trace_)
++         return;
++      struct timespec ts;
++      clock_gettime(CLOCK_MONOTONIC, &ts);
++      fprintf(trace_, "%ld.%06ld %s %u %02x %u %lu\n", (long)ts.tv_sec, ts.tv_nsec / 1000L, what, a, b & 0xFF, gap, clock_);
++   }
++   void put(unsigned char type, unsigned seq, unsigned char data, unsigned char flag, unsigned gap)
++   {
++      if (trace_) {
++         char w[4] = { 't', 'x', (char)type, 0 };
++         tr(w, seq, data, gap);
++      }
++      unsigned char p[HB_NP_UNIT_LEN] = { type, (unsigned char)(seq & 0xFF), (unsigned char)(seq >> 8), data, (unsigned char)(flag | (timeline() ? 0x40 : 0)),
++         (unsigned char)(gap & 0xFF), (unsigned char)(gap >> 8), (unsigned char)(gap >> 16), (unsigned char)(gap >> 24) };
++      for (unsigned i=0;i<8;i++) p[9+i]=(unsigned char)((uint64_t)clock_ >> (8*i));
++      /* Preserve the complete v4bm 17-byte legacy payload for other games.
++       * Generations and boot-kind controls belong only to bounded sessions. */
++      if (timeline())
++         for (unsigned i=0;i<4;++i) { p[17+i]=(unsigned char)(generation_>>(8*i)); p[21+i]=(unsigned char)(peer_generation_>>(8*i)); }
++      send_fn_(RETRO_NETPACKET_RELIABLE | RETRO_NETPACKET_FLUSH_HINT, p, timeline() ? sizeof(p) : 17, (uint16_t)peer_);
++   }
++   static unsigned long now_ms()
++   {
++      struct timespec ts;
++      clock_gettime(CLOCK_MONOTONIC, &ts);
++      return (unsigned long)ts.tv_sec * 1000UL + (unsigned long)(ts.tv_nsec / 1000000L);
++   }
++   static void sleep_us(long us)
++   {
++      struct timespec ts;
++      ts.tv_sec  = 0;
++      ts.tv_nsec = us * 1000L;
++      nanosleep(&ts, NULL);
++   }
++
++   retro_netpacket_send_t send_fn_;
++   retro_netpacket_poll_receive_t poll_fn_;
++   int peer_;
++   bool is_host_;
++   unsigned seq_;
++   Unit q_[HB_NP_QUEUE];
++   unsigned head_, tail_;
++   unsigned long last_poll_ms_;
++   unsigned long clock_;           /* Game Boy time (cycles) of the current check/send */
++   unsigned long last_xfer_clock_; /* Game Boy time of the last byte either way (0 = none yet) */
++   unsigned long expect_;          /* cycles after that byte when the other side's next one is due (0 = not expected) */
++   unsigned held_seq_;             /* byte held back so this Game Boy reaches its time first (traced once) */
++   unsigned hist_[HB_NP_HIST];     /* gaps of the latest bytes from the other side */
++   unsigned hist_n_;
++   bool after_send_;               /* the last byte either way was one this Game Boy sent */
++   FILE* trace_;
++   uint64_t peer_clock_;
++   uint64_t sent_clock_;
++   bool peer_seen_;
++   bool sent_progress_;
++   uint64_t epoch_;
++   bool epoch_set_;
++   bool timing_;
++   bool fresh_, boot_pending_, link_ready_, peer_boot_;
++   uint32_t generation_, peer_generation_, used_peer_generation_, peer_ack_;
++   bool boot_reset_, peer_boot_reset_;
++   unsigned long boot_deadline_, boot_tx_ms_;
++   unsigned long runs_;
++   bool auto_cold_, state_loaded_;
++   int event_;
++   bool progressed_, ever_linked_;
++   bool timeline() const { return timing_; }
++   unsigned long armed_clock_;     /* v4bw: Game Boy time this side armed SC for the byte it waits for */
++   unsigned long late_;            /* v4bw: how long the byte just taken was already due (see HB_NP_POLL_LATE) */
++   unsigned long unarmed_from_;    /* v4bw: this side's time from which the waiting byte counts as not listened to */
++   unsigned unarmed_seq_;          /* v4bw: that byte (0x10000 = none) */
++   bool turn_seen_;                /* v4bw: the other side answered our last byte with a byte of its own */
++   unsigned long frames_;          /* v5irh2: frames run (beforeRun calls) */
++   unsigned long first_frame_;     /* v5irh2: the frame the first byte of the current incoming run was taken in */
++   unsigned long frame_clock_;     /* v5irh2: this side's time first seen in the current frame */
++   bool new_frame_;                /* v5irh2: a frame began and its time is not seen yet */
++
++
++public:
++   /* ===== v5ir: infrared (see HB_IR_LEN) ===== */
++   virtual void irWrite(unsigned long abs, bool ds, unsigned char val)
++   {
++      uint64_t t = irTime(abs, ds);
++      bool act = (val & 0xC0) == 0xC0 || (val & 1);
++      unsigned char led = val & 1;
++      bool changed = act != ir_act_ || led != ir_led_;
++      /* v5irh3: a Game Boy that turns its LED on while not tied and the other one listens meets it
++       * first, at this point (Boku no Camp-jou sends its hello pulse before it ever reads RP; that
++       * pulse was over before the two met, so the receiver never saw it). The stop is made with the
++       * LED still off, so the pulse starts after the meeting point for both. */
++      if (act && led && !ir_led_ && ir_act_ && ir_map_ != 2 && irLinked() && ir_pact_ && ir_pread_) {
++         ir_reading_ = true; ir_last_rd_any_ = t;
++         tr("ir-tx-meet", 0, 0, (unsigned)t);
++         irBarrier(t);
++      }
++      ir_act_ = act; ir_led_ = led;
++      if (!act) ir_reading_ = false;
++      if (!irLinked()) return;
++      if (!act) {
++         if (changed) { irReport(t, 0); irEnd("self-off"); ir_ps_ok_ = false; }
++         return;
++      }
++      if (changed) tr("ir-tx", led, act, (unsigned)t);
++      if (changed || t - ir_last_rep_ >= ir_lag_ / 4) irReport(t, 0);
++   }
++   virtual bool irRead(unsigned long abs, bool ds)
++   {
++      uint64_t t = irTime(abs, ds);
++      if (!irLinked() || !ir_act_) return false;
++      ir_last_rd_any_ = t;
++      if (!ir_reading_) { ir_reading_ = true; irReport(t, 0); }   /* tell the other side we listen now */
++      else if (!ir_act_sent_) irReport(t, 0);   /* port was turned on before the room linked */
++      if (ir_map_ != 2) {
++         /* meet only a Game Boy that listens too: a port left on in a menu (Pokemon Pinball after a
++          * send) must not freeze this one at the meeting point */
++         if (!ir_pact_ || !ir_pread_) return false;
++         if (!irBarrier(t)) return false;
++      }
++      uint64_t need = t > ir_lag_ ? t - ir_lag_ : 0;
++      irApply(need);
++      if (ir_map_ != 2) return false;
++      if (irFrontier() < (int64_t)need) {
++         irReport(t, 0);                 /* tell the other side where this one waits */
++         ++ir_waits_;
++         unsigned long w0 = now_ms();
++         unsigned long deadline = now_ms() + HB_IR_WAIT_MS;
++         for (;;) {
++            poll_fn_();
++            irApply(need);
++            if (ir_map_ != 2) return false;
++            if (irFrontier() >= (int64_t)need) { if (now_ms() - w0 >= 20) tr("ir-waited", (unsigned)(now_ms() - w0), 0, (unsigned)t); break; }
++            if (!irLinked()) { irEnd("left"); return false; }
++            if (now_ms() > deadline) { irEnd("wait-timeout"); return false; }
++            irRefresh();
++            sleep_us(100);
++         }
++      }
++      /* the receiver keeps seeing a pulse for a short while after it ends (HB_IR_HOLD): the
++       * Mystery Gift role loop polls RP every 260 units and then waits a timer tick, so a
++       * 320-unit hello pulse caught late was gone by its next read and the hello was missed */
++      if (ir_seen_led_ && ir_pulse_reads_ < 255) ++ir_pulse_reads_;   /* v5irh3 */
++      bool seen = ir_seen_led_ || (ir_pulse_reads_ <= HB_IR_HOLD_READS && ir_off_valid_ && (int64_t)need >= ir_off_at_ && (int64_t)need - ir_off_at_ < (int64_t)ir_hold_);
++      if (seen != ir_last_ret_ || t - ir_last_rd_ > 4096 || ir_rdall_) { tr(seen ? "ir-rd-light" : "ir-rd-dark", 0, 0, (unsigned)t); }
++      ir_last_ret_ = seen; ir_last_rd_ = t;
++      return seen;
++   }
++   virtual void irTick(unsigned long abs, bool ds)
++   {
++      uint64_t t = irTime(abs, ds);
++      if (ir_reading_ && t - ir_last_rd_any_ > HB_IR_IDLE) {
++         ir_reading_ = false;
++         if (irLinked() && ir_act_) irReport(t, 0);
++      }
++      if (ir_map_ == 2 && ir_act_ && irLinked() && t - ir_last_rep_ >= ir_lag_ / 2)
++         irReport(t, 0);
++   }
++   unsigned long irWaits() const { return ir_waits_; }
++   /* a long wait spans many frames: re-read the pad meanwhile so a short press is not lost */
++   void setIrRefresh(void (*fn)(void)) { ir_refresh_ = fn; }
++   bool irSession() const { return ir_map_ == 2; }
++
++private:
++   struct IrEv { uint64_t rt; unsigned char act, led; };
++   bool irLinked() const { return send_fn_ != NULL && peer_ >= 0; }
++   void irReset()
++   {
++      ir_abs_set_ = false; ir_abs_ = 0; ir_ds_ = false; ir_rt_ = 0;
++      ir_act_ = false; ir_led_ = 0; ir_act_sent_ = false; ir_last_rep_ = 0;
++      ir_pact_ = false; ir_prt_ = 0; ir_prt_seen_ = false; ir_pled_ = 0;
++      ir_qh_ = ir_qt_ = 0; ir_map_ = 0; ir_off_ = 0; ir_seen_led_ = false;
++      ir_my_s_ = 0; ir_my_bs_ = 0; ir_bs_ = 0; ir_ps_ok_ = false; ir_ps_rt_ = 0; ir_ps_bs_ = 0;
++      ir_map_pbs_ = 0; ir_t_bs_ = 0; ir_t_ok_ = false; ir_t_rt_ = 0;
++      ir_off_valid_ = false; ir_off_at_ = ir_on_at_ = 0; ir_last_ret_ = false; ir_reading_ = ir_pread_ = false; ir_last_rd_any_ = 0; ir_last_rd_ = 0; ir_pulse_reads_ = 0; ir_backoff_ms_ = 0; ir_waits_ = 0;
++   }
++   uint64_t irTime(unsigned long abs, bool ds)
++   {
++      if (!ir_abs_set_) { ir_abs_set_ = true; ir_abs_ = abs; ir_ds_ = ds; return ir_rt_; }
++      if (abs >= ir_abs_)
++         ir_rt_ += (uint64_t)(abs - ir_abs_) >> (ir_ds_ ? 1 : 0);
++      else if (ir_map_ != 0)
++         irEnd("rewind");               /* a state was loaded: the tie no longer holds */
++      ir_abs_ = abs; ir_ds_ = ds;
++      return ir_rt_;
++   }
++   int64_t irFrontier() const { return (int64_t)ir_prt_ + ir_off_; }
++   void irReport(uint64_t t, unsigned char flags, uint32_t bs = 0, uint32_t ack = 0)
++   {
++      unsigned char p[HB_IR_LEN];
++      p[0] = 'I'; p[1] = flags; p[2] = (ir_act_ ? 1 : 0) | (ir_act_ && ir_reading_ ? 2 : 0); p[3] = ir_led_;
++      for (unsigned i = 0; i < 4; ++i) { p[4+i] = (unsigned char)(bs >> (8*i)); p[8+i] = (unsigned char)(ack >> (8*i)); }
++      for (unsigned i = 0; i < 8; ++i) p[12+i] = (unsigned char)(t >> (8*i));
++      if (!(flags & 2)) {
++         ir_last_rep_ = t;
++         if (ir_act_) ir_act_sent_ = true;
++      }
++      send_fn_(RETRO_NETPACKET_RELIABLE | RETRO_NETPACKET_FLUSH_HINT, p, sizeof(p), (uint16_t)peer_);
++   }
++   void irFold(uint64_t upto)
++   {
++      while (ir_qh_ != ir_qt_ && ir_q_[ir_qh_].rt < upto) {   /* v5irh3: '<': what happens at the stop itself is applied after the tie */
++         ir_seen_led_ = ir_q_[ir_qh_].act && ir_q_[ir_qh_].led;
++         ir_qh_ = (ir_qh_ + 1) & (HB_IR_Q - 1);
++      }
++   }
++   void irReceive(const unsigned char *p)
++   {
++      uint32_t bs = 0, ack = 0; uint64_t rt = 0;
++      for (unsigned i = 0; i < 4; ++i) { bs |= (uint32_t)p[4+i] << (8*i); ack |= (uint32_t)p[8+i] << (8*i); }
++      for (unsigned i = 0; i < 8; ++i) rt |= (uint64_t)p[12+i] << (8*i);
++      if (p[1] & 2) {                     /* (client) the host tied its stop to one of ours */
++         if (is_host_ || ack != ir_my_bs_ || ack == 0) return;
++         if (ir_map_ == 1) { ir_t_ok_ = true; ir_t_bs_ = bs; ir_t_rt_ = rt; }
++         else if (ir_map_ == 2 && bs != ir_map_pbs_) irEnd("host-retie");
++         return;
++      }
++      if (ir_prt_seen_ && rt < ir_prt_) {   /* the other side's time went back (state load, restart) */
++         irEnd("peer-rewind"); ir_ps_ok_ = false;
++      }
++      ir_prt_ = rt; ir_prt_seen_ = true; ir_pact_ = (p[2] & 1) != 0; ir_pread_ = (p[2] & 2) != 0; ir_pled_ = p[3] & 1;
++      unsigned next = (ir_qt_ + 1) & (HB_IR_Q - 1);
++      if (next == ir_qh_)                 /* full: should not happen; keep the newest state */
++         ir_qh_ = (ir_qh_ + 1) & (HB_IR_Q - 1);
++      ir_q_[ir_qt_].rt = rt; ir_q_[ir_qt_].act = (p[2] & 1) != 0; ir_q_[ir_qt_].led = p[3] & 1;
++      ir_qt_ = next;
++      if (p[1] & 1) {                     /* the other side stopped at its meeting point */
++         ir_ps_ok_ = true; ir_ps_rt_ = rt; ir_ps_bs_ = bs;
++         if (is_host_ && ir_map_ == 2 && bs != ir_map_pbs_) {
++            /* host: the client stopped again (it had not seen our tie in time): tie our stop to this one */
++            irFold(rt);
++            ir_off_ = (int64_t)ir_my_s_ - (int64_t)rt; ir_map_pbs_ = bs;
++            irReport(ir_my_s_, 2, ir_my_bs_, bs);
++            tr("ir-retie", ir_my_bs_, 0, bs);
++         }
++      }
++      if (!ir_pact_) { ir_ps_ok_ = false; ir_pread_ = false; }
++      if (ir_map_ == 0) {                 /* not tied: only the newest state (and what follows a stop) matters */
++         while (((ir_qh_ + 1) & (HB_IR_Q - 1)) != ir_qt_ && (!ir_ps_ok_ || ir_q_[ir_qh_].rt < ir_ps_rt_)) {
++            ir_seen_led_ = ir_q_[ir_qh_].act && ir_q_[ir_qh_].led;
++            ir_qh_ = (ir_qh_ + 1) & (HB_IR_Q - 1);
++         }
++      }
++   }
++   void irApply(uint64_t need)
++   {
++      while (ir_map_ == 2 && ir_qh_ != ir_qt_ && (int64_t)ir_q_[ir_qh_].rt + ir_off_ <= (int64_t)need) {
++         IrEv &e = ir_q_[ir_qh_];
++         ir_qh_ = (ir_qh_ + 1) & (HB_IR_Q - 1);
++         if ((e.act && e.led) != ir_seen_led_) tr("ir-see", e.act && e.led, 0, (unsigned)(e.rt + ir_off_));
++         if (!ir_seen_led_ && e.act && e.led) { ir_on_at_ = (int64_t)e.rt + ir_off_; ir_pulse_reads_ = 0; }
++         if (ir_seen_led_ && !(e.act && e.led)) {
++            /* only a long pulse lingers (Pokemon Pinball's pulses are 32-224 units with gaps as short) */
++            ir_off_at_ = (int64_t)e.rt + ir_off_;
++            ir_off_valid_ = ir_off_at_ - ir_on_at_ >= (int64_t)HB_IR_HOLD_MIN;
++         }
++         ir_seen_led_ = e.act && e.led;
++         if (!e.act) { irEnd("peer-off"); return; }
++      }
++   }
++   /* Meeting point. The host decides which two stops belong together: it ties its stop to the
++    * client's latest stop and tells the client (flag 2); the client ties only to that answer while
++    * it is still stopped, so both always use the same pair even when the two stop at once. */
++   bool irBarrier(uint64_t t)
++   {
++      unsigned long n = now_ms();
++      if (ir_backoff_ms_ && n < ir_backoff_ms_) return false;
++      if (ir_map_ == 0) {
++         ir_map_ = 1; ir_my_s_ = t; ir_my_bs_ = ++ir_bs_; ir_t_ok_ = false;
++         irReport(t, 1, ir_my_bs_, 0);
++         tr("ir-stop", ir_my_bs_, 0, 0);
++      }
++      unsigned long deadline = n + HB_IR_BARRIER_MS;
++      for (;;) {
++         if (is_host_ && ir_ps_ok_ && ir_pact_) {
++            ir_off_ = (int64_t)ir_my_s_ - (int64_t)ir_ps_rt_;
++            ir_map_ = 2; ir_map_pbs_ = ir_ps_bs_; ir_backoff_ms_ = 0;
++            irFold(ir_ps_rt_);
++            irReport(ir_my_s_, 2, ir_my_bs_, ir_ps_bs_);
++            tr("ir-tied", ir_my_bs_, 0, ir_map_pbs_);
++            return true;
++         }
++         if (!is_host_ && ir_t_ok_) {
++            ir_off_ = (int64_t)ir_my_s_ - (int64_t)ir_t_rt_;
++            ir_map_ = 2; ir_map_pbs_ = ir_t_bs_; ir_backoff_ms_ = 0; ir_t_ok_ = false;
++            irFold(ir_t_rt_);
++            tr("ir-tied", ir_my_bs_, 0, ir_map_pbs_);
++            return true;
++         }
++         if (!ir_pact_ || !irLinked()) { ir_map_ = 0; tr("ir-stop-off", ir_my_bs_, 0, 0); return false; }
++         if (now_ms() > deadline) { ir_map_ = 0; ir_backoff_ms_ = now_ms() + 300; tr("ir-stop-timeout", ir_my_bs_, 0, 0); return false; }
++         poll_fn_();
++         irRefresh();
++         sleep_us(100);
++      }
++   }
++   void irRefresh()
++   {
++      unsigned long n = now_ms();
++      if (ir_refresh_ && n - ir_refresh_ms_ >= 16) { ir_refresh_ms_ = n; ir_refresh_(); }
++   }
++   void irEnd(const char *why)
++   {
++      if (ir_map_ != 0) tr(why, ir_my_bs_, 0, ir_map_pbs_);
++      ir_map_ = 0; ir_off_ = 0; ir_seen_led_ = false; ir_off_valid_ = false;
++      ir_qh_ = ir_qt_;                    /* drop what is queued */
++   }
++
++   bool ir_abs_set_, ir_ds_, ir_act_, ir_act_sent_, ir_pact_, ir_prt_seen_, ir_seen_led_, ir_ps_ok_;
++   unsigned char ir_led_, ir_pled_;
++   unsigned long ir_abs_, ir_lag_, ir_backoff_ms_, ir_waits_;
++   uint64_t ir_rt_, ir_last_rep_, ir_prt_, ir_my_s_, ir_ps_rt_;
++   int64_t ir_off_;
++   int ir_map_;                          /* 0 = not tied, 1 = waiting at our stop, 2 = tied */
++   uint32_t ir_my_bs_, ir_bs_, ir_ps_bs_, ir_map_pbs_, ir_t_bs_;
++   bool ir_t_ok_;
++   uint64_t ir_t_rt_;
++   bool ir_rdall_, ir_off_valid_, ir_last_ret_, ir_reading_, ir_pread_; uint64_t ir_last_rd_any_; int64_t ir_off_at_, ir_on_at_; unsigned long ir_hold_; uint64_t ir_last_rd_; unsigned ir_pulse_reads_;
++   void (*ir_refresh_)(void); unsigned long ir_refresh_ms_;
++   IrEv ir_q_[HB_IR_Q];
++   unsigned ir_qh_, ir_qt_;
++
++};
++
++#endif
+diff --git a/libgambatte/libretro/libretro.cpp b/libgambatte/libretro/libretro.cpp
+index 1c4471c517b6..da822e3ecb4d 100644
+--- a/libgambatte/libretro/libretro.cpp
++++ b/libgambatte/libretro/libretro.cpp
+@@ -10,6 +10,7 @@
+ #include "bootloader.h"
+ #ifdef HAVE_NETWORK
+ #include "net_serial.h"
++#include "hb_netpacket_serial.h"
+ #endif
+ 
+ #if defined(__DJGPP__) && defined(__STRICT_ANSI__)
+@@ -1526,6 +1527,116 @@ static NetSerial gb_net_serial;
+ static SerialMode gb_serialMode = SERIAL_NONE;
+ static int gb_NetworkPort = 12345;
+ static std::string gb_NetworkClientAddr;
++
++/* Hanbang: GB link cable over a netplay room (hb_netpacket_serial.h) */
++static NetpacketSerial gb_np_serial;
++static bool gb_np_audited_beatmania = false;
++static uint32_t hb_np_crc32(const void *data, size_t size)
++{
++   const unsigned char *p = static_cast<const unsigned char *>(data);
++   uint32_t crc = 0xFFFFFFFFu;
++   for (size_t i=0; i<size; ++i) {
++      crc ^= p[i];
++      for (unsigned k=0; k<8; ++k)
++         crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
++   }
++   return ~crc;
++}
++
++
++static void apply_serial_mode(void)
++{
++   if (gb_np_serial.started())
++   {
++      /* while a netplay room is open, the room is the cable */
++      gb_net_serial.stop();
++      gb.setSerialIO(&gb_np_serial);
++      return;
++   }
++
++   switch(gb_serialMode)
++   {
++      case SERIAL_SERVER:
++         gb_net_serial.start(true, gb_NetworkPort, gb_NetworkClientAddr);
++         gb.setSerialIO(&gb_net_serial);
++         break;
++      case SERIAL_CLIENT:
++         gb_net_serial.start(false, gb_NetworkPort, gb_NetworkClientAddr);
++         gb.setSerialIO(&gb_net_serial);
++         break;
++      default:
++         gb_net_serial.stop();
++         gb.setSerialIO(NULL);
++         break;
++   }
++}
++
++static unsigned hb_np_wait_shown = 0;
++/* UTF-8 (RetroArch font has Hangul): "GB 통신: 연결됐어요" / "GB 통신: 상대가 없어 혼자 시작 · 같이 하려면 두 기기 모두 RESET" */
++#define HB_NP_MSG_LINKED "GB \xED\x86\xB5\xEC\x8B\xA0: \xEC\x97\xB0\xEA\xB2\xB0\xEB\x90\x90\xEC\x96\xB4\xEC\x9A\x94"
++#define HB_NP_MSG_SOLO "GB \xED\x86\xB5\xEC\x8B\xA0: \xEC\x83\x81\xEB\x8C\x80\xEA\xB0\x80 \xEC\x97\x86\xEC\x96\xB4 \xED\x98\xBC\xEC\x9E\x90 \xEC\x8B\x9C\xEC\x9E\x91 \xC2\xB7 \xEA\xB0\x99\xEC\x9D\xB4 \xED\x95\x98\xEB\xA0\xA4\xEB\xA9\xB4 \xEB\x91\x90 \xEA\xB8\xB0\xEA\xB8\xB0 \xEB\xAA\xA8\xEB\x91\x90 RESET"
++static void hb_np_msg(const char *text, unsigned frames)
++{
++   struct retro_message message = { text, frames };
++   environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
++}
++
++static void update_input_state(void);
++static void hb_ir_refresh_input(void)   /* v5ir: pad read again during a long IR wait */
++{
++   input_poll_cb();
++   update_input_state();
++}
++
++static void RETRO_CALLCONV hb_np_start(uint16_t client_id,
++      retro_netpacket_send_t send_fn, retro_netpacket_poll_receive_t poll_receive_fn)
++{
++   gb_np_serial.setIrRefresh(hb_ir_refresh_input);
++   gb_np_serial.start(client_id, send_fn, poll_receive_fn);
++   apply_serial_mode();
++   if (gb_np_serial.waitingForBoot()) {
++      struct retro_message message = { "GB Link: waiting for other player (20 seconds)", 180 };
++      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
++   }
++   gambatte_log(RETRO_LOG_INFO, "GB link over netplay started (%s)\n",
++         client_id == 0 ? "host" : "client");
++}
++
++static void RETRO_CALLCONV hb_np_receive(const void* buf, size_t len, uint16_t client_id)
++{
++   gb_np_serial.receive(buf, len, client_id);
++}
++
++static void RETRO_CALLCONV hb_np_stop(void)
++{
++   gb_np_serial.stop();
++   apply_serial_mode();
++   gambatte_log(RETRO_LOG_INFO, "GB link over netplay stopped\n");
++}
++
++static bool RETRO_CALLCONV hb_np_connected(uint16_t client_id)
++{
++   bool ok = gb_np_serial.connected(client_id);
++   gambatte_log(RETRO_LOG_INFO, "GB link over netplay: player %u %s\n",
++         (unsigned)client_id, ok ? "connected" : "refused (cable already in use)");
++   return ok;
++}
++
++static void RETRO_CALLCONV hb_np_disconnected(uint16_t client_id)
++{
++   gb_np_serial.disconnected(client_id);
++   gambatte_log(RETRO_LOG_INFO, "GB link over netplay: player %u left\n", (unsigned)client_id);
++}
++
++static const struct retro_netpacket_callback hb_np_iface = {
++   hb_np_start,
++   hb_np_receive,
++   hb_np_stop,
++   NULL,
++   hb_np_connected,
++   hb_np_disconnected,
++   HB_NP_PROTOCOL,
++};
+ #endif
+ 
+ void retro_get_system_info(struct retro_system_info *info)
+@@ -1587,6 +1698,11 @@ void retro_init(void)
+ #endif
+ 
+    check_system_specs();
++
++#ifdef HAVE_NETWORK
++   /* Hanbang: let a netplay room carry the link cable (optional for the frontend) */
++   environ_cb(RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE, (void*)&hb_np_iface);
++#endif
+    
+    //gb/gbc bootloader support
+    gb.setBootloaderGetter(get_bootloader_from_file);
+@@ -1717,7 +1833,7 @@ void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
+ 
+ void retro_set_controller_port_device(unsigned, unsigned) {}
+ 
+-void retro_reset()
++static void reset_keep_saves(bool local)
+ {
+    // gambatte seems to clear out SRAM on reset.
+    uint8_t *sram = 0;
+@@ -1734,6 +1850,12 @@ void retro_reset()
+    }
+ 
+    gb.reset();
++#ifdef HAVE_NETWORK
++   if (local)
++      gb_np_serial.localReset();
++   else
++      gb_np_serial.coldRestarted();
++#endif
+ #ifdef DUAL_MODE
+    gb2.reset();
+ #endif
+@@ -1750,6 +1872,11 @@ void retro_reset()
+    }
+ }
+ 
++void retro_reset()
++{
++   reset_keep_saves(true);
++}
++
+ static size_t serialize_size = 0;
+ size_t retro_serialize_size(void)
+ {
+@@ -1775,6 +1902,9 @@ bool retro_unserialize(const void *data, size_t size)
+       return false;
+ 
+    gb.loadState(data);
++#ifdef HAVE_NETWORK
++   gb_np_serial.stateLoaded();
++#endif
+    return true;
+ }
+ 
+@@ -2278,21 +2408,14 @@ static void check_variables(bool startup)
+       gb_NetworkClientAddr += octet;
+    }
+ 
+-   switch(gb_serialMode)
+-   {
+-      case SERIAL_SERVER:
+-         gb_net_serial.start(true, gb_NetworkPort, gb_NetworkClientAddr);
+-         gb.setSerialIO(&gb_net_serial);
+-         break;
+-      case SERIAL_CLIENT:
+-         gb_net_serial.start(false, gb_NetworkPort, gb_NetworkClientAddr);
+-         gb.setSerialIO(&gb_net_serial);
+-         break;
+-      default:
+-         gb_net_serial.stop();
+-         gb.setSerialIO(NULL);
+-         break;
++   var.key = "gambatte_netlink_timing";
++   bool bounded = gb_np_audited_beatmania;
++   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
++      if (strcmp(var.value, "v3j") == 0) bounded = false;
++      else if (strcmp(var.value, "bounded") == 0) bounded = true;
+    }
++   gb_np_serial.setTiming(bounded);
++   apply_serial_mode();
+ 
+    /* Show/hide core options */
+    update_option_visibility();
+@@ -2591,6 +2714,16 @@ bool retro_load_game(const struct retro_game_info *info)
+ 
+    gambatte_log(RETRO_LOG_INFO, "Got internal game name: %s.\n", internal_game_name);
+ 
++#ifdef HAVE_NETWORK
++   gb_np_serial.loaded();
++   gb_np_audited_beatmania = false;
++   if (info->data && (info->size == 1048576 || info->size == 2097152)) {
++      uint32_t crc = hb_np_crc32(info->data, info->size);
++      gb_np_audited_beatmania =
++         (info->size == 1048576 && (crc == 0x0D9CB195u || crc == 0x59BEB372u)) ||
++         (info->size == 2097152 && crc == 0xB92A6D16u);
++   }
++#endif
+    check_variables(true);
+    audio_resampler_init(true);
+ 
+@@ -2703,6 +2836,40 @@ void retro_run()
+    input_poll_cb();
+    update_input_state();
+ 
++#ifdef HAVE_NETWORK
++   gb_np_serial.noteInput(libretro_input_state);
++   if (gb_np_serial.takeAutoCold())
++      reset_keep_saves(false);          /* v4bu: restart into the cold link barrier */
++   if (!gb_np_serial.beforeRun()) {
++      /* v4bu: a black screen and a countdown instead of an undefined (red) first frame */
++      static gambatte::video_pixel_t *black = NULL;
++      if (!black)
++         black = (gambatte::video_pixel_t*)calloc(1, VIDEO_BUFF_SIZE);
++      unsigned left = (unsigned)((gb_np_serial.bootLeftMs() + 999) / 1000);
++      if (left != hb_np_wait_shown) {
++         char text[128];
++         snprintf(text, sizeof(text), "GB \xED\x86\xB5\xEC\x8B\xA0: \xEC\x83\x81\xEB\x8C\x80 \xEA\xB8\xB0\xEB\x8B\xA4\xEB\xA6\xAC\xEB\x8A\x94 \xEC\xA4\x91 \xC2\xB7 %u\xEC\xB4\x88", left);
++         hb_np_msg(text, 75);
++         hb_np_wait_shown = left;
++      }
++      video_cb(black, VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_PITCH * sizeof(gambatte::video_pixel_t));
++      /* A wait is not an emulated frame: do not change samples/frames_count. */
++      return;
++   }
++   hb_np_wait_shown = 0;
++   switch (gb_np_serial.takeEvent())
++   {
++      case HB_NP_EV_LINKED:
++         hb_np_msg(HB_NP_MSG_LINKED, 150);
++         break;
++      case HB_NP_EV_SOLO:
++         hb_np_msg(HB_NP_MSG_SOLO, 360);
++         break;
++      default:
++         break;
++   }
++#endif
++
+    uint64_t expected_frames = samples_count / SOUND_SAMPLES_PER_FRAME;
+    if (frames_count < expected_frames) // Detect frame dupes.
+    {
+diff --git a/libgambatte/libretro/libretro_core_options.h b/libgambatte/libretro/libretro_core_options.h
+index 7cbeea0229a4..675fbe944a24 100644
+--- a/libgambatte/libretro/libretro_core_options.h
++++ b/libgambatte/libretro/libretro_core_options.h
+@@ -835,6 +835,21 @@ struct retro_core_option_v2_definition option_defs_us[] = {
+       "10"
+    },
+ #ifdef HAVE_NETWORK
++   {
++      "gambatte_netlink_timing",
++      "Netplay Link Timing (Restart)",
++      "Netplay Timing (Restart)",
++      "Auto uses a bounded session timeline for the three verified Japanese beatmania GB ROMs and v3j timing for all others. Both peers need the same setting and corresponding starting states. Bounded timing is byte-level compatibility, not cycle-exact cable emulation. Reconnect after loading a state or resetting.",
++      NULL,
++      "gb_link",
++      {
++         { "auto", "Auto" },
++         { "v3j", "v3j" },
++         { "bounded", "Bounded Timeline" },
++         { NULL, NULL },
++      },
++      "auto"
++   },
+    {
+       "gambatte_show_gb_link_settings",
+       "Show Game Link Settings",
+diff --git a/libgambatte/src/gambatte-memory.cpp b/libgambatte/src/gambatte-memory.cpp
+index e4c3435e5f23..6acf7e13dfb8 100644
+--- a/libgambatte/src/gambatte-memory.cpp
++++ b/libgambatte/src/gambatte-memory.cpp
+@@ -34,6 +34,8 @@ Memory::Memory(Interrupter const &interrupter) :
+    getInput_(0)
+ #ifdef HAVE_NETWORK
+ , serial_io_(0)
++, ccBase_(0)
++, serialArmed_(0)
+ #endif
+ , divLastUpdate_(0)
+ , lastOamDmaUpdate_(disabled_time)
+@@ -107,6 +109,9 @@ void Memory::loadState(SaveState const &state) {
+ #ifdef HAVE_NETWOWRK
+ 	serialize_value_ = state.mem.serialize_value;
+ 	serialize_is_fastcgb_ = state.mem.serialize_is_fastcgb;
++#endif
++#ifdef HAVE_NETWORK
++	serialArmed_ = 0;   /* Hanbang v4bw: not saved; an armed port counts as armed long ago */
+ #endif
+ 	serialCnt_ = intreq_.eventTime(intevent_serial) != disabled_time
+ 	           ? serialCntFrom(intreq_.eventTime(intevent_serial) - state.cpu.cycleCounter,
+@@ -162,14 +167,26 @@ void Memory::startSerialTransfer(unsigned long cc, unsigned char data, bool fast
+ }
+ 
+ void Memory::checkSerial(unsigned long const cc) {
++	if(serial_io_) serial_io_->service(ccBase_+cc,ioamhram_[0x101],ioamhram_[0x102]);
++	if (serial_io_ && isCgb()) serial_io_->irTick(ccBase_ + cc, isDoubleSpeed());   /* Hanbang v5ir */
+ 	// Periodically checks if serial data is received
+ 	if ((serial_io_ != 0) &&
+ 		 ((ioamhram_[0x102] & 0x80) == 0x80) &&
+ 		 (intreq_.eventTime(intevent_serial) == disabled_time)) {
+ 		unsigned char data;
+ 		bool fastCgb;
++		serial_io_->setClock(ccBase_ + cc);
++		serial_io_->setArmed(serialArmed_);
+ 		if (serial_io_->check(ioamhram_[0x101], data, fastCgb)) {
+-			startSerialTransfer(cc, data, fastCgb);
++			/* Hanbang v4bw: an armed port is only checked at core events (up to a
++			 * 4128-cycle run apart in a busy loop), so start the transfer when the
++			 * byte was due, as the other Game Boy's clock would have, not now. */
++			unsigned long late = serial_io_->lateCycles();
++			if (late > cc)
++				late = cc;
++			startSerialTransfer(cc - late, data, fastCgb);
++			if (intreq_.eventTime(intevent_serial) < cc)
++				intreq_.setEventTime<intevent_serial>(cc);   /* already over: completes now */
+ 		}
+ 	}
+ }
+@@ -180,8 +197,10 @@ void Memory::updateSerial(unsigned long const cc) {
+ 		if (intreq_.eventTime(intevent_serial) <= cc) {
+ #ifdef HAVE_NETWORK
+ 			bool fire = ((ioamhram_[0x102] & 0x80) == 0x80);
++			/* Hanbang: the bits of the incoming byte not shifted in yet (see below). */
++			unsigned const rest = (serialize_value_ << (8 - serialCnt_)) & 0xFF;
+ 			ioamhram_[0x101] = ((ioamhram_[0x101] << serialCnt_) |
+-					    (serialize_value_ >> (8 - serialCnt_))) & 0xFF;
++					    (rest >> (8 - serialCnt_))) & 0xFF;
+ #else
+          ioamhram_[0x101] = (((ioamhram_[0x101] + 1) << serialCnt_) - 1) & 0xFF;
+ #endif
+@@ -198,8 +217,19 @@ void Memory::updateSerial(unsigned long const cc) {
+ 			int const targetCnt = serialCntFrom(intreq_.eventTime(intevent_serial) - cc,
+ #ifdef HAVE_NETWORK
+ 			                                    serialize_is_fastcgb_);
+-			ioamhram_[0x101] = ((ioamhram_[0x101] << (serialCnt_ - targetCnt)) |
+-					    (serialize_value_ >> (8 - (serialCnt_ - targetCnt)))) & 0xFF;
++			{
++				/* Hanbang: shift in the next bits of the incoming byte, after the
++				 * 8 - serialCnt_ already shifted in, instead of its top bits again.
++				 * Without this, a game that reads SB/SC/IF while a byte is on the wire
++				 * receives it shifted right (0x20 -> 0x08: Yu-Gi-Oh! DM1 link handshake).
++				 * The byte itself is kept: a write to SC during the transfer sets
++				 * serialCnt_ back to 8, and the byte then comes in whole as before
++				 * (Beach Volley: shifting the kept byte broke its VS start). */
++				int const done = serialCnt_ - targetCnt;
++				unsigned const rest = (serialize_value_ << (8 - serialCnt_)) & 0xFF;
++				ioamhram_[0x101] = ((ioamhram_[0x101] << done) |
++						    (rest >> (8 - done))) & 0xFF;
++			}
+ #else
+                                              ioamhram_[0x102] & isCgb() * 2);
+          ioamhram_[0x101] = (((ioamhram_[0x101] + 1) << (serialCnt_ - targetCnt)) - 1) & 0xFF;
+@@ -436,6 +466,9 @@ unsigned long Memory::resetCounters(unsigned long cc) {
+ 	decEventCycles(intevent_unhalt, dec);
+ 
+ 	unsigned long const oldCC = cc;
++#ifdef HAVE_NETWORK
++	ccBase_ += dec;
++#endif
+ 	cc -= dec;
+ 	intreq_.resetCc(oldCC, cc);
+ 	tima_.resetCc(oldCC, cc, TimaInterruptRequester(intreq_));
+@@ -586,6 +619,13 @@ unsigned Memory::nontrivial_ff_read(unsigned const p, unsigned long const cc) {
+ 		return ioamhram_[0x141] | lcd_.getStat(ioamhram_[0x145], cc);
+ 	case 0x44:
+ 		return lcd_.getLyReg(cc);
++#ifdef HAVE_NETWORK
++	case 0x56:   /* Hanbang v5ir: the other Game Boy's LED over netplay (bit 1 = 0 when seen) */
++		if (isCgb() && serial_io_ && (ioamhram_[0x156] & 0xC0) == 0xC0
++				&& serial_io_->irRead(ccBase_ + cc, isDoubleSpeed()))
++			return ioamhram_[0x156] & ~0x02u;
++		break;
++#endif
+ 	case 0x69:
+ 		return lcd_.cgbBgColorRead(ioamhram_[0x168] & 0x3F, cc);
+ 	case 0x6B:
+@@ -686,11 +726,15 @@ void Memory::nontrivial_ff_write(unsigned const p, unsigned data, unsigned long
+ 		serialCnt_ = 8;
+ 
+ #ifdef HAVE_NETWORK
++		if ((data & 0x81) == 0x80 && !(ioamhram_[0x102] & 0x80))
++			serialArmed_ = ccBase_ + cc;   /* Hanbang v4bw: external-clock wait starts now */
+ 		if ((data & 0x81) == 0x81)
+       {
+ 			unsigned char receivedByte = 0xFF;
+-			if (serial_io_ != 0)
++			if (serial_io_ != 0) {
++				serial_io_->setClock(ccBase_ + cc);
+ 				receivedByte = serial_io_->send(ioamhram_[0x101], (data & isCgb() * 2));
++			}
+ 			startSerialTransfer(cc, receivedByte, (data & isCgb() * 2));
+       }
+ #else
+@@ -1063,8 +1107,12 @@ void Memory::nontrivial_ff_write(unsigned const p, unsigned data, unsigned long
+ 
+ 		return;
+ 	case 0x56:
+-		if (isCgb())
++		if (isCgb()) {
+ 			ioamhram_[0x156] = data | 0x3E;
++#ifdef HAVE_NETWORK
++			if (serial_io_) serial_io_->irWrite(ccBase_ + cc, isDoubleSpeed(), data);   /* Hanbang v5ir */
++#endif
++		}
+ 
+ 		return;
+ 	case 0x68:
+diff --git a/libgambatte/src/gambatte-memory.h b/libgambatte/src/gambatte-memory.h
+index b9257188a04f..93d66c64512e 100644
+--- a/libgambatte/src/gambatte-memory.h
++++ b/libgambatte/src/gambatte-memory.h
+@@ -147,6 +147,8 @@ private:
+ 	unsigned char serialize_value_;
+ 	bool serialize_is_fastcgb_;
+ 	SerialIO *serial_io_;
++	unsigned long ccBase_;   /* Hanbang: cycles taken off cc by resetCounters, so ccBase_ + cc keeps counting */
++	unsigned long serialArmed_; /* Hanbang v4bw: ccBase_ + cc when SC last went from idle to an external-clock wait */
+ #endif
+ 	InputGetter *getInput_;
+ 	unsigned long divLastUpdate_;
+diff --git a/libgambatte/src/gambatte.cpp b/libgambatte/src/gambatte.cpp
+index bef0bf2cd5f4..ad1607f40029 100644
+--- a/libgambatte/src/gambatte.cpp
++++ b/libgambatte/src/gambatte.cpp
+@@ -80,6 +80,12 @@ void GB::Priv::full_init() {
+ }
+ 
+ void GB::reset() {
++   /* v4bv: full_init() reloads the BIOS and snapshots ROM bank 0. If reset
++    * occurs before FF50, bank 0 still contains the BIOS overlay. Restore
++    * the cartridge first, or that overlay becomes the new ROM backup and
++    * survives FF50 after reboot (beatmania then waits on a white screen).
++    * Do this only for reset: load() has already allocated a new cartridge. */
++   p_->cpu.mem_.bootloader.call_FF50();
+    p_->full_init();
+ }
+ 
+diff --git a/libgambatte/src/serial_io.h b/libgambatte/src/serial_io.h
+index ad94255072f5..d50075b59a59 100644
+--- a/libgambatte/src/serial_io.h
++++ b/libgambatte/src/serial_io.h
+@@ -28,6 +28,19 @@ class SerialIO
+ 
+ 		virtual bool check(unsigned char out, unsigned char& in, bool& fastCgb) = 0;
+ 		virtual unsigned char send(unsigned char data, bool fastCgb) = 0;
++		/* Hanbang: Game Boy time (cycles, never reset) just before check()/send() */
++		virtual void service(unsigned long cycles, unsigned char out, unsigned char sc) { (void)cycles; (void)out; (void)sc; }
++		virtual void setClock(unsigned long cycles) { (void)cycles; }
++		/* Hanbang v4bw: Game Boy time this side armed SC for an external-clock byte, told before check() */
++		virtual void setArmed(unsigned long cycles) { (void)cycles; }
++		/* Hanbang v4bw: cycles the byte check() just took was already due (0 = on time):
++		 * its transfer is started that much earlier */
++		virtual unsigned long lateCycles() { return 0; }
++		/* Hanbang v5ir: Game Boy Color infrared port (FF56). abs = ccBase_ + cc, ds = double speed.
++		 * irRead returns true when the other Game Boy's LED is seen (bit 1 then reads 0). */
++		virtual void irWrite(unsigned long abs, bool ds, unsigned char val) { (void)abs; (void)ds; (void)val; }
++		virtual bool irRead(unsigned long abs, bool ds) { (void)abs; (void)ds; return false; }
++		virtual void irTick(unsigned long abs, bool ds) { (void)abs; (void)ds; }
+ };
+ 
+ }

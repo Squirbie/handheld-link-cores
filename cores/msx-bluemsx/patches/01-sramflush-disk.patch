@@ -1,0 +1,31 @@
+diff --git a/libretro.c b/libretro.c
+index d6bb4f7..b334799 100644
+--- a/libretro.c
++++ b/libretro.c
+@@ -230,7 +230,9 @@ bool set_eject_state(bool ejected)
+ 
+ bool get_eject_state(void)
+ {
+-   return !disk_inserted;
++   /* Always report an open tray: RetroArch 1.22 refuses to change the disk index while the tray is closed,
++    * so a single "next/previous disk" hotkey did nothing. set_image_index() inserts the new disk directly. */
++   return true;
+ }
+ 
+ unsigned get_image_index(void)
+@@ -1469,6 +1471,15 @@ bool retro_load_game_special(unsigned a, const struct retro_game_info *b, size_t
+ 
+ void retro_unload_game(void)
+ {
++   /* Write battery-backed cartridge SRAM / flash (Koei, ASCII8/16 SRAM, MegaFlashROM ...) to the save
++    * directory. The libretro port never tears the emulated board down, so the mapper destroy callbacks that
++    * call sramSave() never ran and in-game saves were lost on every restart. */
++   if (boardInfo.destroy)
++   {
++      boardInfo.destroy();
++      boardInfo.destroy = NULL;
++   }
++
+    if (image_buffer)
+       free(image_buffer);
+    

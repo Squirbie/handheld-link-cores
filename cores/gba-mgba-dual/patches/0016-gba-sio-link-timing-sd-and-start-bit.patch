@@ -1,0 +1,110 @@
+Subject: GBA SIO: SD is high while a partner is on the cable; a parent writing start-bit 0 stops its transfer
+Series-Step: 16/19 (mgba_dual 1.6-os4)
+Origin: hanbang (this project)
+요약: 링크 박자 1.4 — 상대 GBA 가 메뉴에 있어도 SD 선은 1(실제 케이블처럼), 부모가 전송 중 시작 비트 0 을 쓰면 그 전송을 멈춤. 사람이 순서를 안 맞춰도 젤다 · 유희왕이 붙음.
+
+Multi-play SIOCNT bit 3 and RCNT SD read 1 whenever a partner is connected, even if it sits in a menu (GPIO input or
+normal mode), like a real cable where nobody pulls the line down. A parent that writes start bit 0 while a transfer is
+running stops it (no completion flag, no interrupt); children and solo play are unchanged. Two-GBA states carry
+DUAL_STATE_LINK14 in the version field, so a 1.3 core refuses them and a half-updated pair cannot silently diverge.
+Version string 1.4-os4.
+
+---
+diff --git a/src/gba/sio.c b/src/gba/sio.c
+index 9f725d07add7..d89d375ede34 100644
+--- a/src/gba/sio.c
++++ b/src/gba/sio.c
+@@ -177,6 +177,17 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
+ 
+ 	switch (sio->mode) {
+ 	case GBA_SIO_MULTI:
++		/* hanbang 1.4: the parent writing Start=0 while its transfer is still
++		 * running stops it (no completion, no IRQ). MultiSio's init writes
++		 * SIOCNT=0x2000 exactly for this; without it a transfer begun by the
++		 * previous protocol finished later and fired a stale IRQ into the
++		 * freshly initialized library (Four Swords title: host first = hang). */
++		if (!id && connected && GBASIOMultiplayerIsBusy(sio->siocnt) && !GBASIOMultiplayerIsBusy(value)
++		    && mTimingIsScheduled(&sio->p->timing, &sio->completeEvent)) {
++			mTimingDeschedule(&sio->p->timing, &sio->completeEvent);
++			sio->siocnt = GBASIOMultiplayerClearBusy(sio->siocnt);
++			sio->rcnt = GBASIORegisterRCNTFillSc(sio->rcnt);
++		}
+ 		value &= 0xFF83;
+ 		value = GBASIOMultiplayerSetSlave(value, id || !connected);
+ 		value = GBASIOMultiplayerSetId(value, id);
+diff --git a/src/gba/sio/lockstep.c b/src/gba/sio/lockstep.c
+index 993bbb9a1622..2952ccb80bde 100644
+--- a/src/gba/sio/lockstep.c
++++ b/src/gba/sio/lockstep.c
+@@ -897,11 +897,13 @@ static void _setData(struct GBASIOLockstepCoordinator* coordinator, uint32_t id,
+ 
+ void _setReady(struct GBASIOLockstepCoordinator* coordinator, struct GBASIOLockstepPlayer* activePlayer, int playerId, enum GBASIOMode mode) {
+ 	activePlayer->otherModes[playerId] = mode;
++	/* hanbang 1.4: SD is a shared line that idles high; a cabled unit that is
++	 * not in multiplayer mode (title/menu: GPIO inputs or normal mode) does not
++	 * pull it low. Requiring every partner to already be in multiplayer mode
++	 * made the parent miss its one-time role check (Nintendo MultiSio: SD=1 &&
++	 * SI=0 -> parent) whenever it entered the link menu first. */
++	UNUSED(coordinator);
+ 	bool ready = true;
+-	int i;
+-	for (i = 0; ready && i < coordinator->nAttached; ++i) {
+-		ready = activePlayer->otherModes[i] == activePlayer->mode;
+-	}
+ 	if (activePlayer->mode == GBA_SIO_MULTI) {
+ 		struct GBASIO* sio = activePlayer->driver->d.p;
+ 		sio->siocnt = GBASIOMultiplayerSetReady(sio->siocnt, ready);
+diff --git a/src/platform/libretro/dual/libretro_dual.c b/src/platform/libretro/dual/libretro_dual.c
+index 0e3025bba998..e01f4e86ac63 100644
+--- a/src/platform/libretro/dual/libretro_dual.c
++++ b/src/platform/libretro/dual/libretro_dual.c
+@@ -55,7 +55,10 @@
+ #endif
+ 
+ #define DUAL_PLAYERS 2
+-#define DUAL_VERSION "1.3-os4"
++/* 1.4(10/21) = 1.3-os4(4판) + 링크 박자: SD 는 상대가 내리지 않으면 1 · 부모가 전송 중에
++ * 시작 비트 0 을 쓰면 그 전송을 멈춤. 두 대 상태는 판 칸에 DUAL_STATE_LINK14 를 넣어
++ * 1.3 코어가 거절하게 함(판이 섞인 넷플레이가 몰래 어긋나지 않게). */
++#define DUAL_VERSION "1.4-os4"
+ #define DUAL_WIDTH GBA_VIDEO_HORIZONTAL_PIXELS
+ #define DUAL_HEIGHT GBA_VIDEO_VERTICAL_PIXELS
+ #define DUAL_AUDIO_CHUNK 1024
+@@ -68,6 +71,7 @@
+ 
+ #define DUAL_STATE_MAGIC 0x31444748 /* "HGD1" */
+ #define DUAL_STATE_VERSION 1
++#define DUAL_STATE_LINK14 0x100
+ #include "hb_ownsave.h"
+ 
+ /* Extra memory ids for test harnesses (RetroArch never asks for these). */
+@@ -1191,7 +1195,7 @@ bool retro_serialize(void* data, size_t size) {
+ 	memset(data, 0, total);
+ 	struct DualStateHeader* header = data;
+ 	STORE_32LE(DUAL_STATE_MAGIC, 0, &header->magic);
+-	STORE_32LE(hb_has_token() ? 3 : DUAL_STATE_VERSION, 0, &header->version);
++	STORE_32LE((hb_has_token() ? 3 : DUAL_STATE_VERSION) | (linkOn ? DUAL_STATE_LINK14 : 0), 0, &header->version);
+ 	memcpy(header->reserved, hb_own_token, 16);
+ 	hb_put32((uint8_t*)header->reserved + 16, hb_own_save_hint);
+ 	hb_put32((uint8_t*)header->reserved + 20, hb_has_token() ? hb_own_frame : 0);
+@@ -1258,6 +1262,12 @@ bool retro_unserialize(const void* data, size_t size) {
+ 		return false;
+ 	}
+ 	LOAD_32LE(value, 0, &header->version);
++	if (!!(value & DUAL_STATE_LINK14) != linkOn) {
++		/* 두 대 상태인데 1.4 표시가 없음 = 1.3 이하 코어가 만든 상태(넷플레이 상대가 옛 판) */
++		_log(RETRO_LOG_ERROR, "state from a different link-timing version (1.3 vs 1.4); update both devices");
++		return false;
++	}
++	value &= ~DUAL_STATE_LINK14;
+ 	if (value != DUAL_STATE_VERSION && value != 2 && value != 3) {
+ 		return false;
+ 	}
+@@ -1285,6 +1295,7 @@ bool retro_unserialize(const void* data, size_t size) {
+ 
+ 	uint32_t ownVersion;
+ 	LOAD_32LE(ownVersion, 0, &header->version);
++	ownVersion &= ~DUAL_STATE_LINK14;
+ 	if (ownVersion >= 2 && hb_u32((const uint8_t*)header->reserved + 16) > DUAL_SAVE_SIZE) return false;
+ 	const uint8_t* base = (const uint8_t*) data + sizeof(*header);
+ 	size_t stride = _playerStateSize();

@@ -1,0 +1,199 @@
+From b02d7a68e505634b95e22a9e13305b9cf613b5c9 Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Thu, 22 Oct 2026 02:56:41 +0900
+Subject: [PATCH 2/2] NGP Dual: BIOS default serial handlers at COMINIT
+
+With the link on, the HLE COMINIT now does what the real BIOS has to do
+for games that rely on it: it points the user vectors 0x6FE4 (INTRX0)
+and 0x6FE8 (INTTX0) at two HLE handlers in the BIOS area (0xFF2DA0 and
+0xFF2DB0, opcode 0x1F placed by bios_install only when the link is on)
+and enables both serial interrupt levels (INTES0 = 0x66).
+
+- receive: SC0CR error bits into 0x6D06, SC0BUF into the 0x6CC0 ring,
+  count +1, stop flag 0x6D05 above 0x37 bytes (RTS kept off), otherwise
+  RTS back to what it was (the copied handler in Big Bang Pro Wrestling
+  does the same).
+- transmit end: next byte from the 0x6C80 ring into SC0BUF, or clear
+  the busy flag 0x6D04.
+- both end with RETI.
+
+SNK library games (KOF R-1/R-2, SvC, Card Fighters) overwrite the
+vectors right after COMINIT and behave as before; games that only call
+COMINIT (Pocket Tennis, Tsunagete Pon, Magical Drop, Samurai Shodown 2,
+Neo Poke Pro Yakyuu, ...) used to stop after the first byte because
+nothing sent the rest of the ring and nothing stored received bytes.
+Link off is unchanged (same picture, sound and RAM as the original core).
+
+---
+ mednafen/ngp/bios.c    |  8 ++++++
+ mednafen/ngp/biosHLE.c |  2 ++
+ mednafen/ngp/hb_link.c | 64 ++++++++++++++++++++++++++++++++++++++++++
+ mednafen/ngp/hb_link.h | 10 +++++++
+ 4 files changed, 84 insertions(+)
+
+diff --git a/mednafen/ngp/bios.c b/mednafen/ngp/bios.c
+index 4b08384..58bedec 100644
+--- a/mednafen/ngp/bios.c
++++ b/mednafen/ngp/bios.c
+@@ -14,6 +14,7 @@
+ 
+ #include <string.h>
+ #include "bios.h"
++#include "hb_link.h"
+ 
+ #ifdef MSB_FIRST
+ #define HTOLE32(l) ((((l)>>24) & 0xff) | (((l)>>8) & 0xff00) | (((l)<<8) & 0xff0000) | (((l)<<24) & 0xff000000))
+@@ -204,6 +205,13 @@ int bios_install(void)
+    /* Default Interrupt handler */
+    ngpc_bios[0x23DF] = 0x07;  //RETI
+ 
++   /* 한방 두 대 연결(연결 켬일 때만): 바이오스 기본 직렬 처리기 자리(hb_link.c hb_com_isr) */
++   if (hb_link_on)
++   {
++      ngpc_bios[HB_COM_RXISR & 0xFFFF] = 0x1F;
++      ngpc_bios[HB_COM_TXISR & 0xFFFF] = 0x1F;
++   }
++
+    /* Install a Quick and Dirty Bios */
+    ngpc_bios[0xFFFE] = 0x68; // - JR 0xFFFFFE (Infinite loop!)
+    ngpc_bios[0xFFFF] = 0xFE;
+diff --git a/mednafen/ngp/biosHLE.c b/mednafen/ngp/biosHLE.c
+index c37b8da..8976fdb 100644
+--- a/mednafen/ngp/biosHLE.c
++++ b/mednafen/ngp/biosHLE.c
+@@ -65,6 +65,8 @@ void iBIOSHLE(void)
+    cycles = 8;		/* TODO: Correct cycle counts (or approx?) */
+ 
+    /* 한방 두 대 연결: COM 함수는 실제 직렬 0 · 바이오스 고리 버퍼로(hb_link.c). 끄면 아래 원래 NeoPop 그대로 */
++   if (hb_link_on && hb_com_isr(pc & 0xFFFFFF))
++      return;                    /* 바이오스 기본 직렬 처리기 — RETI 까지 함 */
+    if (hb_link_on && hb_com_hle(pc & 0xFFFFFF))
+    {
+       pc = pop32();
+diff --git a/mednafen/ngp/hb_link.c b/mednafen/ngp/hb_link.c
+index acbc09c..9fcd77c 100644
+--- a/mednafen/ngp/hb_link.c
++++ b/mednafen/ngp/hb_link.c
+@@ -19,6 +19,7 @@
+ #include "mem.h"
+ #include "interrupt.h"
+ #include "TLCS-900h/TLCS900h_registers.h"
++#include "TLCS-900h/TLCS900h_interpret.h"
+ #include "../state.h"
+ #include "../state_helpers.h"
+ 
+@@ -296,6 +297,13 @@ int hb_com_hle(uint32_t vector)
+             for (a = COM_TXCNT; a <= COM_ERR; a++)
+                storeB(a, 0);
+          }
++         /* 실기 바이오스처럼 기본 직렬 처리기를 깔고 인터럽트 수준을 켬(받기 · 보냄 끝 모두 6, 걸린 요청은 지움).
++          * 근거: SNK 라이브러리 게임은 COMINIT 바로 뒤에 자기 처리기로 덮어쓰고(KOF R-2 0x202503~20251F · SvC),
++          * 빅뱅 프로레슬링은 받기 처리기만 램 0x6D26 에 복사해 덮어씀(보냄 끝은 바이오스 것에 기댐 — 0x20590E).
++          * 포켓 테니스 · 츠나게테 퐁 · 매지컬 드롭은 벡터를 RETI 로 채운 다음 COMINIT 만 부름 → 바이오스 처리기가 있어야 이어 보냄 */
++         storeL(0x6FE4, HB_COM_RXISR);
++         storeL(0x6FE8, HB_COM_TXISR);
++         storeB(0x77, 0x66);
+          rCodeB(0x30) = COM_BUF_OK;
+          return 1;
+       case VECT_COMSENDSTART:
+@@ -353,6 +361,62 @@ int hb_com_hle(uint32_t vector)
+    return 0;
+ }
+ 
++/* 바이오스 기본 직렬 처리기(COMINIT 이 0x6FE4 · 0x6FE8 에 깖). SNK 라이브러리 처리기와 같은 일:
++ *  받기(INTRX0): SC0CR 오류 비트(0x1C)를 0x6D06 에 모으고, SC0BUF 를 받은 고리(0x6CC0 + (머리 + 개수) & 0x3F)에, 개수 +1,
++ *               개수가 0x37 을 넘으면 0x6D05 = FF(받기 멈춤 — RTS 를 끈 채 둠), 아니면 0 이고 RTS 는 들어올 때 상태로 되돌림
++ *               (빅뱅 프로레슬링 램 처리기 꼴 — 게임이 COMOFFRTS 로 꺼 둔 RTS 를 멋대로 켜지 않음).
++ *  보냄 끝(INTTX0): 보낼 개수가 남았으면 0x6D04 = FF · 개수 -1 · 머리 +1 · 보낼 고리 다음 바이트를 SC0BUF 에, 없으면 0x6D04 = 0.
++ * 끝은 RETI(SR · PC 꺼냄 → 걸린 인터럽트 다시 봄). */
++int hb_com_isr(uint32_t address)
++{
++   uint8_t cnt, head, err, rts;
++   uint16_t sr_saved;
++   if (!hb_link_on)
++      return 0;
++   if (address == HB_COM_RXISR)
++   {
++      rts = COMMStatus & 1;
++      err = (uint8_t)(loadB(0x51) & 0x1C);
++      if (err)
++         storeB(COM_ERR, (uint8_t)(loadB(COM_ERR) | err));
++      cnt = loadB(COM_RXCNT);
++      storeB(COM_RXCNT, (uint8_t)(cnt + 1));
++      storeB(COM_RXBUF + ((cnt + loadB(COM_RXHEAD)) & 0x3F), loadB(0x50));
++      if ((int8_t)(cnt + 1) > 0x37)
++      {
++         storeB(COM_RXSTOP, 0xFF);
++         COMMStatus |= 1;
++      }
++      else
++      {
++         storeB(COM_RXSTOP, 0);
++         COMMStatus = (uint8_t)((COMMStatus & ~1) | rts);
++      }
++   }
++   else if (address == HB_COM_TXISR)
++   {
++      cnt = loadB(COM_TXCNT);
++      if (cnt)
++      {
++         storeB(COM_TXBUSY, 0xFF);
++         storeB(COM_TXCNT, (uint8_t)(cnt - 1));
++         head = loadB(COM_TXHEAD);
++         storeB(COM_TXHEAD, (uint8_t)(head + 1));
++         storeB(0x50, loadB(COM_TXBUF + (head & 0x3F)));
++      }
++      else
++         storeB(COM_TXBUSY, 0);
++   }
++   else
++      return 0;
++   /* RETI */
++   sr_saved = pop16();
++   pc = pop32();
++   sr = sr_saved;
++   changedSP();
++   return 1;
++}
++
+ int hb_sio_StateAction(void *data, int load, int data_only)
+ {
+    SFORMAT StateRegs[] =
+diff --git a/mednafen/ngp/hb_link.h b/mednafen/ngp/hb_link.h
+index 3394164..37ef404 100644
+--- a/mednafen/ngp/hb_link.h
++++ b/mednafen/ngp/hb_link.h
+@@ -13,6 +13,10 @@
+  *  - 0xB2 비트0 = 내 RTS(0 = 받을 준비). SC0MOD 의 CTSE 가 켜져 있으면 상대 RTS 가 켜질 때까지 다음 바이트를 안 보냄.
+  *  - 바이오스 COM 함수(COMINIT ~ COMGETBUFDATA)를 게임이 까는 SNK 직렬 처리기와 같은 바이오스 작업 메모리
+  *    (보낼 고리 0x6C80 · 받은 고리 0x6CC0 · 개수 0x6D00/0x6D01 · 머리 0x6D02/0x6D03 · 보내는 중 0x6D04 · 받기 멈춤 0x6D05 · 오류 0x6D06)로.
++ *  - (10/22) COMINIT 은 실기 바이오스처럼 기본 직렬 처리기를 사용자 벡터에 깔고(받기 0x6FE4 · 보냄 끝 0x6FE8) 직렬 인터럽트
++ *    수준(INTES0 0x77)을 6 으로 켬. 처리기를 스스로 까는 게임(SNK 라이브러리 — KOF · SvC 는 둘 다, 빅뱅 프로레슬링 등은
++ *    받기만)은 COMINIT 바로 뒤에 덮어써서 그대로이고, 바이오스 처리기에 기대는 게임(포켓 테니스 · 츠나게테 퐁 · 매지컬 드롭 …)은
++ *    이제 보냄 끝마다 고리에서 다음 바이트가 나가고, 받은 바이트가 받은 고리에 쌓여 COMGETDATA 로 읽힘.
+  */
+ #ifndef HB_LINK_H
+ #define HB_LINK_H
+@@ -23,6 +27,11 @@
+ extern "C" {
+ #endif
+ 
++/* 바이오스 기본 직렬 처리기(받기 · 보냄 끝) 자리 — 연결 켬일 때만 bios_install 이 이 두 곳에 HLE 명령(0x1F)을 놓고,
++ * COMINIT 이 사용자 벡터 0x6FE4(받기) · 0x6FE8(보냄 끝)에 이 주소를 넣음(실기 바이오스처럼. 10/22 TASK3) */
++#define HB_COM_RXISR 0xFF2DA0
++#define HB_COM_TXISR 0xFF2DB0
++
+ extern uint8_t hb_link_on;   /* 1 = 연결 흉내 켬(게임 켤 때 래퍼가 정함, 상태에 안 들어감) */
+ extern uint8_t hb_link_cts;  /* 상대 RTS 가 켜져 있음(받을 준비) — 래퍼가 줄마다 넣음 */
+ /* 연결 켬일 때 시계(RTC): 기기 시각을 읽을 때마다 쓰지 않고 '켤 때 시각(지역 시간을 UTC 처럼) + 흐른 CPU 사이클'로 —
+@@ -44,6 +53,7 @@ void    hb_sio_receive(uint8_t data);
+ int     hb_sio_take(uint8_t *data);
+ uint8_t hb_sio_rts(void);
+ int     hb_com_hle(uint32_t vector);                      /* 처리했으면 1 (RET 은 부른 쪽) */
++int     hb_com_isr(uint32_t address);                     /* 바이오스 기본 직렬 처리기 — 처리했으면 1 (RETI 까지 함) */
+ int     hb_sio_StateAction(void *data, int load, int data_only);
+ 
+ #ifdef __cplusplus
+-- 
+2.39.5
+

@@ -1,0 +1,6 @@
+# Apply in this order (git apply or patch -p1)
+0001-netpacket-link-cable-with-timing-v4bw.patch
+0002-gbc-infrared-over-netplay-v5ir.patch
+0003-reply-00-not-ff-to-unheard-byte-v5irh.patch
+0004-hold-second-byte-to-next-frame-v5irh2.patch
+0005-infrared-meet-before-led-and-pulse-tail-v5irh3.patch

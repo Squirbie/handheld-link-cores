@@ -1,0 +1,26 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# KNULLI service: remembers Wi-Fi networks you joined and reconnects when one is in range, like a phone
+# (runs /userdata/system/claude/hb_wifimem.py; it only reads knulli.conf). Details at the top of hb_wifimem.py.
+# Enable: add "hb_wifimem" to system.services in /userdata/system/knulli.conf (S99userservices starts it at boot).
+# Disable: remove that word and reboot. Install this file as /userdata/system/services/hb_wifimem
+P=/var/run/hb_wifimem.pid
+PY=/userdata/system/claude/hb_wifimem.py
+
+case "$1" in
+  start|"")
+    if [ -f "$P" ] && kill -0 "$(cat "$P")" 2>/dev/null; then
+      exit 0
+    fi
+    [ -f "$PY" ] || exit 0
+    python3 "$PY" >/dev/null 2>&1 < /dev/null &
+    echo $! > "$P"
+    ;;
+  stop)
+    if [ -f "$P" ]; then
+      kill "$(cat "$P")" 2>/dev/null
+      rm -f "$P"
+    fi
+    ;;
+esac
+exit 0

@@ -1,0 +1,468 @@
+Subject: gpSP: RFU wireless adapter over netplay: survive Wi-Fi latency and bursts (v2)
+Series-Step: 2/3 (gpsp rfu v3)
+Origin: hanbang (this project); record name rfu_v2.patch (it supersedes the first 6-line timeout patch)
+요약: 무선 어댑터(RFU) 넷플레이가 와이파이 지연 · 몰아 오기에 견디게 함 — 시간 제한 1.2초, 패킷 줄 4칸 → 128칸 돌림 줄, 늦은 답을 버리지 않음, 끊김은 남은 패킷을 다 읽은 뒤, 상대가 아닌 기기 패킷 거르기, 손님 패킷 길이 검사.
+
+Netplay round trips take tens to hundreds of ms and sometimes stall for half a second, but the stock adapter model
+assumes the adapter answers within milliseconds and drops RF packets after a few frames.
+- "no news" time-outs are at least 1.2 s (RFU_NET_TIMEOUT_CYCLES); the answer time of the leader is the game's own value
+  (about 11 ms) because late answers are no longer thrown away.
+- received-packet queues are 128-entry ring queues instead of four-entry shifting arrays that dropped packets when the
+  Wi-Fi released a burst (the cause of the "communication error" after about five minutes of trading). Empty packets
+  are not queued.
+- the client game is handed one leader packet per frame (RFU_CLIENT_PER_FRAME); the leader waits (at most 1.2 s) while
+  more than RFU_PIPE_MAX (12) of its packets are unacknowledged, or while a client that reported a queue longer than
+  RFU_PEER_Q_MAX (10) has no packet queued. The client's ACK carries its queue length in its fourth word (tag 'Q',
+  previously always 0, ignored by stock cores).
+- a DISCONNECT is applied after the packets queued before it were read, so the game gets the last greeting.
+- HOST_SEND / CLIENT_SEND / ACK are only accepted from the current peer (client_id check), and the length of a client
+  packet is validated (blen <= 16 and len >= blen + 12) before it is copied into the 16-byte slot.
+
+---
+diff --git a/rfu.c b/rfu.c
+index f4ae0b701d0a..ea3ebb425dcb 100644
+--- a/rfu.c
++++ b/rfu.c
+@@ -33,6 +33,44 @@
+ #define RFU_DEF_TIMEOUT              32   // Expressed as frames (~533ms)
+ #define RFU_DEF_RTXMAX                4   // Up to 4 transmissions per send
+ 
++// ---- 한방 v2: 와이파이 넷플레이용 조정 (10/11) ----
++// 게임은 무선 어댑터가 몇 ms 안에 답하는 것을 기준으로 짜여 있다. 넷플레이는 왕복에
++// 수십~수백 ms 가 걸리고 가끔 0.5초씩 멈추기도 한다. 그래서:
++// 1) 끊김 판단: 아무 소식 없이 1.2초가 지나야 '시간 초과'로 본다(v1 과 같음).
++#define RFU_NET_TIMEOUT_CYCLES (16777216 * 6 / 5)  // 1.2초
++// 2) 리더가 방금 보낸 것의 답을 기다리는 시간: 게임이 정한 값 그대로(약 11ms, 순정과 같음).
++//    v1 은 1.2초까지 기다려서 리더 게임이 와이파이 왕복만큼 매번 멈췄다(느려진 원인).
++//    v2 는 늦게 온 답을 버리지 않고 줄에 남겨 다음 차례에 읽히므로 오래 기다릴 까닭이 없다.
++//    10/11 시험(파이어레드 교환, 리더÷손님 속도): 11ms 1.00 · 2프레임 0.96~0.98 · 3프레임 0.77.
++//    0 이면 게임 값만 쓰고, 값을 주면 그보다 짧게는 안 기다린다(사이클 단위, 1프레임=279620).
++#ifndef RFU_RESP_WAIT_CYCLES
++#define RFU_RESP_WAIT_CYCLES 0
++#endif
++// 3) 받은 패킷 줄: 순정 4칸은 와이파이가 잠깐 막혔다 풀리며 한꺼번에 오면 넘쳐서 패킷을
++//    버렸다(10/6 통신 에러의 원인). 패킷마다 게임 장면 하나가 실려 있어 하나도 버리면 안 된다.
++#define RFU_QUEUE_LEN               128   // 약 2초 분량
++// 4) 손님 게임에는 리더 패킷을 한 프레임에 1개씩만 넘긴다. 실제 어댑터도 리더 프레임마다
++//    1개씩 받는다. 한꺼번에 십여 개를 넘기면 게임 안의 받기 줄이 넘쳐 통신 에러가 난다.
++#define RFU_CLIENT_PER_FRAME          1
++// 5) 리더가 보낸 패킷 중 손님 어댑터의 '받았음'(ACK)이 아직 안 온 것이 이보다 많으면
++//    (= 와이파이가 지금 크게 늦음) '응답 없음'으로 넘기지 않고 답을 기다린다(최대 1.2초).
++//    이렇게 해야 밀린 패킷이 끝없이 쌓이지 않는다(쌓인 만큼 조작이 늦게 먹음).
++#define RFU_PIPE_MAX                 12   // 약 200ms 분량
++// 6) (10/12 검수) 손님 게임은 리더 패킷을 한 프레임에 1개씩만 읽는다. 기기마다 화면 속도가 조금
++//    다르면(예: 59.7장과 60장) 리더가 손님보다 빨라서 손님 줄이 끝없이 늘어난다. 맥 하네스에서
++//    손님을 1% 느리게 하고 교환방에 3분 머무니 줄이 65개(1초 넘게 늦음)까지 늘었고, 나갈 때
++//    통신 에러 화면이 났다. 그래서 v2 손님은 '받았음'(ACK)의 빈 넷째 칸에 자기 줄 길이를 실어
++//    보내고, 리더는 줄이 이보다 긴 손님의 다음 패킷이 아직 안 왔으면 그 패킷을 기다린다(최대 1.2초).
++//    다른 손님 패킷이 와 있어도 기다린다(세 대일 때 느린 손님 하나만 밀리지 않게).
++//    순정·v1 은 넷째 칸을 0 으로 보내고 읽지도 않으므로 섞여도 그대로 붙는다.
++//    10/12 시험(리더÷손님 속도, 20~300ms+0.5초 멈춤): 기준 6 은 0.57, 10 은 0.64(고치기 전 0.65~0.72).
++//    깨끗한 와이파이·20~60ms 에서는 손님 줄이 10 을 안 넘어서 1.00 그대로.
++//    손님이 1% 느리거나 10초마다 0.3초 멈출 때 손님 줄은 14~20 에서 멈춘다(고치기 전: 계속 늘어 128 에서 버림).
++#ifndef RFU_PEER_Q_MAX
++#define RFU_PEER_Q_MAX               10   // 약 170ms 분량
++#endif
++#define RFU_QINFO_TAG        0x51000000   // 넷째 칸 표시('Q'). 0 이면 줄 길이 정보 없음
++
+ 
+ // Unpacks big endian integers used for signaling
+ static inline u32 upack32(const u8 *ptr) {
+@@ -135,10 +173,16 @@ static struct {
+     u16 client_id;   // libretro client ID
+     u16 devid;       // Host-assigned device ID
+     u16 clttl;       // Client TTL (to check for disconnects)
++    u16 qhead;       // 줄의 맨 앞 (돌림 줄)
++    u16 qcount;      // 줄에 있는 패킷 수
++    u32 sent;        // 이 손님에게 보낸 패킷 수
++    u32 acked;       // 그중 손님 어댑터가 받았다고 알려 온 수
++    u32 disc_pending;// 손님이 끊었지만 줄에 남은 패킷을 다 읽은 뒤 자리를 비움
++    u32 peer_q;      // 손님이 마지막 ACK 에 실어 보낸 손님 쪽 줄 길이 (v2 손님만)
+     struct {
+       u32 datalen;   // Byte count of data waiting to be polled.
+       u8  data[16];  // Data received from client.
+-    } pkts[4];
++    } pkts[RFU_QUEUE_LEN];
+   } clients[4];      // Connected clients IDs (zero means empty slot).
+ } rfu_host;
+ 
+@@ -146,13 +190,19 @@ static struct {
+   u16 devid;         // Device ID assigned to the client (by the host?)
+   u16 clnum;         // Client number (0 to 3)
+   u16 host_id;       // Client ID for the host device.
+-  // Store host recevied packets (up to 8!)
++  u16 qhead;         // 줄의 맨 앞 (돌림 줄)
++  u16 qcount;        // 줄에 있는 패킷 수
++  u16 disc_pending;  // 리더가 끊었지만 줄에 남은 패킷을 다 넘긴 뒤 끊음
++  // Store host received packets
+   struct {
+     u16 hblen;       // Bytes received from the host.
+     u8 hdata[128];   // Data received from the host (accumulated).
+-  } pkts[4];
++  } pkts[RFU_QUEUE_LEN];
+ } rfu_client;
+ 
++// 이번 프레임에 손님 게임에 넘긴 리더 패킷 수
++static u32 rfu_client_events;
++
+ typedef struct {
+   u8 valid;
+   u8 ttl;            // When it reaches zero, entry is invalidated
+@@ -180,16 +230,20 @@ static t_client_broadcast rfu_peer_bcst[MAX_RFU_PEERS];
+ void netpacket_send(uint16_t client_id, const void *buf, size_t len);
+ void netpacket_poll_receive();
+ 
+-static void rfu_net_send_cmd(int client_id, u32 ptype, u32 h) {
++static void rfu_net_send_cmd_x(int client_id, u32 ptype, u32 h, u32 extra) {
+   u32 pkt[4] = {
+     netorder32(NET_RFU_HEADER),  // RFU1 header
+     netorder32(ptype),           // Message type
+     netorder32(h),               // Header word
+-    0
++    netorder32(extra)            // 순정은 늘 0. v2 손님 ACK 만 여기에 줄 길이를 실음
+   };
+   netpacket_send(client_id, pkt, 16);
+ }
+ 
++static void rfu_net_send_cmd(int client_id, u32 ptype, u32 h) {
++  rfu_net_send_cmd_x(client_id, ptype, h, 0);
++}
++
+ static void rfu_net_send_bcast(u32 ptype, u32 h, const u32 *pload) {
+   u32 i;
+   u32 pkt[9] = {
+@@ -368,9 +422,17 @@ static s32 rfu_process_command() {
+     // clients, it will return to idle state (I think!).
+     if (rfu_state == RFU_STATE_HOST) {
+       for (i = 0; i < 4; i++)
+-        if (rfu_host.clients[i].devid)
++        if (rfu_host.clients[i].devid && !rfu_host.clients[i].disc_pending)
+           return 0;     // We stay in the host mode.
+ 
++      // v2: 남은 자리가 모두 '끊고 나갔지만 줄이 남은' 자리뿐이면, 게임이 이제 그만 받겠다고
++      // 했으니 비우고 순정처럼 쉬는 상태로 감(유니온룸처럼 리더↔손님을 바꾸는 흐름에서
++      // 리더 상태에 남아 다음 접속이 거절되지 않게)
++      for (i = 0; i < 4; i++)
++        if (rfu_host.clients[i].devid) {
++          RFU_DEBUG_LOG("HOST_STOP clears pending slot %d (q=%d)\n", i, rfu_host.clients[i].qcount);
++          memset(&rfu_host.clients[i], 0, sizeof(rfu_host.clients[i]));
++        }
+       rfu_state = RFU_STATE_IDLE;
+     }
+ 
+@@ -461,9 +523,11 @@ static s32 rfu_process_command() {
+                     rfu_tx_buf.blen, rfu_plen - 1);
+       if (rfu_tx_buf.blen <= 90) {
+         for (i = 0; i < 4; i++)
+-          if (rfu_host.clients[i].devid)
++          if (rfu_host.clients[i].devid && !rfu_host.clients[i].disc_pending) {
+             rfu_net_send_data(rfu_host.clients[i].client_id,
+               NET_RFU_HOST_SEND, rfu_tx_buf.blen, rfu_tx_buf.buf, rfu_tx_buf.blen);
++            rfu_host.clients[i].sent++;
++          }
+       }
+     }
+     else if (rfu_state == RFU_STATE_CLIENT) {
+@@ -488,18 +552,22 @@ static s32 rfu_process_command() {
+       u8 tmpbuf[16*4] = {0};
+       rfu_buf[cnt++] = 0;   // Header contains byte counts as a bitfield.
+       for (i = 0; i < 4; i++) {
+-        u32 dlen = MIN(16, rfu_host.clients[i].pkts[0].datalen);
++        u32 head = rfu_host.clients[i].qhead;
++        u32 dlen = rfu_host.clients[i].qcount ?
++                   MIN(16, rfu_host.clients[i].pkts[head].datalen) : 0;
+         if (rfu_host.clients[i].devid && dlen != 0) {
+           RFU_DEBUG_LOG("Host reads data from client buffer (%d bytes)\n", dlen);
+           // Accumulate into temp buffer
+-          memcpy(&tmpbuf[bufbytes], &rfu_host.clients[i].pkts[0].data[0], dlen);
++          memcpy(&tmpbuf[bufbytes], &rfu_host.clients[i].pkts[head].data[0], dlen);
+           bufbytes += dlen;
+           // Update byte count header for this client
+           rfu_buf[0] |= dlen << (8 + i * 5);
+           // Discard front packet
+-          memmove(&rfu_host.clients[i].pkts[0], &rfu_host.clients[i].pkts[1],
+-                  3 * sizeof(rfu_host.clients[i].pkts[0]));
+-          rfu_host.clients[i].pkts[3].datalen = 0;
++          rfu_host.clients[i].qhead = (head + 1) % RFU_QUEUE_LEN;
++          rfu_host.clients[i].qcount--;
++          // 끊고 나간 손님: 남은 패킷을 다 읽었으면 이제 자리를 비움
++          if (!rfu_host.clients[i].qcount && rfu_host.clients[i].disc_pending)
++            memset(&rfu_host.clients[i], 0, sizeof(rfu_host.clients[i]));
+         }
+       }
+       // Copy data into words into the RFU buffer.
+@@ -509,15 +577,23 @@ static s32 rfu_process_command() {
+     }
+     else if (rfu_state == RFU_STATE_CLIENT) {
+       u32 cnt = 0;
+-      u32 dlen = rfu_client.pkts[0].hblen;
++      u32 head = rfu_client.qhead;
++      u32 dlen = rfu_client.qcount ? rfu_client.pkts[head].hblen : 0;
+       RFU_DEBUG_LOG("Client reads data from host buffer (%d bytes)\n", dlen);
+       rfu_buf[cnt++] = dlen;   // Header contains byte count.
+       for (j = 0; j < (dlen + 3) / 4; j++)
+-        rfu_buf[cnt++] = leupack32(&rfu_client.pkts[0].hdata[j*4]);
++        rfu_buf[cnt++] = leupack32(&rfu_client.pkts[head].hdata[j*4]);
+ 
+       // Move to the next packet
+-      memmove(&rfu_client.pkts[0], &rfu_client.pkts[1], sizeof(rfu_client.pkts[0]) * 3);
+-      rfu_client.pkts[3].hblen = 0;
++      if (rfu_client.qcount) {
++        rfu_client.qhead = (head + 1) % RFU_QUEUE_LEN;
++        rfu_client.qcount--;
++      }
++      // 리더가 끊었으면, 끊기 전에 온 패킷을 다 넘긴 지금 끊음
++      if (!rfu_client.qcount && rfu_client.disc_pending) {
++        memset(&rfu_client, 0, sizeof(rfu_client));
++        rfu_state = RFU_STATE_IDLE;
++      }
+       return cnt;
+     }
+     break;
+@@ -555,19 +631,45 @@ static s32 rfu_process_command() {
+ // Returns true if a Wait event can finish due to new data being available.
+ static bool rfu_data_avail() {
+   if (rfu_state == RFU_STATE_CLIENT) {
+-    if (rfu_client.pkts[0].hblen != 0)
++    // 손님: 이번 프레임 몫(1개)을 아직 안 넘겼을 때만
++    if (rfu_client.qcount && rfu_client_events < RFU_CLIENT_PER_FRAME)
+       return true;
+   }
+   else if (rfu_state == RFU_STATE_HOST) {
+     // Returns true if any data from any client is available.
+     u32 i;
+     for (i = 0; i < 4; i++)
+-      if (rfu_host.clients[i].devid && rfu_host.clients[i].pkts[0].datalen)
++      if (rfu_host.clients[i].devid && rfu_host.clients[i].qcount)
+         return true;
+   }
+   return false;
+ }
+ 
++// 리더: 어떤 손님에게 '받았음'이 안 온 패킷이 RFU_PIPE_MAX 개보다 많으면 참.
++// 한 번도 '받았음'이 안 온 자리는 빼고 봄 (손님 게임이 접속을 포기한 뒤 늦게 잡힌 자리:
++// 답이 영영 안 오니 기다려 봐야 4초 동안 느려지기만 함).
++static bool rfu_net_backlogged() {
++  u32 i;
++  for (i = 0; i < 4; i++)
++    if (rfu_host.clients[i].devid && !rfu_host.clients[i].disc_pending &&
++        rfu_host.clients[i].acked &&
++        rfu_host.clients[i].sent - rfu_host.clients[i].acked > RFU_PIPE_MAX)
++      return true;
++  return false;
++}
++
++// 리더: 줄이 RFU_PEER_Q_MAX 개보다 길다고 알려 온 손님(= 리더보다 느린 손님)의 패킷이
++// 지금 리더 줄에 없으면 참. 이때 리더는 그 손님 패킷이 올 때까지 기다림(최대 1.2초).
++static bool rfu_net_wait_peer() {
++  u32 i;
++  for (i = 0; i < 4; i++)
++    if (rfu_host.clients[i].devid && !rfu_host.clients[i].disc_pending &&
++        rfu_host.clients[i].acked && !rfu_host.clients[i].qcount &&
++        rfu_host.clients[i].peer_q > RFU_PEER_Q_MAX)
++      return true;
++  return false;
++}
++
+ // Called whenever the game flips the SIOCNT:Start bit to transmit a value.
+ // We simulate the reception and response of said value (over the SPI bus).
+ u32 rfu_transfer(u32 sent_value) {
+@@ -639,8 +741,8 @@ u32 rfu_transfer(u32 sent_value) {
+     // and reverse the clock roles (the RFU becomes master).
+     if (rfu_cmd == RFU_CMD_WAIT || rfu_cmd == RFU_CMD_RTX_WAIT || rfu_cmd == RFU_CMD_SEND_DATAW) {
+       rfu_comstate = RFU_COMSTATE_WAITEVENT;
+-      rfu_timeout_cycles = rfu_timeout * (16777216 / 60);  // Frames to cycles
+-      rfu_resp_timeout = rfu_rtx_max * (16777216 / 60 / 6);  // RFU "frame" to cycles
++      rfu_timeout_cycles = MAX(rfu_timeout * (16777216 / 60), RFU_NET_TIMEOUT_CYCLES);
++      rfu_resp_timeout = MAX(rfu_rtx_max * (16777216 / 60 / 6), RFU_RESP_WAIT_CYCLES);
+     } else {
+       rfu_comstate = rfu_plen ? RFU_COMSTATE_RESPDAT : RFU_COMSTATE_WAITCMD;
+     }
+@@ -676,6 +778,7 @@ u32 rfu_transfer(u32 sent_value) {
+ 
+ // Gets called every frame for basic device updates.
+ void rfu_frame_update() {
++  rfu_client_events = 0;   // 손님: 새 프레임이니 다시 1개 넘길 수 있음
+   // If device is in reset state, do nothing really.
+   if (rfu_comstate != RFU_COMSTATE_RESET) {
+     u32 i;
+@@ -739,6 +842,11 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+         for (i = 0; i < 4; i++)
+           if (rfu_host.clients[i].devid &&
+               rfu_host.clients[i].client_id == client_id) {
++            if (rfu_host.clients[i].disc_pending) {
++              // 끊고 나간 뒤 남은 패킷을 기다리던 자리: 새로 접속하니 비움
++              memset(&rfu_host.clients[i], 0, sizeof(rfu_host.clients[i]));
++              continue;
++            }
+ 
+             RFU_DEBUG_LOG("Connection request ignored: already connected!\n");
+             return;
+@@ -787,39 +895,60 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+       break;
+ 
+     case NET_RFU_DISCONNECT:
++      // 끊음 알림은 그 전에 보낸 패킷들 뒤에 온다(TCP 순서). 줄에 남은 것이 있으면
++      // 게임이 그것을 다 읽은 뒤에 끊는다. 바로 지우면 게임이 마지막 인사를 못 받아
++      // '통신 에러'가 날 수 있다.
+       if (rfu_state == RFU_STATE_HOST) {
+         // Clear the client from the list
+         u32 clnum = (hdata >> 16) & 0x3;
+         u16 cldid = hdata & 0xffff;
+-        if (rfu_host.clients[clnum].devid == cldid)
+-          memset(&rfu_host.clients[clnum], 0, sizeof(rfu_host.clients[clnum]));
++        if (rfu_host.clients[clnum].devid == cldid &&
++            rfu_host.clients[clnum].client_id == client_id) {
++          if (rfu_host.clients[clnum].qcount)
++            rfu_host.clients[clnum].disc_pending = 1;
++          else
++            memset(&rfu_host.clients[clnum], 0, sizeof(rfu_host.clients[clnum]));
++        }
+       }
+-      else if (rfu_state == RFU_STATE_CLIENT) {
+-        // Go back to idle state!
+-        memset(&rfu_client, 0, sizeof(rfu_client));
+-        rfu_state = RFU_STATE_IDLE;
++      else if (rfu_state == RFU_STATE_CLIENT && client_id == rfu_client.host_id) {
++        // Go back to idle state! (내 리더가 보낸 끊음만. 세 대 이상일 때 다른 기기가 늦게 보낸
++        // 끊음으로 지금 리더와의 연결이 끊기지 않게)
++        if (rfu_client.qcount)
++          rfu_client.disc_pending = 1;
++        else {
++          memset(&rfu_client, 0, sizeof(rfu_client));
++          rfu_state = RFU_STATE_IDLE;
++        }
+       }
+       break;
+ 
+     case NET_RFU_HOST_SEND:
+       // Only possible if we are a client
+-      if (rfu_state == RFU_STATE_CLIENT) {
++      // (내 리더가 보낸 것만 받음. 세 대 이상일 때 예전에 접속하려던 다른 리더가 늦게 보낸 패킷이
++      //  지금 리더의 줄에 섞이면 게임이 엉뚱한 데이터를 받음)
++      if (rfu_state == RFU_STATE_CLIENT && client_id == rfu_client.host_id) {
+         u32 blen = hdata & 0x7f;
+         if (len >= blen + 12) {
+           u32 i;
+-          // ACK the reception (so they know we are alive!)
+-          rfu_net_send_cmd(client_id, NET_RFU_CLIENT_ACK,
+-                           rfu_client.devid | (rfu_client.clnum << 16));
+-          // Receive data from the host. Queue que packet if possible
+-          for (i = 0; i < 4; i++) {
+-            if (!rfu_client.pkts[i].hblen) {
++          // Receive data from the host. Queue the packet (빈 패킷은 실을 것이 없어 안 넣음)
++          if (blen) {
++            if (rfu_client.qcount < RFU_QUEUE_LEN) {
++              i = (rfu_client.qhead + rfu_client.qcount) % RFU_QUEUE_LEN;
+               memcpy(&rfu_client.pkts[i].hdata, payl, blen);
+               rfu_client.pkts[i].hblen = blen;
++              rfu_client.qcount++;
++              i = rfu_client.qcount - 1;
+               RFU_DEBUG_LOG("Recv host packet (%d bytes) Q[#%d]\n", blen, i);
+-              return;
++            } else {
++              RFU_DEBUG_LOG("Client dropped a host packet\n");
+             }
+           }
+-          RFU_DEBUG_LOG("Client dropped a host packet\n");
++          // ACK the reception (so they know we are alive!)
++          // 넷째 칸에 지금 줄 길이를 실음(리더가 너무 앞서 나가지 않게). 순정·v1 리더는 안 읽음.
++          rfu_net_send_cmd_x(client_id, NET_RFU_CLIENT_ACK,
++                             rfu_client.devid | (rfu_client.clnum << 16),
++                             RFU_QINFO_TAG | MIN(rfu_client.qcount, 0xffff));
++          return;
+         }
+       }
+       break;
+@@ -832,16 +961,20 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+         u32 clid = (hdata >> 16) & 0x3;
+         u32 blen = hdata >> 24;
+ 
+-        // Validate the slot with device ID
+-        if (rfu_host.clients[clid].devid == cdevid) {
++        // Validate the slot with device ID (손님 패킷은 16바이트까지라 크기도 확인)
++        if (rfu_host.clients[clid].devid == cdevid && rfu_host.clients[clid].client_id == client_id &&
++            blen <= 16 && len >= blen + 12) {
+           rfu_host.clients[clid].clttl = 0;   // Account for packet reception
+-          for (i = 0; i < 4; i++) {
+-            if (!rfu_host.clients[clid].pkts[i].datalen) {
+-              memcpy(rfu_host.clients[clid].pkts[i].data, payl, blen);
+-              rfu_host.clients[clid].pkts[i].datalen = blen;
+-              RFU_DEBUG_LOG("Recv client packet (%d bytes) Q[#%d]\n", blen, i);
+-              return;
+-            }
++          if (!blen)
++            return;   // 빈 패킷은 실을 것이 없어 안 넣음 (순정도 같은 결과)
++          if (rfu_host.clients[clid].qcount < RFU_QUEUE_LEN) {
++            i = (rfu_host.clients[clid].qhead + rfu_host.clients[clid].qcount) % RFU_QUEUE_LEN;
++            memcpy(rfu_host.clients[clid].pkts[i].data, payl, blen);
++            rfu_host.clients[clid].pkts[i].datalen = blen;
++            rfu_host.clients[clid].qcount++;
++            i = rfu_host.clients[clid].qcount - 1;
++            RFU_DEBUG_LOG("Recv client packet (%d bytes) Q[#%d]\n", blen, i);
++            return;
+           }
+           RFU_DEBUG_LOG("Host dropped a client packet\n");
+         }
+@@ -853,8 +986,21 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+         u32 devid = hdata & 0xffff;
+         u32 clid = (hdata >> 16) & 0x3;
+ 
+-        if (rfu_host.clients[clid].devid == devid)
++        if (rfu_host.clients[clid].devid == devid &&
++            rfu_host.clients[clid].client_id == client_id) {
+           rfu_host.clients[clid].clttl = 0;   // Account for packet reception
++          // '받았음' 세기 (CLIENT_SEND 가 여기로 흘러 들어온 경우는 빼고)
++          if (ptype == NET_RFU_CLIENT_ACK) {
++            if (rfu_host.clients[clid].acked < rfu_host.clients[clid].sent)
++              rfu_host.clients[clid].acked++;
++            // v2 손님이 넷째 칸에 실어 보낸 손님 쪽 줄 길이
++            if (len >= 16) {
++              u32 extra = upack32(&buf8[12]);
++              if ((extra & 0xff000000) == RFU_QINFO_TAG)
++                rfu_host.clients[clid].peer_q = extra & 0xffff;
++            }
++          }
++        }
+       }
+     };
+   } else {
+@@ -885,17 +1031,36 @@ bool rfu_update(unsigned cycles) {
+         rfu_comstate = RFU_COMSTATE_WAITRESP;
+         RFU_DEBUG_LOG("Wait command resp: disconnect\n");
+       }
+-      else if (rfu_data_avail()) {
++      else if ((rfu_state != RFU_STATE_HOST || !rfu_net_wait_peer() || !rfu_timeout_cycles) &&
++               rfu_data_avail()) {
+         // Some event is available!
++        // (v2 리더: 느린 손님의 패킷을 기다리는 중이면 다른 손님 패킷이 있어도 아직 안 알림)
+         rfu_buf[0] = 0x99660000 | RFU_CMD_RESP_DATA;
+         rfu_buf[1] = 0x80000000;
+         rfu_cnt = 0;
+         rfu_plen = 2;
+         rfu_comstate = RFU_COMSTATE_WAITRESP;
++        if (rfu_state == RFU_STATE_CLIENT)
++          rfu_client_events++;
++        if (rfu_state == RFU_STATE_HOST && !rfu_timeout_cycles) {
++          // 1.2초를 기다려도 느린 손님 패킷이 안 왔음: 줄 길이 정보는 오래된 것이니 지움
++          u32 k;
++          for (k = 0; k < 4; k++)
++            rfu_host.clients[k].peer_q = 0;
++        }
+       }
+-      else if (rfu_state == RFU_STATE_HOST && !rfu_resp_timeout) {
++      else if (rfu_state == RFU_STATE_HOST &&
++               ((!rfu_resp_timeout && !rfu_net_backlogged() && !rfu_net_wait_peer()) ||
++                !rfu_timeout_cycles)) {
+         // We "retransmitted" the message N times (not really, but the equivalent
+         // time has elapsed) and we simulate a lack of client response.
++        // (v2: 와이파이가 크게 밀려 있거나 느린 손님을 기다리면 1.2초까지 더 기다린 뒤 여기로 옴)
++        if (!rfu_timeout_cycles) {
++          // 1.2초 동안 아무 답이 없었음: 손님 줄 길이 정보는 오래된 것이니 지움
++          u32 k;
++          for (k = 0; k < 4; k++)
++            rfu_host.clients[k].peer_q = 0;
++        }
+         rfu_buf[0] = 0x99660000 | RFU_CMD_RESP_DATA | (1 << 8);
+         rfu_buf[1] = 0x00000F0F;  // TODO: just using 4 slots for now
+         rfu_buf[2] = 0x80000000;

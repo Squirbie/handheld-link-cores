@@ -1,0 +1,30 @@
+diff --git a/src/libretro/input/input.cpp b/src/libretro/input/input.cpp
+index 0b0b101..d7d0b9b 100644
+--- a/src/libretro/input/input.cpp
++++ b/src/libretro/input/input.cpp
+@@ -61,7 +61,7 @@ const struct retro_input_descriptor MelonDsDs::input_descriptors[] = {
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_R,      "R"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_L,      "L"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_X,      "X / ---"},
+-        {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_Y,      "Y / Close Lid"},
++        {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_Y,      "Y"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_L2,     "Speedup/Slowdown Pointer+Enable Alternate Controls"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_R2,     "Touch Joystick"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_L3,     "Microphone"},
+diff --git a/src/libretro/input/joypad.cpp b/src/libretro/input/joypad.cpp
+index fabccaa..e16bb21 100644
+--- a/src/libretro/input/joypad.cpp
++++ b/src/libretro/input/joypad.cpp
+@@ -88,11 +88,7 @@ void JoypadState::Update(const InputPollResult& poll) noexcept {
+     _micButton = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_L3);
+ 
+     _previousToggleLidButton = _toggleLidButton;
+-    if (_joystickSpeedupCursorButton){
+-        _toggleLidButton = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_Y);
+-    } else {
+-        _toggleLidButton = false;
+-    }
++    _toggleLidButton = false; // hanbang (10/10): L2+Y lid close disabled (handhelds: the game fell asleep by accident)
+ 
+     _previousCycleLayoutButton = _cycleLayoutButton;
+     _cycleLayoutButton = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_R3);

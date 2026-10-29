@@ -1,0 +1,233 @@
+diff --git a/src/libretro/config/console.cpp b/src/libretro/config/console.cpp
+index 73b7e24..722a08c 100644
+--- a/src/libretro/config/console.cpp
++++ b/src/libretro/config/console.cpp
+@@ -18,6 +18,14 @@
+ 
+ #include <codecvt>
+ #include <memory>
++#include <new>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <cstdlib>
++#include <string>
++#include <cstring>
+ #include <optional>
+ #include <span>
+ #include <string_view>
+@@ -669,6 +677,44 @@ static void MelonDsDs::ApplyCommonArgs(const CoreConfig& config, melonDS::NDSArg
+ #endif
+ }
+ 
++// hanbang: put the ROM file itself (a private, copy-on-write file mapping) in the cart buffer,
++// so the ROM lives in the page cache instead of anonymous memory. 512 MB ROMs don't fit in
++// this device's RAM otherwise. The block comes from posix_memalign, which glibc serves with its
++// own mmap for anything this big; melonDS later frees it with delete[] -> free(), and glibc's
++// munmap_chunk() then unmaps the whole region, file mapping included.
++static std::unique_ptr<uint8_t[]> MapRomFile(std::string_view path, size_t size, size_t padded) noexcept {
++    if (path.empty() || size < (size_t(32) << 20) || padded < size)
++        return nullptr;
++
++    std::string p(path);
++    int fd = open(p.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0)
++        return nullptr;
++
++    struct stat st {};
++    if (fstat(fd, &st) != 0 || (size_t)st.st_size != size) {
++        close(fd);
++        return nullptr;
++    }
++
++    void* mem = nullptr;
++    if (posix_memalign(&mem, 4096, padded) != 0 || !mem) {
++        close(fd);
++        return nullptr;
++    }
++
++    size_t mapped = (size + 4095) & ~size_t(4095);
++    void* m = mmap(mem, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0);
++    close(fd);
++    if (m != mem) {
++        free(mem);
++        return nullptr;
++    }
++
++    retro::info("hanbang: mapped {}-byte ROM file into a {}-byte cart buffer", size, padded);
++    return std::unique_ptr<uint8_t[]>(static_cast<uint8_t*>(mem));
++}
++
+ static unique_ptr<melonDS::NDSCart::CartCommon> MelonDsDs::LoadNdsCart(const CoreConfig& config, const retro::GameInfo& ndsInfo) {
+     ZoneScopedN(TracyFunction);
+     span<const std::byte> rom = ndsInfo.GetData();
+@@ -700,7 +746,23 @@ static unique_ptr<melonDS::NDSCart::CartCommon> MelonDsDs::LoadNdsCart(const Cor
+     std::unique_ptr<melonDS::NDSCart::CartCommon> cart;
+     {
+         ZoneScopedN("NDSCart::ParseROM");
+-        cart = melonDS::NDSCart::ParseROM(reinterpret_cast<const uint8_t*>(rom.data()), rom.size(), nullptr, std::move(sdargs));
++        // hanbang: avoid the extra copies (CopyToUnique + PadToPowerOf2) that need 2-3x the ROM size in RAM.
++        size_t padded = 1;
++        while (padded < rom.size())
++            padded <<= 1;
++        std::unique_ptr<uint8_t[]> romdata = MapRomFile(ndsInfo.GetPath(), rom.size(), padded);
++        if (!romdata) {
++            romdata.reset(new (std::nothrow) uint8_t[padded]);
++            if (!romdata)
++                throw invalid_rom_exception("Not enough memory to load this ROM.");
++            memcpy(romdata.get(), rom.data(), rom.size());
++            // A trimmed ROM is padded with zeros (same as melonDS's PadToPowerOf2).
++            // Big blocks come straight from mmap (glibc always maps blocks over 32 MiB), so they're
++            // already zero; leaving them untouched keeps the padding out of resident memory.
++            if (padded > rom.size() && padded < (size_t(64) << 20))
++                memset(romdata.get() + rom.size(), 0, padded - rom.size());
++        }
++        cart = melonDS::NDSCart::ParseROM(std::move(romdata), (uint32_t)padded, nullptr, std::move(sdargs));
+     }
+ 
+     if (!cart) {
+diff --git a/src/libretro/core/core.cpp b/src/libretro/core/core.cpp
+index df32f07..a546c0c 100644
+--- a/src/libretro/core/core.cpp
++++ b/src/libretro/core/core.cpp
+@@ -927,15 +927,16 @@ void MelonDsDs::CoreState::InitContent(unsigned type, std::span<const retro_game
+                     throw content_exception("Loaded a save file instead of a ROM, ensure that you opened the right file.");
+                 }
+ 
+-                if (game[0].size == 0) {
+-                    throw content_exception("Loaded an empty file as content, please load a valid Nintendo DS ROM.");
+-                }
+-
+-                if (game[0].data == nullptr) {
++                if (game[0].data == nullptr && game[0].path == nullptr) {
+                     throw content_exception("Failed to load the content data, the frontend may have a bug.");
+                 }
+ 
+                 _ndsInfo = game[0];
++
++                if (_ndsInfo->GetData().empty()) {
++                    // hanbang: covers both an empty file and a file we couldn't map
++                    throw content_exception("Loaded an empty file as content, please load a valid Nintendo DS ROM.");
++                }
+             }
+             break;
+         default:
+diff --git a/src/libretro/info.cpp b/src/libretro/info.cpp
+index 9ba200b..c5b1fca 100644
+--- a/src/libretro/info.cpp
++++ b/src/libretro/info.cpp
+@@ -27,7 +27,14 @@ const struct retro_system_content_info_override MelonDsDs::content_overrides[] =
+         // as we may want to write back changes later.
+     },
+     {
+-        "nds|dsi|ids|gba",
++        "nds|dsi|ids",
++        true,
++        false
++        // hanbang: the core maps the ROM file itself (see retro::GameInfo),
++        // so the frontend doesn't need to keep another full copy in memory
++    },
++    {
++        "gba",
+         false,
+         true
+         // We need to keep the ROM around for reloads
+diff --git a/src/libretro/retro/info.cpp b/src/libretro/retro/info.cpp
+index c55aa81..e885d9c 100644
+--- a/src/libretro/retro/info.cpp
++++ b/src/libretro/retro/info.cpp
+@@ -18,6 +18,10 @@ Copyright 2023 Jesse Talavera-Greenberg
+ 
+ #include <cstring>
+ #include <libretro.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ 
+ retro::GameInfo::GameInfo(const retro_game_info& info) noexcept :
+     _path(info.path ? info.path : ""),
+@@ -27,6 +31,54 @@ retro::GameInfo::GameInfo(const retro_game_info& info) noexcept :
+ {
+     if (_data) {
+         memcpy(_data.get(), info.data, info.size);
++        return;
+     }
++
++    // hanbang: the frontend gave us only a path (need_fullpath), so map the file
++    _size = 0;
++    if (_path.empty())
++        return;
++
++    int fd = open(_path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0)
++        return;
++
++    struct stat st {};
++    if (fstat(fd, &st) == 0 && st.st_size > 0) {
++        void* p = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
++        if (p != MAP_FAILED) {
++            _map = p;
++            _size = (size_t)st.st_size;
++        }
++    }
++    close(fd);
++}
++
++retro::GameInfo::~GameInfo() noexcept {
++    if (_map) munmap(_map, _size);
+ }
+ 
++retro::GameInfo::GameInfo(GameInfo&& other) noexcept :
++    _path(std::move(other._path)),
++    _data(std::move(other._data)),
++    _size(other._size),
++    _meta(std::move(other._meta)),
++    _map(other._map)
++{
++    other._map = nullptr;
++    other._size = 0;
++}
++
++retro::GameInfo& retro::GameInfo::operator=(GameInfo&& other) noexcept {
++    if (this != &other) {
++        if (_map) munmap(_map, _size);
++        _path = std::move(other._path);
++        _data = std::move(other._data);
++        _size = other._size;
++        _meta = std::move(other._meta);
++        _map = other._map;
++        other._map = nullptr;
++        other._size = 0;
++    }
++    return *this;
++}
+diff --git a/src/libretro/retro/info.hpp b/src/libretro/retro/info.hpp
+index f5e8175..470a180 100644
+--- a/src/libretro/retro/info.hpp
++++ b/src/libretro/retro/info.hpp
+@@ -31,9 +31,15 @@ namespace retro {
+     class GameInfo {
+     public:
+         GameInfo(const retro_game_info& info) noexcept;
++        ~GameInfo() noexcept;
++        GameInfo(GameInfo&& other) noexcept;
++        GameInfo& operator=(GameInfo&& other) noexcept;
++        GameInfo(const GameInfo&) = delete;
++        GameInfo& operator=(const GameInfo&) = delete;
+ 
+         std::string_view GetPath() const noexcept { return _path; }
+         std::span<const std::byte> GetData() const noexcept {
++            if (_map) return std::span(static_cast<const std::byte*>(_map), _size);
+             return std::span(_data.get(), _size);
+         }
+         std::string_view GetMeta() const noexcept { return _meta; }
+@@ -41,6 +47,7 @@ namespace retro {
+         std::string _path;
+         std::unique_ptr<std::byte[]> _data;
+         size_t _size;
++        void* _map = nullptr; // hanbang: read-only file mapping (page cache, not counted as anonymous memory)
+         std::string _meta;
+     };
+ 

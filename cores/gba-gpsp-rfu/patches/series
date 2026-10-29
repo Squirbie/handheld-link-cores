@@ -1,0 +1,4 @@
+# Apply in this order (git apply or patch -p1)
+0001-arm64-linux-cache-sync.patch
+0002-rfu-wifi-netplay-robustness-v2.patch
+0003-rfu-less-waiting-v3.patch

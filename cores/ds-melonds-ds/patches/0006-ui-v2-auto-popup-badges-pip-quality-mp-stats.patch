@@ -1,0 +1,1249 @@
+diff --git a/src/libretro/core/core.cpp b/src/libretro/core/core.cpp
+index a546c0c..91de02b 100644
+--- a/src/libretro/core/core.cpp
++++ b/src/libretro/core/core.cpp
+@@ -32,6 +32,7 @@
+ #include "../config/console.hpp"
+ #include "../exceptions.hpp"
+ #include "../format.hpp"
++#include "../hanbang.hpp"
+ #include "../info.hpp"
+ #include "../microphone.hpp"
+ #include "../message/error.hpp"
+@@ -127,6 +128,9 @@ retro_system_av_info MelonDsDs::CoreState::GetSystemAvInfo() const noexcept {
+ }
+ 
+ void MelonDsDs::CoreState::UnloadGame() noexcept {
++    // hanbang (ui-v2 고침 8): 게임을 끌 때 같이하기 기록을 닫아요 (마지막 줄이 버퍼에 남아 사라지지 않게)
++    if (hanbang::mp::on) hanbang::mp::Close();
++
+     // Just in case the frontend forgets to stop the rumbling
+     _inputState.StopRumble();
+ 
+@@ -179,6 +183,9 @@ void MelonDsDs::CoreState::UninstallDsiwareIfNeeded() noexcept {
+ 
+ void MelonDsDs::CoreState::Run() noexcept {
+     ZoneScopedN(TracyFunction);
++    // hanbang: 같이하기 재는 기록 (/tmp/melonds_mp_stats 가 있을 때만) + 작은 화면 시험 파일 확인 (60장마다)
++    hanbang::mp::FrameStart(_mpState.IsReady());
++    const hanbang::mp::Timer hbRunTimer;
+ 
+     if (_renderState.SoftwareFallbackRequested()) [[unlikely]] {
+         // The OpenGL context the frontend gave us turned out to be unusable.
+@@ -255,7 +262,9 @@ void MelonDsDs::CoreState::Run() noexcept {
+             // which is then drawn to the screen by _renderState.Render
+             {
+                 ZoneScopedN("NDS::RunFrame");
++                const hanbang::mp::Timer hbTimer;
+                 nds.RunFrame();
++                if (hbTimer.active) hanbang::mp::c.runFrameMs += hbTimer.Ms();
+             }
+ 
+             // The Rumble Pak was flipped an unknown number of times during that frame;
+@@ -267,7 +276,11 @@ void MelonDsDs::CoreState::Run() noexcept {
+             _inputState.StopRumble();
+         }
+ 
+-        _renderState.Render(nds, _inputState, Config, _screenLayout);
++        {
++            const hanbang::mp::Timer hbTimer;
++            _renderState.Render(nds, _inputState, Config, _screenLayout);
++            if (hbTimer.active) hanbang::mp::c.renderMs += hbTimer.Ms();
++        }
+         RenderAudio(*Console);
+ 
+         // Among other things, this is what compiles the shaders
+@@ -282,6 +295,8 @@ void MelonDsDs::CoreState::Run() noexcept {
+         // No frames are running, so nothing is driving the Rumble Pak.
+         _inputState.StopRumble();
+     }
++
++    if (hbRunTimer.active && hanbang::mp::on) hanbang::mp::c.runMs += hbRunTimer.Ms();
+ }
+ 
+ void MelonDsDs::CoreState::Reset() {
+@@ -621,6 +636,9 @@ bool MelonDsDs::CoreState::LoadGame(unsigned type, std::span<const retro_game_in
+ 
+     InitContent(type, game);
+ 
++    // hanbang (ui-v2): DraStic 팝업과 같은 설정 파일(hb_popup.cfg)의 auto=·fade=·alpha=·pip= 를 게임 켤 때 읽어요
++    hanbang::LoadPopupSettings();
++
+     // ...then load the game.
+     if (!retro::set_pixel_format(RETRO_PIXEL_FORMAT_XRGB8888)) {
+         throw environment_exception(
+diff --git a/src/libretro/hanbang.hpp b/src/libretro/hanbang.hpp
+new file mode 100644
+index 0000000..62a22da
+--- /dev/null
++++ b/src/libretro/hanbang.hpp
+@@ -0,0 +1,281 @@
++/*
++    hanbang (10/11, ui-v2): 전용 도우미 두 가지.
++
++    1) 팝업 설정 — DraStic 팝업(hb_dsosd)이 읽는 같은 파일을 게임 켤 때 한 번 읽어요.
++       /userdata/system/configs/advanced_drastic/hb_popup.cfg (MELONDSDS_HB_POPUP_CFG 로 바꿀 수 있음)
++         auto=1   위 화면이 클 때 오른쪽 스틱을 밀면 '누르는 창'이 저절로 떠요 (0 = 끔)
++         fade=40  아래 화면이 클 때 L2 보기 창이, 스틱을 쓰는 동안 이만큼(%)으로 흐려져요
++         alpha=85 창 불투명도(%) — DraStic 과 같은 줄을 같이 써요
++         pip=1    왼쪽 위 작은 화면 줄이는 방식: 0 = 옛것(가까운 점만) 1 = 넓이 평균 2 = 두 배 크기로 내보내고 평균
++       파일이나 줄이 없으면 위 기본값. hb_dsosd 는 모르는 줄(auto/fade/pip)을 그냥 넘겨요.
++       시험용: MELONDSDS_PIP=0|1|2 환경 변수, 또는 /tmp/melonds_pip 파일(숫자 하나)이 있으면 그 값이 먼저예요.
++       /tmp/melonds_pip 는 게임 중 약 1초마다 다시 봐서, 끄지 않고 바로 바꿔 볼 수 있어요.
++
++    2) 같이하기 재는 기록 — /tmp/melonds_mp_stats 파일이 있을 때만 1초마다 /tmp/melonds_mp_stats.log 에 한 줄.
++       파일이 없으면 60장마다 stat() 두 번만 해요 (거의 0 비용). 줄 뜻은 Open() 의 머리말에 적어요.
++*/
++#pragma once
++
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <sys/stat.h>
++#include <sys/time.h>
++
++namespace hanbang {
++
++// ---------------------------------------------------------------- 1) 팝업 설정
++struct PopupSettings {
++    bool autoPopup = true; // auto=
++    int fade = 40;         // fade=  (%)
++    int alpha = 85;        // alpha= (%)
++    int pip = 1;           // pip=   (0/1/2)
++};
++
++inline PopupSettings& Popup() noexcept {
++    static PopupSettings s;
++    return s;
++}
++
++inline int& PipOverride() noexcept {
++    static int v = -1; // -1 = 덮어쓰기 없음
++    return v;
++}
++
++// 지금 작은 화면 방식 (0/1/2)
++inline int PipMode() noexcept {
++    const int o = PipOverride();
++    return o >= 0 ? o : Popup().pip;
++}
++
++inline void LoadPopupSettings() noexcept {
++    PopupSettings s;
++    const char* path = std::getenv("MELONDSDS_HB_POPUP_CFG");
++    if (!path || !*path) path = "/userdata/system/configs/advanced_drastic/hb_popup.cfg";
++    if (FILE* f = std::fopen(path, "r")) {
++        char line[160];
++        while (std::fgets(line, sizeof line, f)) {
++            int v;
++            if (std::sscanf(line, "auto=%d", &v) == 1) s.autoPopup = v != 0;
++            else if (std::sscanf(line, "fade=%d", &v) == 1 && v >= 10 && v <= 100) s.fade = v;
++            else if (std::sscanf(line, "alpha=%d", &v) == 1 && v >= 10 && v <= 100) s.alpha = v;
++            else if (std::sscanf(line, "pip=%d", &v) == 1 && v >= 0 && v <= 2) s.pip = v;
++        }
++        std::fclose(f);
++    }
++    if (const char* env = std::getenv("MELONDSDS_PIP"); env && env[0] >= '0' && env[0] <= '2' && !env[1]) {
++        s.pip = env[0] - '0';
++    }
++    Popup() = s;
++    std::fprintf(stderr, "[hanbang] popup cfg %s: auto=%d fade=%d alpha=%d pip=%d\n",
++                 path, s.autoPopup ? 1 : 0, s.fade, s.alpha, s.pip);
++}
++
++// ---------------------------------------------------------------- 2) 같이하기 재는 기록
++namespace mp {
++using Clock = std::chrono::steady_clock;
++
++struct Counters {
++    // 장면(프레임)
++    uint32_t frames = 0;
++    double runFrameMs = 0;   // nds.RunFrame 전체 (기다림 포함)
++    double renderMs = 0;     // Render() 전체 (아래 vidMs 포함)
++    double vidMs = 0;        // 그중 레트로아크에 장면 넘기기(video_refresh). video_threaded 면 앞 장면을 기다리기도 해요
++    double runMs = 0;        // 코어 Run() 전체
++    double gapMaxMs = 0;     // 장면과 장면 사이 가장 긴 간격
++    // 기다림 (NextPacketBlock)
++    double waitRepMs = 0;    // 방장: 손님 답 기다림
++    double waitHostMs = 0;   // 손님: 방장 신호 기다림
++    double waitMaxMs = 0;    // 한 번에 가장 오래 기다린 시간
++    uint32_t blockCalls = 0, timeouts = 0, waitsOver50 = 0;
++    // 안 기다리는 확인 (NextPacket 의 flush+poll)
++    uint32_t pollCalls = 0, pollHits = 0;
++    double pollMs = 0;
++    // 보냄/받음 — C = 방장 신호(CMD), R = 답(REPLY), O = 그 밖 (b 비컨, d 데이터, m 관리)
++    uint32_t txC = 0, txR = 0, txO = 0, txOb = 0, txOd = 0, txOm = 0, txAck = 0, txBytes = 0;
++    uint32_t rxC = 0, rxAck = 0, rxR = 0, rxO = 0, rxOb = 0, rxOd = 0, rxOm = 0, rxBytes = 0;
++    uint32_t txSameC = 0, txSameR = 0, rxSameC = 0, rxSameR = 0; // 바로 앞과 내용이 같은 것 (다시 보냄일 수 있음)
++    uint32_t txFail = 0;     // 보낼 준비가 안 돼서 못 보냄
++    // 방장: 답 모으기 (MP_RecvReplies)
++    // rrMiss = 기다리다 시간 초과로 끝남(답 안 온 손님 있음), rrPart = 다 답했지만 '준비 안 됨' 빈 답이 섞여 끝남
++    uint32_t rrCalls = 0, rrMiss = 0, rrPart = 0, rrBlank = 0, rrStale = 0, rrDrop = 0;
++    // 손님: 방장 신호 받기 (MP_RecvHostPacket)
++    uint32_t hpCalls = 0, hpEmpty = 0, hpNotCmd = 0;
++    // 큐
++    uint32_t qMax = 0;
++    uint32_t hostChanges = 0;
++};
++
++inline bool on = false;
++inline bool capped = false;   // 기록 파일이 20MB 를 넘어 멈춤 (/tmp 는 메모리라서). 시험 파일을 지우면 풀려요
++inline Counters c{};
++inline FILE* logFile = nullptr;
++inline Clock::time_point windowStart{};
++inline Clock::time_point lastFrame{};
++inline bool haveLastFrame = false;
++inline bool mpActive = false;
++inline int ctx = 0;           // 1 = 답 모으는 중, 2 = 방장 신호 기다리는 중
++inline uint32_t frameCounter = 0;
++inline uint32_t eventsThisWindow = 0;
++inline uint32_t lastHash[4] = {0, 0, 0, 0}; // [0] tx CMD [1] tx REPLY [2] rx CMD [3] rx REPLY
++
++inline double Ms(Clock::duration d) noexcept { return std::chrono::duration<double, std::milli>(d).count(); }
++
++inline void Stamp(char* out, size_t n) noexcept {
++    timeval tv{};
++    gettimeofday(&tv, nullptr);
++    tm t{};
++    localtime_r(&tv.tv_sec, &t);
++    std::snprintf(out, n, "%02d:%02d:%02d.%03d", t.tm_hour, t.tm_min, t.tm_sec, static_cast<int>(tv.tv_usec / 1000));
++}
++
++inline void Event(const char* what) noexcept {
++    if (!on || !logFile || eventsThisWindow >= 10) return;
++    eventsThisWindow++;
++    char ts[24];
++    Stamp(ts, sizeof ts);
++    std::fprintf(logFile, "! %s %s\n", ts, what);
++    // 고침 8: 바로 파일로 내보내요. 굳거나 꺼지기 바로 전 줄이 가장 중요한데, 예전엔 다음 1초 정리 때까지 버퍼에만 있었어요.
++    // 1초에 10줄까지라 비용은 없어요.
++    std::fflush(logFile);
++}
++
++inline void Open() noexcept {
++    logFile = std::fopen("/tmp/melonds_mp_stats.log", "a");
++    if (!logFile) return;
++    on = true;
++    c = Counters{};
++    windowStart = Clock::now();
++    haveLastFrame = false;
++    eventsThisWindow = 0;
++    char ts[24];
++    Stamp(ts, sizeof ts);
++    std::fprintf(logFile,
++        "# %s 같이하기 기록 시작 (끄기: rm /tmp/melonds_mp_stats)\n"
++        "# 한 줄 = 1초. mp=같이하기 연결 fps=초당 장수 frame=한 장 평균 ms\n"
++        "#   emu=에뮬 계산(기다림 뺀 RunFrame) wait=통신 기다림(rep 방장이 답 기다림 / host 손님이 방장 기다림, max 한 번 최대)\n"
++        "#   draw=화면 그리기(우리 코드만) vid=레트로아크에 장면 넘기기(video_threaded 면 앞 장면 기다림 포함)\n"
++        "#   rest=코어 밖(레트로아크 넷플레이·화면·소리) gap=장면 사이 최대 간격  emu 에는 poll 시간도 빼요\n"
++        "#   poll=안 기다리는 확인 횟수/찾음/시간  to=시간 초과(150ms) 횟수 long=50ms 넘게 기다린 횟수\n"
++        "#   tx/rx: C=방장 신호(CMD) R=답 O=그 밖(b 비컨 d 데이터 m 관리) A=확인(ACK)  same=바로 앞과 같은 내용(다시 보냄일 수 있음)\n"
++        "#   rr=답 모으기 횟수 miss=시간 초과로 끝남(답 없는 손님 있음) part=빈 답이 섞여 끝남(둘 다 DS 가 다시 보내는 원인)\n"
++        "#   blank=준비 안 됨 빈 답 수 stale=늦은 답 버림 drop=답 기다리다 버린 다른 패킷\n"
++        "#   hp=손님 신호 받기 횟수/빈손/신호 아닌 것  q=받은 큐 최대 host=방장 바뀜\n",
++        ts);
++    std::fflush(logFile);
++}
++
++inline void Close() noexcept {
++    if (logFile) {
++        char ts[24];
++        Stamp(ts, sizeof ts);
++        std::fprintf(logFile, "# %s 기록 끝\n", ts);
++        std::fclose(logFile);
++    }
++    logFile = nullptr;
++    on = false;
++}
++
++inline void FlushWindow(Clock::time_point now) noexcept {
++    const double sec = Ms(now - windowStart) / 1000.0;
++    if (!logFile || sec <= 0) return;
++    const double n = c.frames ? static_cast<double>(c.frames) : 1.0;
++    const double fps = c.frames / sec;
++    const double frame = c.frames ? sec * 1000.0 / c.frames : 0.0;
++    const double wait = c.waitRepMs + c.waitHostMs;
++    // 고침 9: poll(안 기다리는 확인)도 RunFrame 안에서 일어나서 빼요. 남는 건 순수 에뮬 계산이에요
++    const double emu = (c.runFrameMs - wait - c.pollMs) / n;
++    const double rest = frame - c.runMs / n;
++    char ts[24];
++    Stamp(ts, sizeof ts);
++    std::fprintf(logFile,
++        "%s mp=%d fps=%.1f frame=%.1f emu=%.1f wait=%.1f(rep %.1f host %.1f max %.0f) draw=%.2f vid=%.2f rest=%.1f gap=%.0f"
++        " poll=%u/%u/%.1fms to=%u long=%u"
++        " tx=C%u A%u R%u O%u(b%u d%u m%u) %uB rx=C%u A%u R%u O%u(b%u d%u m%u) %uB same=tC%u tR%u rC%u rR%u fail=%u"
++        " rr=%u miss=%u part=%u blank=%u stale=%u drop=%u hp=%u/%u/%u q=%u host=%u\n",
++        ts, mpActive ? 1 : 0, fps, frame, emu, wait / n, c.waitRepMs / n, c.waitHostMs / n, c.waitMaxMs,
++        (c.renderMs - c.vidMs) / n, c.vidMs / n, rest, c.gapMaxMs,
++        c.pollCalls, c.pollHits, c.pollMs, c.timeouts, c.waitsOver50,
++        c.txC, c.txAck, c.txR, c.txO, c.txOb, c.txOd, c.txOm, c.txBytes,
++        c.rxC, c.rxAck, c.rxR, c.rxO, c.rxOb, c.rxOd, c.rxOm, c.rxBytes,
++        c.txSameC, c.txSameR, c.rxSameC, c.rxSameR, c.txFail,
++        c.rrCalls, c.rrMiss, c.rrPart, c.rrBlank, c.rrStale, c.rrDrop, c.hpCalls, c.hpEmpty, c.hpNotCmd, c.qMax, c.hostChanges);
++    std::fflush(logFile);
++    c = Counters{};
++    windowStart = now;
++    eventsThisWindow = 0;
++    if (std::ftell(logFile) > 20L * 1024 * 1024) {
++        std::fprintf(logFile, "# 기록 파일이 20MB 를 넘어서 멈춰요. rm /tmp/melonds_mp_stats.log /tmp/melonds_mp_stats 뒤 다시 켜세요\n");
++        Close();
++        capped = true;
++    }
++}
++
++// 60장마다: 시험 파일 두 개를 확인 (/tmp/melonds_mp_stats, /tmp/melonds_pip)
++inline void SlowCheck() noexcept {
++    struct stat st {};
++    const bool want = ::stat("/tmp/melonds_mp_stats", &st) == 0;
++    if (!want) capped = false;
++    if (want && !on && !capped) Open();
++    else if (!want && on) Close();
++
++    int pip = -1;
++    if (FILE* f = std::fopen("/tmp/melonds_pip", "r")) {
++        const int ch = std::fgetc(f);
++        if (ch >= '0' && ch <= '2') pip = ch - '0';
++        std::fclose(f);
++    }
++    PipOverride() = pip;
++}
++
++// 코어 Run() 맨 앞에서 한 번
++inline void FrameStart(bool active) noexcept {
++    mpActive = active;
++    if (++frameCounter >= 60) {
++        frameCounter = 0;
++        SlowCheck();
++    }
++    if (!on) return;
++    const Clock::time_point now = Clock::now();
++    if (haveLastFrame) c.gapMaxMs = std::max(c.gapMaxMs, Ms(now - lastFrame));
++    lastFrame = now;
++    haveLastFrame = true;
++    if (now - windowStart >= std::chrono::seconds(1)) FlushWindow(now);
++    c.frames++;
++}
++
++// 짧은 시간 재기 (기록이 꺼져 있으면 시계를 안 읽어요)
++struct Timer {
++    bool active;
++    Clock::time_point start;
++    Timer() noexcept : active(on), start(active ? Clock::now() : Clock::time_point{}) {}
++    double Ms() const noexcept { return active ? mp::Ms(Clock::now() - start) : 0.0; }
++};
++
++// 패킷 내용 지문 (802.11 머리 24바이트·TX 머리 12바이트·순번은 빼고)
++inline uint32_t PayloadHash(const uint8_t* data, size_t len) noexcept {
++    uint32_t h = 2166136261u;
++    for (size_t i = 12 + 24; i < len; i++) h = (h ^ data[i]) * 16777619u;
++    return h ^ static_cast<uint32_t>(len);
++}
++
++// 받은 CMD 형 패킷이 확인(ACK)인가: 802.11 받는 주소 끝 바이트 03 (melonDS Wifi.cpp MPAckMAC)
++inline bool IsAck(const uint8_t* data, size_t len) noexcept {
++    return len >= 12 + 10 && data[12 + 4] == 0x03 && data[12 + 5] == 0x09 && data[12 + 6] == 0xBF && data[12 + 9] == 0x03;
++}
++
++// 그 밖 패킷 종류: 'b' 비컨 'd' 데이터 'm' 관리·제어
++inline char OtherKind(const uint8_t* data, size_t len) noexcept {
++    if (len < 12 + 2) return 'm';
++    const uint16_t fc = static_cast<uint16_t>(data[12] | (data[13] << 8));
++    const unsigned type = (fc >> 2) & 3, sub = (fc >> 4) & 0xF;
++    if (type == 0 && sub == 8) return 'b';
++    if (type == 2) return 'd';
++    return 'm';
++}
++} // namespace mp
++} // namespace hanbang
+diff --git a/src/libretro/input/cursor.cpp b/src/libretro/input/cursor.cpp
+index 98b8766..d69063a 100644
+--- a/src/libretro/input/cursor.cpp
++++ b/src/libretro/input/cursor.cpp
+@@ -83,6 +83,7 @@ void CursorState::Update(const CoreConfig& config, const ScreenLayoutData& layou
+         _joypadCursorTouching = joypad.IsTouching();
+         _joystickRawDirection = joypad.RawCursorDirection();
+         _joystickRawDirection = (i16vec2)glm::rotate(vec2(_joystickRawDirection), GetOrientationAngle(orientation));
++        bool hbPenMoved = false; // hanbang (ui-v2 고침 1): 이번 장면에 스틱 때문에 펜 자리(정수 칸)가 바뀌었나
+         if (_joystickRawDirection != i16vec2(0)) {
+             // If the player moved the joypad's cursor this frame...
+             if (_pointerCursorLastUpdate > _joypadCursorLastUpdate) {
+@@ -150,11 +151,15 @@ void CursorState::Update(const CoreConfig& config, const ScreenLayoutData& layou
+             //The code below sets the cursor position to the position of the joystick (absolute)
+             //_joystickCursorPosition = vec2((NDS_SCREEN_WIDTH/2.0f)+(std::min<float>(1.0,(joystickNorm.x/0.7071))*(NDS_SCREEN_WIDTH/2.0f)), (NDS_SCREEN_HEIGHT/2.0f)+(std::min<float>(1.0,(joystickNorm.y/0.7071))*(NDS_SCREEN_HEIGHT/2.0f)));
+ 
++            const ivec2 hbBefore = ivec2(_joystickCursorPosition); // hanbang (ui-v2 고침 1)
+             _joystickCursorPosition +=  joystickScaled*heightSpeed;
+-            _joystickCursorPosition = clamp(_joystickCursorPosition, vec2(1.0), NDS_SCREEN_SIZE<float> - 1.0f); 
+-            
++            _joystickCursorPosition = clamp(_joystickCursorPosition, vec2(1.0), NDS_SCREEN_SIZE<float> - 1.0f);
++            hbPenMoved = ivec2(_joystickCursorPosition) != hbBefore;
+         }
+-        if (joypad.CursorActive()) {
++        // hanbang (ui-v2 고침 1): 예전엔 스틱 '값이 바뀔 때'만 펜 숨김 시계(cursor_timeout)를 처음부터 다시 셌어요.
++        // 스틱을 같은 힘으로 민 채 있으면 값이 그대로라, 펜이 움직이는(또는 자동 창이 떠 있는) 중에도 3초 뒤 펜이 꺼졌어요.
++        // 이제 스틱이 20% 밖이거나(자동 창 D 와 같은 기준), 펜 자리가 이번 장면에 한 칸이라도 바뀌면(살살 밀 때) 다시 세요.
++        if (joypad.CursorActive() || joypad.StickOutsideDeadzone() || hbPenMoved) {
+             // If the player moved, pressed, or released the joystick within the past frame...
+             ResetCursorTimeout();
+         }
+diff --git a/src/libretro/input/input.cpp b/src/libretro/input/input.cpp
+index 600c30b..a805d5c 100644
+--- a/src/libretro/input/input.cpp
++++ b/src/libretro/input/input.cpp
+@@ -62,7 +62,7 @@ const struct retro_input_descriptor MelonDsDs::input_descriptors[] = {
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_L,      "L"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_X,      "X / ---"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_Y,      "Y"},
+-        {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_L2,     "Speedup/Slowdown Pointer+Enable Alternate Controls"},
++        {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_L2,     "Pop-up Screen (hold, double-tap = pin)"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_R2,     "Swap Screens"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_L3,     "Microphone"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_R3,     "Touch Joystick"},
+diff --git a/src/libretro/input/input.hpp b/src/libretro/input/input.hpp
+index 0a731c7..2d6c188 100644
+--- a/src/libretro/input/input.hpp
++++ b/src/libretro/input/input.hpp
+@@ -70,6 +70,8 @@ namespace MelonDsDs {
+         void Apply(ScreenLayoutData& layout) const noexcept;
+         [[nodiscard]] bool CursorVisible() const noexcept { return _cursor.CursorVisible(); }
+         [[nodiscard]] bool PopupHeld() const noexcept { return _joypad.PopupHeld(); }
++        [[nodiscard]] bool PopupPinned() const noexcept { return _joypad.PopupPinned(); }
++        [[nodiscard]] bool StickOutsideDeadzone() const noexcept { return _joypad.StickOutsideDeadzone(); }
+         [[nodiscard]] bool IsTouching() const noexcept { return _cursor.IsTouching(); }
+         [[nodiscard]] bool TouchReleased() const noexcept {
+             return _pointer.CursorReleased() || _joypad.TouchReleased();
+diff --git a/src/libretro/input/joypad.cpp b/src/libretro/input/joypad.cpp
+index cfaa063..7d6b4a7 100644
+--- a/src/libretro/input/joypad.cpp
++++ b/src/libretro/input/joypad.cpp
+@@ -140,7 +140,8 @@ void JoypadState::Update(const InputPollResult& poll) noexcept {
+ }
+ 
+ void JoypadState::Apply(CoreConfig& config) const noexcept {
+-    config.SetJoystickSpeedupEnabled(_joystickSpeedupCursorButton);
++    // hanbang (ui-v2): L2 는 팝업 전용이에요. 예전엔 L2 를 누르는 동안 펜이 2배 빨라져서 DraStic 과 달랐어요 → 늘 끔
++    config.SetJoystickSpeedupEnabled(false);
+ }
+ 
+ 
+diff --git a/src/libretro/input/joypad.hpp b/src/libretro/input/joypad.hpp
+index 2cbfa63..10bd6e9 100644
+--- a/src/libretro/input/joypad.hpp
++++ b/src/libretro/input/joypad.hpp
+@@ -64,6 +64,15 @@ namespace MelonDsDs {
+         [[nodiscard]] bool PreviousLayoutPressed() const noexcept { return _prevLayoutCombo && !_previousPrevLayoutCombo; }
+         // hanbang: hold L2, or double-tap within 350 ms to pin (single-screen layouts only)
+         [[nodiscard]] bool PopupHeld() const noexcept { return _joystickSpeedupCursorButton || _popupPinned; }
++        // hanbang (ui-v2): 팝업이 L2 따닥으로 고정됐는가 (창 모서리 핀 그림)
++        [[nodiscard]] bool PopupPinned() const noexcept { return _popupPinned; }
++        // hanbang (ui-v2): 지금 오른쪽 스틱이 데드존(20%) 밖인가 — 매 장면 지금 값으로 봐요.
++        // (값이 바뀔 때만 바뀌는 '마지막으로 움직인 시각'은 끝까지 민 채로 있으면 멈춰서 안 써요)
++        [[nodiscard]] bool StickOutsideDeadzone() const noexcept {
++            constexpr float DEADZONE = 0.20f * 32767.0f;
++            const float x = _joystickRawDirection.x, y = _joystickRawDirection.y;
++            return x * x + y * y > DEADZONE * DEADZONE;
++        }
+         [[nodiscard]] bool MicButtonDown() const noexcept { return _micButton; }
+         [[nodiscard]] bool MicButtonPressed() const noexcept { return _micButton && !_previousMicButton; }
+         [[nodiscard]] bool MicButtonReleased() const noexcept { return !_micButton && _previousMicButton; }
+@@ -109,8 +118,8 @@ namespace MelonDsDs {
+         unsigned _device;
+         TouchMode _touchMode;
+         retro_perf_tick_t _lastPointerUpdate;
+-        i16vec2 _joystickRawDirection;
+-        i16vec2 _previousJoystickRawDirection;
++        i16vec2 _joystickRawDirection {0, 0};
++        i16vec2 _previousJoystickRawDirection {0, 0};
+     };
+ 
+ }
+diff --git a/src/libretro/libretro.cpp b/src/libretro/libretro.cpp
+index 3e31820..388d36d 100644
+--- a/src/libretro/libretro.cpp
++++ b/src/libretro/libretro.cpp
+@@ -39,6 +39,7 @@
+ #include "config/config.hpp"
+ #include "core/core.hpp"
+ #include "environment.hpp"
++#include "hanbang.hpp"
+ #include "exceptions.hpp"
+ #include "info.hpp"
+ #include "retro/task_queue.hpp"
+@@ -353,8 +354,44 @@ int DeconstructPacket(u8 *data, u64 *timestamp, const std::optional<MelonDsDs::P
+     return o_p->Length();
+ }
+ 
++// hanbang: 같이하기 재는 기록 — 보낸 패킷 세기 (kind: 'C' 신호 'R' 답 'A' 확인 'O' 그 밖). 기록이 꺼져 있으면 바로 돌아가요.
++static void HbCountTx(char kind, const u8* data, int len, bool sent) noexcept {
++    if (!hanbang::mp::on) return;
++    namespace hm = hanbang::mp;
++    if (!sent) { hm::c.txFail++; return; }
++    hm::c.txBytes += static_cast<uint32_t>(len) + static_cast<uint32_t>(MelonDsDs::HeaderSize);
++    const size_t n = len > 0 ? static_cast<size_t>(len) : 0;
++    switch (kind) {
++        case 'C': {
++            hm::c.txC++;
++            const uint32_t h = data ? hm::PayloadHash(data, n) : 0;
++            if (h == hm::lastHash[0]) hm::c.txSameC++;
++            hm::lastHash[0] = h;
++            break;
++        }
++        case 'R': {
++            hm::c.txR++;
++            const uint32_t h = data ? hm::PayloadHash(data, n) : 0;
++            if (h == hm::lastHash[1]) hm::c.txSameR++;
++            hm::lastHash[1] = h;
++            break;
++        }
++        case 'A': hm::c.txAck++; break;
++        default:
++            hm::c.txO++;
++            switch (data ? hm::OtherKind(data, n) : 'm') {
++                case 'b': hm::c.txOb++; break;
++                case 'd': hm::c.txOd++; break;
++                default: hm::c.txOm++; break;
++            }
++            break;
++    }
++}
++
+ int Platform::MP_SendPacket(u8* data, int len, u64 timestamp, void*) {
+-    return MelonDsDs::Core.MpSendPacket(MelonDsDs::Packet(data, len, timestamp, 0, MelonDsDs::Packet::Type::Other)) ? len : 0;
++    const bool sent = MelonDsDs::Core.MpSendPacket(MelonDsDs::Packet(data, len, timestamp, 0, MelonDsDs::Packet::Type::Other));
++    HbCountTx('O', data, len, sent);
++    return sent ? len : 0;
+ }
+ 
+ int Platform::MP_RecvPacket(u8* data, u64* timestamp, void*) {
+@@ -363,7 +400,9 @@ int Platform::MP_RecvPacket(u8* data, u64* timestamp, void*) {
+ }
+ 
+ int Platform::MP_SendCmd(u8* data, int len, u64 timestamp, void*) {
+-    return MelonDsDs::Core.MpSendPacket(MelonDsDs::Packet(data, len, timestamp, 0, MelonDsDs::Packet::Type::Cmd)) ? len : 0;
++    const bool sent = MelonDsDs::Core.MpSendPacket(MelonDsDs::Packet(data, len, timestamp, 0, MelonDsDs::Packet::Type::Cmd));
++    HbCountTx('C', data, len, sent);
++    return sent ? len : 0;
+ }
+ 
+ int Platform::MP_SendReply(u8 *data, int len, u64 timestamp, u16 aid, void*) {
+@@ -375,15 +414,26 @@ int Platform::MP_SendReply(u8 *data, int len, u64 timestamp, u16 aid, void*) {
+     // [1] https://github.com/melonDS-emu/melonDS/blob/817b409ec893fb0b2b745ee18feced08706419de/src/net/LAN.cpp#L1074
+     // [2] https://melonds.kuribo64.net/comments.php?id=25
+     retro_assert(aid < 16);
+-    return MelonDsDs::Core.MpSendPacket(MelonDsDs::Packet(data, len, timestamp, aid, MelonDsDs::Packet::Type::Reply)) ? len : 0;
++    const bool sent = MelonDsDs::Core.MpSendPacket(MelonDsDs::Packet(data, len, timestamp, aid, MelonDsDs::Packet::Type::Reply));
++    HbCountTx('R', data, len, sent);
++    return sent ? len : 0;
+ }
+ 
+ int Platform::MP_SendAck(u8* data, int len, u64 timestamp, void*) {
+-    return MelonDsDs::Core.MpSendPacket(MelonDsDs::Packet(data, len, timestamp, 0, MelonDsDs::Packet::Type::Cmd)) ? len : 0;
++    const bool sent = MelonDsDs::Core.MpSendPacket(MelonDsDs::Packet(data, len, timestamp, 0, MelonDsDs::Packet::Type::Cmd));
++    HbCountTx('A', data, len, sent);
++    return sent ? len : 0;
+ }
+ 
+ int Platform::MP_RecvHostPacket(u8* data, u64 * timestamp, void*) {
++    hanbang::mp::ctx = 2;
+     std::optional<MelonDsDs::Packet> o_p = MelonDsDs::Core.MpNextPacketBlock();
++    hanbang::mp::ctx = 0;
++    if (hanbang::mp::on) {
++        hanbang::mp::c.hpCalls++;
++        if (!o_p.has_value()) hanbang::mp::c.hpEmpty++;
++        else if (o_p->PacketType() != MelonDsDs::Packet::Type::Cmd) hanbang::mp::c.hpNotCmd++;
++    }
+     return DeconstructPacket(data, timestamp, o_p);
+ }
+ 
+@@ -394,29 +444,39 @@ u16 Platform::MP_RecvReplies(u8* packets, u64 timestamp, u16 aidmask, void*) {
+     u16 ret = 0;
+     u16 answered = 0; // hanbang: AIDs that answered at all, including blank "not ready" replies
+     int loops = 0;
++    const bool hb = hanbang::mp::on; // hanbang: 같이하기 재는 기록
++    if (hb) hanbang::mp::c.rrCalls++;
+     while((answered & aidmask) != aidmask) {
++        hanbang::mp::ctx = 1;
+         std::optional<MelonDsDs::Packet> o_p = MelonDsDs::Core.MpNextPacketBlock();
++        hanbang::mp::ctx = 0;
+         if(!o_p.has_value()) {
++            if (hb) hanbang::mp::c.rrMiss++; // 고침 9: 시간 초과로 끝남 (답 안 온 손님 있음)
+             return ret;
+         }
+         MelonDsDs::Packet p = std::move(o_p).value();
+         if(p.Timestamp() < (timestamp - 32)) {
++            if (hb) hanbang::mp::c.rrStale++;
+             continue;
+         }
+         if(p.PacketType() != MelonDsDs::Packet::Type::Reply) {
++            if (hb) hanbang::mp::c.rrDrop++;
+             continue;
+         }
+         u8 aid = MelonDsDs::Core.MpReplyAid(p);
+         if(aid == 0 || aid >= 16) {
++            if (hb) hanbang::mp::c.rrDrop++;
+             continue;
+         }
+         answered |= 1<<aid;
+         if(p.Aid() == 0) {
++            if (hb) hanbang::mp::c.rrBlank++;
+             continue;
+         }
+         ret |= 1<<aid;
+         memcpy(&packets[(aid-1)*1024], p.Data(), std::min(p.Length(), (uint64_t)1024));
+         loops++;
+     }
++    if (hb && (ret & aidmask) != aidmask) hanbang::mp::c.rrPart++; // 고침 9: 다 답했지만 빈 답이 섞임 → DS 가 다시 보냄 (시간 초과 miss 와 따로 셈)
+     return ret;
+ }
+diff --git a/src/libretro/net/mp.cpp b/src/libretro/net/mp.cpp
+index 1e5d0b7..f714193 100644
+--- a/src/libretro/net/mp.cpp
++++ b/src/libretro/net/mp.cpp
+@@ -15,7 +15,10 @@
+ */
+ #include "mp.hpp"
+ #include "environment.hpp"
++#include "hanbang.hpp"
++#include <algorithm>
+ #include <chrono>
++#include <cstdio>
+ #include <cstdlib>
+ #include <thread>
+ #include <libretro.h>
+@@ -122,17 +125,53 @@ void MpState::PacketReceived(const void *buf, size_t len, uint16_t client_id) no
+     Packet p = Packet::parsePk(buf, len);
+     p.SetSender(client_id);
+     if(p.PacketType() == Packet::Type::Cmd) {
++        if (hanbang::mp::on && _hostId.has_value() && *_hostId != client_id) hanbang::mp::c.hostChanges++;
+         _hostId = client_id;
+         //retro::debug("Host client id is {}", client_id);
+     }
++    if (hanbang::mp::on) {
++        // hanbang: 같이하기 재는 기록 — 받은 패킷 세기
++        namespace hm = hanbang::mp;
++        const auto* d = static_cast<const uint8_t*>(p.Data());
++        const size_t n = p.Length();
++        hm::c.rxBytes += static_cast<uint32_t>(len);
++        if (p.PacketType() == Packet::Type::Cmd) {
++            if (hm::IsAck(d, n)) hm::c.rxAck++;
++            else {
++                hm::c.rxC++;
++                const uint32_t h = hm::PayloadHash(d, n);
++                if (h == hm::lastHash[2]) hm::c.rxSameC++;
++                hm::lastHash[2] = h;
++            }
++        } else if (p.PacketType() == Packet::Type::Reply) {
++            hm::c.rxR++;
++            const uint32_t h = hm::PayloadHash(d, n);
++            if (h == hm::lastHash[3]) hm::c.rxSameR++;
++            hm::lastHash[3] = h;
++        } else {
++            hm::c.rxO++;
++            switch (hm::OtherKind(d, n)) {
++                case 'b': hm::c.rxOb++; break;
++                case 'd': hm::c.rxOd++; break;
++                default: hm::c.rxOm++; break;
++            }
++        }
++    }
+     receivedPackets.push(std::move(p));
++    if (hanbang::mp::on) hanbang::mp::c.qMax = std::max<uint32_t>(hanbang::mp::c.qMax, static_cast<uint32_t>(receivedPackets.size()));
+ }
+ 
+ std::optional<Packet> MpState::NextPacket() noexcept {
+     retro_assert(IsReady());
+     if(receivedPackets.empty()) {
++        const hanbang::mp::Timer timer; // hanbang: 기록이 켜졌을 때만 시간을 재요
+         _sendFn(RETRO_NETPACKET_FLUSH_HINT, NULL, 0, RETRO_NETPACKET_BROADCAST);
+         _pollFn();
++        if (timer.active) {
++            hanbang::mp::c.pollCalls++;
++            hanbang::mp::c.pollMs += timer.Ms();
++            if (!receivedPackets.empty()) hanbang::mp::c.pollHits++;
++        }
+     }
+     if(receivedPackets.empty()) {
+         return std::nullopt;
+@@ -146,16 +185,36 @@ std::optional<Packet> MpState::NextPacket() noexcept {
+ 
+ std::optional<Packet> MpState::NextPacketBlock() noexcept {
+     retro_assert(IsReady());
++    if (hanbang::mp::on) hanbang::mp::c.blockCalls++;
+     if (receivedPackets.empty()) {
+-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(RecvTimeoutMs());
++        const auto start = std::chrono::steady_clock::now();
++        const auto deadline = start + std::chrono::milliseconds(RecvTimeoutMs());
++        // hanbang: 같이하기 재는 기록 — 기다린 시간을 '답 기다림(방장)'·'신호 기다림(손님)'으로 나눠 더해요
++        auto note = [&start](bool timedOut) noexcept {
++            if (!hanbang::mp::on) return;
++            namespace hm = hanbang::mp;
++            const double ms = hm::Ms(std::chrono::steady_clock::now() - start);
++            (hm::ctx == 2 ? hm::c.waitHostMs : hm::c.waitRepMs) += ms;
++            hm::c.waitMaxMs = std::max(hm::c.waitMaxMs, ms);
++            if (ms > 50.0) hm::c.waitsOver50++;
++            if (timedOut) {
++                hm::c.timeouts++;
++                char what[96];
++                std::snprintf(what, sizeof what, "시간 초과 %.0fms (%s)", ms,
++                              hm::ctx == 2 ? "손님: 방장 신호 기다림" : hm::ctx == 1 ? "방장: 답 기다림" : "기타");
++                hm::Event(what);
++            }
++        };
+         do {
+             _sendFn(RETRO_NETPACKET_FLUSH_HINT, NULL, 0, RETRO_NETPACKET_BROADCAST);
+             _pollFn();
+             if(!receivedPackets.empty()) {
++                note(false);
+                 return NextPacket();
+             }
+             std::this_thread::yield();
+         } while (std::chrono::steady_clock::now() < deadline);
++        note(true);
+     } else {
+         return NextPacket();
+     }
+diff --git a/src/libretro/platform/mp.cpp b/src/libretro/platform/mp.cpp
+index 30ee4c2..432d88b 100644
+--- a/src/libretro/platform/mp.cpp
++++ b/src/libretro/platform/mp.cpp
+@@ -18,6 +18,7 @@
+ #include "tracy.hpp"
+ #include "core/core.hpp"
+ #include "environment.hpp"
++#include "hanbang.hpp"
+ #include <fmt/base.h>
+ #include <retro_assert.h>
+ 
+@@ -41,6 +42,7 @@ void MelonDsDs::CoreState::MpStarted(retro_netpacket_send_t send, retro_netpacke
+         retro::warn("Failed to disable fastforwarding for multiplayer");
+     }
+     retro::info("Starting multiplayer on libretro side");
++    hanbang::mp::Event("같이하기 연결 시작");
+ }
+ 
+ void MelonDsDs::CoreState::MpPacketReceived(const void *buf, size_t len, uint16_t client_id) noexcept {
+@@ -54,6 +56,7 @@ void MelonDsDs::CoreState::MpStopped() noexcept {
+     _mpState.SetPollFn(nullptr);
+     retro::clear_fastforwarding_override();
+     retro::info("Stopping multiplayer on libretro side");
++    hanbang::mp::Event("같이하기 연결 끝");
+ }
+ 
+ bool MelonDsDs::CoreState::MpSendPacket(const MelonDsDs::Packet &p) noexcept {
+diff --git a/src/libretro/render/software.cpp b/src/libretro/render/software.cpp
+index aa7040b..91bb791 100644
+--- a/src/libretro/render/software.cpp
++++ b/src/libretro/render/software.cpp
+@@ -17,7 +17,9 @@
+ #include "software.hpp"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
++#include <cstring>
+ 
+ #include <retro_assert.h>
+ 
+@@ -26,6 +28,7 @@
+ 
+ #include "config/config.hpp"
+ #include "config/types.hpp"
++#include "hanbang.hpp"
+ #include "input/input.hpp"
+ #include "message/error.hpp"
+ #include "screenlayout.hpp"
+@@ -90,36 +93,115 @@ void MelonDsDs::SoftwareRenderState::Render(
+         screenLayout
+     );
+ 
+-    bool mainCursorDrawn = false;
++    // hanbang (ui-v2, 10/11): 그리는 차례 = 큰 화면 → 왼쪽 위 작은 화면 → 펜 → 창(팝업) → 창 모서리 그림 → 창 안 펜(누르는 창일 때).
++    // 큰 화면의 펜은 창보다 먼저(밑에) 그려요. DraStic 도 펜이 창 밑이에요. 창이 흐려지면(C) 밑의 펜이 비쳐 보여요.
++    // 누르는 창 안의 펜은 맨 위예요(고침 2 — 손가락 그림이 펜을 가리지 않게).
++    const ScreenLayout layout = screenLayout.Layout();
++    const bool single = layout == ScreenLayout::TopOnly || layout == ScreenLayout::BottomOnly;
++    const bool topMain = layout == ScreenLayout::TopOnly; // 위(보기) 화면이 큼 → 창 = 누르는 화면
++    const bool pipShown = single && screenLayout.PictureInPictureEnabled();
++    const int pipMode = hanbang::PipMode();
++    // 작은 화면 선명하게(7): pip=2 이고 작은 화면이 보일 때만 2배 크기(512x384)로 내보내요.
++    // 고침 5: 같이하기 중(mpActive)에는 pip=2 여도 1배로 내보내요. 2배는 매 장면 키우기 + 레트로아크 768KB 복사 + 창 4배라서
++    //   같이하기가 느려지는 걸 막으려고요. 그때 작은 화면은 pip=1(넓이 평균)로 그려요.
++    const unsigned S = (pipShown && pipMode == 2 && !hanbang::mp::mpActive) ? 2u : 1u;
++    if (S == 2) Upscale2x();
++    PixelBuffer& out = S == 2 ? hiresBuffer : buffer;
++
++    const bool cursorOn = !nds.IsLidClosed() && inputState.CursorVisible();
++    const ivec2 touch = inputState.ConsoleTouchPosition();
++    if (pipShown) {
++        DrawPictureInPicture(out, S, pipMode, topMain ? bottomScreenBuffer : topScreenBuffer,
++                             topMain && cursorOn, touch, config.CursorSize());
++    }
++    if (cursorOn) {
++        DrawCursor(out, S, inputState, config, screenLayout); // A2: 창보다 먼저 = 창 밑
++    }
++
+     {
+-        // hanbang (10/9): while L2 is held or pinned in a one-screen layout (top only / bottom only), the other screen slides up from the bottom
+-        // as a translucent pop-up (75% size, rounded corners), like the Android 'pop-up screen' builds. In 'top only' the touch cursor
+-        // is drawn inside the pop-up so the bottom screen can be aimed at with the right stick.
++        // hanbang (10/9): L2 꾹·따닥 고정 = 한 화면 배치(위만 / 아래만)에서 다른 화면이 아래에서 반투명 창으로 올라와요.
++        // ui-v2 에서 더한 것 (두 화면이 다 보이는 배치에서는 창이 없으니 D·C 도 없어요):
++        //  D: 위 화면이 크고 L2 창이 없을 때, 오른쪽 스틱이 데드존(20%) 밖이거나 펜이 움직이면 '누르는 창'이 저절로 떠요.
++        //     스틱을 마지막으로 쓴 뒤 1.5초가 지나면 내려가요. L2 꾹·고정이 먼저예요. 설정 auto=0 이면 끔.
++        //  C: 아래 화면이 크고 L2 보기 창이 떠 있을 때, 스틱이 데드존 밖이거나 펜이 움직이면 창이 fade=(기본 40%)로 흐려져요.
++        //     스틱을 놓고 1.2초 뒤 원래(alpha=, 기본 85%)로 돌아와요.
++        using namespace std::chrono_literals;
+         constexpr int POPUP_ANIM = 9;
+-        ScreenLayout layout = screenLayout.Layout();
+-        bool single = layout == ScreenLayout::TopOnly || layout == ScreenLayout::BottomOnly;
+-        if (single && screenLayout.PictureInPictureEnabled()) {
+-            bool topMain = layout == ScreenLayout::TopOnly;
+-            DrawPictureInPicture(topMain ? bottomScreenBuffer : topScreenBuffer,
+-                                 topMain && !nds.IsLidClosed() && inputState.CursorVisible(),
+-                                 inputState.ConsoleTouchPosition(), config.CursorSize());
++        const auto now = std::chrono::steady_clock::now();
++        const hanbang::PopupSettings& hb = hanbang::Popup();
++        const bool l2Popup = inputState.PopupHeld();
++        // 고침 3: 코어 펜 데드존(5%)과 D·C 데드존(20%) 사이로 살살 밀면 펜은 움직이는데 창이 안 떴어요(안 흐려졌어요).
++        // 그래서 '펜 자리가 이번 장면에 바뀜'도 스틱을 쓰는 것으로 봐요. 끝까지 민 채 가장자리에 멈춰 있으면 20% 조건이 창을 지켜요.
++        const bool penMoved = lastTouch.x >= 0 && touch != lastTouch;
++        lastTouch = touch;
++        const bool stick = inputState.StickOutsideDeadzone() || penMoved;
++
++        // 고침 7: 예전엔 L2 를 누르는 동안 D 를 아예 안 셌어요. 그래서 L2 + 스틱을 쓰다 L2 를 놓으면 1.5초 안 기다리고 바로 내려갔어요.
++        // 이제 스틱을 쓰면 L2 와 관계없이 늘 시계를 늘려요. 보이기는 (L2 || 자동) 그대로라 L2 가 먼저인 건 같아요.
++        if (single && topMain && hb.autoPopup && !nds.IsLidClosed()) {
++            if (stick) {
++                autoPopup = true;
++                autoPopupUntil = now + 1500ms;
++            } else if (autoPopup && now >= autoPopupUntil) {
++                autoPopup = false;
++            }
++        } else {
++            autoPopup = false;
++        }
++
++        if (single && !topMain && l2Popup) {
++            if (stick) {
++                fadeActive = true;
++                fadeUntil = now + 1200ms;
++            } else if (fadeActive && now >= fadeUntil) {
++                fadeActive = false;
++            }
++        } else {
++            fadeActive = false;
++        }
++
++        const float baseA = hb.alpha * 256.0f / 100.0f;
++        const float fadeA = hb.fade * 256.0f / 100.0f;
++        const float targetA = fadeActive ? fadeA : baseA;
++        float dtMs = haveLastRender ? std::chrono::duration<float, std::milli>(now - lastRender).count() : 0.0f;
++        dtMs = std::clamp(dtMs, 0.0f, 100.0f);
++        lastRender = now;
++        haveLastRender = true;
++        if (popupAlpha < 0.0f || popupFrames == 0) {
++            popupAlpha = targetA; // 창이 없을 땐 바로 맞춤
++        } else {
++            // 0.15초에 걸쳐 바뀜
++            const float step = std::max(1.0f, std::abs(baseA - fadeA) * dtMs / 150.0f);
++            if (popupAlpha < targetA) popupAlpha = std::min(targetA, popupAlpha + step);
++            else if (popupAlpha > targetA) popupAlpha = std::max(targetA, popupAlpha - step);
++        }
++
++        const bool showPopup = single && (l2Popup || autoPopup);
++        if (showPopup) {
++            popupFrames = std::min(popupFrames + 1, POPUP_ANIM);
++            popupTopMain = topMain; // 떠 있는 동안은 늘 지금 배치의 종류
++        } else {
++            popupFrames = std::max(popupFrames - 1, 0);
+         }
+-        if (single && inputState.PopupHeld()) popupFrames = std::min(popupFrames + 1, POPUP_ANIM);
+-        else popupFrames = std::max(popupFrames - 1, 0);
++        if (!single) popupFrames = 0; // 두 화면 배치에선 창이 없어요 (돌아왔을 때 반쯤 내려가던 창이 다시 보이지 않게)
+         if (single && popupFrames > 0) {
+-            bool topMain = layout == ScreenLayout::TopOnly;
+-            DrawPopup(topMain ? bottomScreenBuffer : topScreenBuffer, popupFrames / static_cast<float>(POPUP_ANIM),
+-                      topMain && !nds.IsLidClosed() && inputState.CursorVisible(),
+-                      inputState.ConsoleTouchPosition(), config.CursorSize());
++            // 고침 6: R2·SELECT+←/→ 로 배치를 바꾼 뒤 내려가는 9장 동안, 예전엔 새 배치 종류(눈 그림 보기 창)로 바뀌어 내려갔어요.
++            // 이제 내려가는 동안은 떠 있던 때의 종류(popupTopMain)로 그려요. L2 를 누른 채 바꾸면 창이 계속 떠 있으니 바로 새 종류예요.
++            const bool kindTouch = popupTopMain;
++            DrawPopup(out, S, kindTouch ? bottomScreenBuffer : topScreenBuffer, popupFrames / static_cast<float>(POPUP_ANIM),
++                      static_cast<int>(popupAlpha + 0.5f), kindTouch && cursorOn, touch, config.CursorSize(),
++                      kindTouch, inputState.PopupPinned());
+         }
+     }
+ 
+-    if (!mainCursorDrawn && !nds.IsLidClosed() && inputState.CursorVisible()) {
+-        DrawCursor(inputState, config, screenLayout);
++    {
++        // 고침 4: 레트로아크에 장면 넘기기. video_threaded 에선 앞 장면이 아직 안 나갔으면 여기서 최대 한 장(약 16ms) 기다려요.
++        // 그래서 기록의 draw(우리 그리기)에서 빼고 vid 로 따로 세요.
++        const hanbang::mp::Timer hbVid;
++        retro::video_refresh(out[0], out.Width(), out.Height(), out.Stride());
++        if (hbVid.active) hanbang::mp::c.vidMs += hbVid.Ms();
+     }
+ 
+-    retro::video_refresh(buffer[0], buffer.Width(), buffer.Height(), buffer.Stride());
+-
+ #ifdef HAVE_TRACY
+     if (tracy::ProfilerAvailable()) {
+         // If Tracy is connected...
+@@ -198,7 +280,7 @@ void MelonDsDs::SoftwareRenderState::CopyScreen(const uint32_t* src, uvec2 destT
+     }
+ }
+ 
+-void MelonDsDs::SoftwareRenderState::DrawCursor(const InputState& input, const CoreConfig& config,
++void MelonDsDs::SoftwareRenderState::DrawCursor(PixelBuffer& out, unsigned S, const InputState& input, const CoreConfig& config,
+     const ScreenLayoutData& screenLayout
+ ) noexcept {
+     ZoneScopedN(TracyFunction);
+@@ -223,69 +305,209 @@ void MelonDsDs::SoftwareRenderState::DrawCursor(const InputState& input, const C
+         (screenLayout.HybridSmallScreenLayout() == HybridSideScreenDisplay::One || !secondaryTouchInBounds);
+ 
+     const mat3& touchScreenMatrix = touchUsesHybrid ? screenLayout.GetHybridScreenMatrix() : screenLayout.GetBottomScreenMatrix();
+-    vec3 p0 = touchScreenMatrix * vec3(vec2(touch) - vec2(cursorRadius), 1.0f);
+-    vec3 p1 = touchScreenMatrix * vec3(vec2(touch) + vec2(cursorRadius), 1.0f);
++    // hanbang: 화면 배치 행렬은 1배 기준이라, 2배로 내보낼 땐 S 를 곱해요
++    vec3 p0 = touchScreenMatrix * vec3(vec2(touch) - vec2(cursorRadius), 1.0f) * static_cast<float>(S);
++    vec3 p1 = touchScreenMatrix * vec3(vec2(touch) + vec2(cursorRadius), 1.0f) * static_cast<float>(S);
+     float x0 = std::min(p0.x, p1.x);
+     float y0 = std::min(p0.y, p1.y);
+     float x1 = std::max(p0.x, p1.x);
+     float y1 = std::max(p0.y, p1.y);
+-    ivec2 startI = clamp(ivec2(static_cast<int>(std::floor(x0)), static_cast<int>(std::floor(y0))), ivec2(0), ivec2(buffer.Size()));
+-    ivec2 endI = clamp(ivec2(static_cast<int>(std::ceil(x1)), static_cast<int>(std::ceil(y1))), ivec2(0), ivec2(buffer.Size()));
++    ivec2 startI = clamp(ivec2(static_cast<int>(std::floor(x0)), static_cast<int>(std::floor(y0))), ivec2(0), ivec2(out.Size()));
++    ivec2 endI = clamp(ivec2(static_cast<int>(std::ceil(x1)), static_cast<int>(std::ceil(y1))), ivec2(0), ivec2(out.Size()));
+     uvec2 start = uvec2(startI);
+     uvec2 end = uvec2(endI);
+     for (uint32_t y = start.y; y < end.y; y++) {
+         for (uint32_t x = start.x; x < end.x; x++) {
+             // TODO: Replace with SIMD (does GLM have a SIMD version of this?)
+-            uint32_t& pixel = buffer[uvec2(x, y)];
++            uint32_t& pixel = out[uvec2(x, y)];
+             pixel = (0xFFFFFF - pixel) | 0xFF000000;
+         }
+     }
+ }
+ 
+-void MelonDsDs::SoftwareRenderState::DrawPictureInPicture(const uint32_t* src, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept {
++void MelonDsDs::SoftwareRenderState::Upscale2x() noexcept {
++    ZoneScopedN(TracyFunction);
++    const unsigned w = buffer.Width(), h = buffer.Height();
++    hiresBuffer.SetSize(buffer.Size() * 2u);
++    for (unsigned y = 0; y < h; y++) {
++        const uint32_t* s = buffer[y];
++        uint32_t* d = hiresBuffer[2 * y];
++        for (unsigned x = 0; x < w; x++) {
++            d[2 * x] = s[x];
++            d[2 * x + 1] = s[x];
++        }
++        std::memcpy(hiresBuffer[2 * y + 1], d, 2u * w * sizeof(uint32_t));
++    }
++}
++
++void MelonDsDs::SoftwareRenderState::DrawPictureInPicture(PixelBuffer& out, unsigned S, int mode, const uint32_t* src, bool cursor,
++                                                          glm::ivec2 touch, float cursorRadius) noexcept {
+     ZoneScopedN(TracyFunction);
+-    const int bw = static_cast<int>(buffer.Width() / 4), bh = static_cast<int>(buffer.Height() / 4);
++    const int bw = static_cast<int>(out.Width() / 4), bh = static_cast<int>(out.Height() / 4);
+     constexpr int SW = NDS_SCREEN_WIDTH, SH = NDS_SCREEN_HEIGHT;
+-    if (bw < 3 || bh < 3) return;
++    const int T = static_cast<int>(S); // 테두리 두께 (화면에서 늘 같은 굵기)
++    if (bw < 3 * T || bh < 3 * T) return;
+     constexpr uint32_t BORDER = 0xFF03CF03; // opaque RGB(3, 207, 3), outermost output pixels
++    // hanbang (ui-v2): 옛것은 4점마다 1점만 집어서(가까운 점) 가는 글자 획이 통째로 사라졌어요.
++    // 넓이 평균(box)은 k x k 칸의 평균이라 가는 획도 옅게나마 남아요. 2배 출력(S=2)이면 k=2 라서 훨씬 또렷해요.
++    const int k = SW / bw;
++    const bool box = mode >= 1 && k >= 2 && k <= 4 && k * bw == SW && k * bh == SH;
++    const int shift = k == 2 ? 2 : (k == 4 ? 4 : 0);
+     for (int y = 0; y < bh; y++) {
+-        uint32_t* row = buffer[static_cast<unsigned>(y)];
+-        const int sy = y * SH / bh;
+-        for (int x = 0; x < bw; x++) {
+-            row[x] = (x == 0 || y == 0 || x == bw - 1 || y == bh - 1)
+-                ? BORDER : src[sy * SW + x * SW / bw] | 0xFF000000;
++        uint32_t* row = out[static_cast<unsigned>(y)];
++        const bool edgeRow = y < T || y >= bh - T;
++        if (box && shift) {
++            const uint32_t* s0 = src + (y * k) * SW;
++            for (int x = 0; x < bw; x++) {
++                if (edgeRow || x < T || x >= bw - T) { row[x] = BORDER; continue; }
++                uint32_t rb = 0, g = 0; // 빨강·파랑은 16비트 칸 두 개에, 초록은 따로 더해요 (16칸 x 255 도 안 넘침)
++                const uint32_t* s = s0 + x * k;
++                for (int dy = 0; dy < k; dy++, s += SW) {
++                    for (int dx = 0; dx < k; dx++) {
++                        rb += s[dx] & 0x00FF00FFu;
++                        g += s[dx] & 0x0000FF00u;
++                    }
++                }
++                row[x] = 0xFF000000u | ((rb >> shift) & 0x00FF00FFu) | ((g >> shift) & 0x0000FF00u);
++            }
++        } else {
++            const int sy = y * SH / bh;
++            for (int x = 0; x < bw; x++) {
++                row[x] = (edgeRow || x < T || x >= bw - T) ? BORDER : src[sy * SW + x * SW / bw] | 0xFF000000;
++            }
+         }
+     }
+     if (cursor) {
+         touch = glm::clamp(touch, glm::ivec2(0), glm::ivec2(SW - 1, SH - 1));
+-        const float rx = std::max(0.5f, cursorRadius * bw / SW);
+-        const float ry = std::max(0.5f, cursorRadius * bh / SH);
+-        const float cx = std::clamp((touch.x + 0.5f) * bw / SW, 1.5f, bw - 1.5f);
+-        const float cy = std::clamp((touch.y + 0.5f) * bh / SH, 1.5f, bh - 1.5f);
+-        // Clip to the interior so the opaque one-pixel border stays intact.
+-        const int xa = std::clamp(static_cast<int>(std::floor(cx - rx)), 1, bw - 1);
+-        const int xb = std::clamp(static_cast<int>(std::ceil(cx + rx)), 1, bw - 1);
+-        const int ya = std::clamp(static_cast<int>(std::floor(cy - ry)), 1, bh - 1);
+-        const int yb = std::clamp(static_cast<int>(std::ceil(cy + ry)), 1, bh - 1);
++        const float rx = std::max(0.5f * T, cursorRadius * bw / SW);
++        const float ry = std::max(0.5f * T, cursorRadius * bh / SH);
++        const float cx = std::clamp((touch.x + 0.5f) * bw / SW, T + 0.5f, bw - T - 0.5f);
++        const float cy = std::clamp((touch.y + 0.5f) * bh / SH, T + 0.5f, bh - T - 0.5f);
++        // Clip to the interior so the opaque border stays intact.
++        const int xa = std::clamp(static_cast<int>(std::floor(cx - rx)), T, bw - T);
++        const int xb = std::clamp(static_cast<int>(std::ceil(cx + rx)), T, bw - T);
++        const int ya = std::clamp(static_cast<int>(std::floor(cy - ry)), T, bh - T);
++        const int yb = std::clamp(static_cast<int>(std::ceil(cy + ry)), T, bh - T);
+         for (int y = ya; y < yb; y++) {
+-            uint32_t* row = buffer[static_cast<unsigned>(y)];
++            uint32_t* row = out[static_cast<unsigned>(y)];
+             for (int x = xa; x < xb; x++) row[x] = (0xFFFFFF - row[x]) | 0xFF000000;
+         }
+     }
+ }
+ 
+-void MelonDsDs::SoftwareRenderState::DrawPopup(const uint32_t* src, float t, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept {
++namespace {
++    // hanbang (ui-v2) B: 창 모서리 작은 그림 (11x11 점, 글자 없음). '.' = 투명, 'k' = 어두운 동그라미 바탕
++    // 'w' 흰색 'b' 검정 'y' 손가락 노랑 'o' 손가락 그림자 'r' 핀 빨강 'p' 핀 밝은 점 'g' 핀 바늘 회색
++    constexpr const char* BADGE_EYES[11] = { // 👀 보기 창
++        "...kkkkk...",
++        ".kkkkkkkkk.",
++        ".kwwkkkwwk.",
++        "kwwwwkwwwwk",
++        "kwwbbkwwbbk",
++        "kwwbbkwwbbk",
++        "kwwwwkwwwwk",
++        ".kwwkkkwwk.",
++        ".kkkkkkkkk.",
++        "..kkkkkkk..",
++        "...kkkkk...",
++    };
++    constexpr const char* BADGE_FINGER[11] = { // 👆 누르는 창
++        "...kkkkk...",
++        ".kkkyykkkk.",
++        ".kkkyykkkk.",
++        "kkkkyykkkkk",
++        "kkkkyyoyoyk",
++        "kkyyyyyyyyk",
++        "kkyyyyyyyyk",
++        ".kyyyyyyyk.",
++        ".kkyyyyyyk.",
++        "..kkyyyykk.",
++        "...kkkkk...",
++    };
++    constexpr const char* BADGE_PIN[11] = { // 📌 고정
++        "...kkkkk...",
++        ".kkkkkrrkk.",
++        ".kkkkrrrrk.",
++        "kkkkrrprrrk",
++        "kkkkrrrrrkk",
++        "kkkgrrrrkkk",
++        "kkkgkrrkkkk",
++        ".kgkkkkkkk.",
++        ".gkkkkkkkk.",
++        "..kkkkkkk..",
++        "...kkkkk...",
++    };
++    constexpr int BADGE = 11;
++    constexpr uint32_t TOUCH_BORDER = 0xFFFFCC00; // 누르는 창 노란 테두리
++
++    inline uint32_t Blend(uint32_t fg, uint32_t bg, unsigned a) noexcept {
++        uint32_t res = 0xFF000000;
++        for (int s = 0; s < 24; s += 8) {
++            const unsigned f = (fg >> s) & 0xFF, b = (bg >> s) & 0xFF;
++            res |= ((f * a + b * (256 - a)) >> 8) << s;
++        }
++        return res;
++    }
++}
++
++void MelonDsDs::SoftwareRenderState::DrawBadge(PixelBuffer& out, unsigned S, int x, int y, const char* const* rows) noexcept {
++    const int W = static_cast<int>(out.Width()), H = static_cast<int>(out.Height());
++    const int s = static_cast<int>(S);
++    for (int ry = 0; ry < BADGE; ry++) {
++        for (int rx = 0; rx < BADGE; rx++) {
++            const char ch = rows[ry][rx];
++            if (ch == '.') continue;
++            uint32_t color;
++            unsigned a = 256;
++            switch (ch) {
++                case 'k': color = 0xFF1E1E24; a = 210; break;
++                case 'w': color = 0xFFFFFFFF; break;
++                case 'b': color = 0xFF101010; break;
++                case 'y': color = 0xFFFFC83D; break;
++                case 'o': color = 0xFFB07818; break;
++                case 'r': color = 0xFFE5323C; break;
++                case 'p': color = 0xFFFF9EA6; break;
++                case 'g': color = 0xFFC8C8D0; break;
++                default: continue;
++            }
++            for (int dy = 0; dy < s; dy++) {
++                const int py = y + ry * s + dy;
++                if (py < 0 || py >= H) continue;
++                uint32_t* row = out[static_cast<unsigned>(py)];
++                for (int dx = 0; dx < s; dx++) {
++                    const int px = x + rx * s + dx;
++                    if (px < 0 || px >= W) continue;
++                    row[px] = a >= 256 ? color : Blend(color, row[px], a);
++                }
++            }
++        }
++    }
++}
++
++void MelonDsDs::SoftwareRenderState::DrawPopup(PixelBuffer& out, unsigned S, const uint32_t* src, float t, int alpha256, bool cursor,
++                                               glm::ivec2 touch, float cursorRadius, bool touchWindow, bool pinned) noexcept {
+     ZoneScopedN(TracyFunction);
+-    const int W = static_cast<int>(buffer.Width()), H = static_cast<int>(buffer.Height());
++    const int W = static_cast<int>(out.Width()), H = static_cast<int>(out.Height());
+     constexpr int SW = NDS_SCREEN_WIDTH, SH = NDS_SCREEN_HEIGHT;
+     if (W < SW || H < SH) return;
++    const int s = static_cast<int>(S);
+     const int bw = W * 3 / 4, bh = H * 3 / 4;          // 75% of the screen, 4:3 kept
+     const int x0 = (W - bw) / 2;
+-    const int yOpen = H - bh - 4;                       // 4px above the bottom edge when fully open
++    const int yOpen = H - bh - 4 * s;                   // 4px (1배 기준) above the bottom edge when fully open
+     const float e = 1.0f - (1.0f - t) * (1.0f - t);     // ease-out slide
+     const int y0 = H + static_cast<int>((yOpen - H) * e);
+-    constexpr unsigned A = 218;                         // ~85% opaque
+-    constexpr int R = 6;                                // corner radius
++    const unsigned A = static_cast<unsigned>(std::clamp(alpha256, 0, 256)); // 85% ≈ 218
++    const int R = 6 * s;                                // corner radius
++    const int T = touchWindow ? s : 0;                  // 누르는 창 노란 테두리 두께
++    // 가로 표본 위치는 줄마다 같아서 한 번만 계산해요 (예전엔 점마다 64비트 나눗셈)
++    if (static_cast<int>(popupColumns.size()) != bw) {
++        popupColumns.resize(static_cast<size_t>(bw));
++        for (int ox = 0; ox < bw; ox++) {
++            int sxf = static_cast<int>((2LL * ox + 1) * SW * 65536 / (2 * bw)) - 32768;
++            if (sxf < 0) sxf = 0;
++            popupColumns[static_cast<size_t>(ox)] = sxf;
++        }
++    }
+     for (int oy = 0; oy < bh; oy++) {
+         const int dy = y0 + oy;
+         if (dy < 0 || dy >= H) continue;
+@@ -294,33 +516,44 @@ void MelonDsDs::SoftwareRenderState::DrawPopup(const uint32_t* src, float t, boo
+         const int sy = syf >> 16, fy = (syf >> 8) & 0xFF, sy1 = std::min(sy + 1, SH - 1);
+         const uint32_t* r0 = src + sy * SW;
+         const uint32_t* r1 = src + sy1 * SW;
+-        uint32_t* d = buffer[static_cast<unsigned>(dy)] + x0;
++        uint32_t* d = out[static_cast<unsigned>(dy)] + x0;
+         const int cy = oy < R ? R - oy : (oy >= bh - R ? oy - (bh - R - 1) : 0);
++        const bool edgeRow = oy < T || oy >= bh - T;
+         for (int ox = 0; ox < bw; ox++) {
+             const int cx = ox < R ? R - ox : (ox >= bw - R ? ox - (bw - R - 1) : 0);
+-            if (cx && cy && cx * cx + cy * cy > R * R) continue;
+-            int sxf = static_cast<int>((2LL * ox + 1) * SW * 65536 / (2 * bw)) - 32768;
+-            if (sxf < 0) sxf = 0;
++            const int dd = cx * cx + cy * cy;
++            if (cx && cy && dd > R * R) continue;
++            if (T && (edgeRow || ox < T || ox >= bw - T || (cx && cy && dd > (R - T) * (R - T)))) {
++                d[ox] = TOUCH_BORDER;
++                continue;
++            }
++            const int sxf = popupColumns[static_cast<size_t>(ox)];
+             const int sx = sxf >> 16, fx = (sxf >> 8) & 0xFF, sx1 = std::min(sx + 1, SW - 1);
+             const uint32_t p00 = r0[sx], p01 = r0[sx1], p10 = r1[sx], p11 = r1[sx1], bg = d[ox];
+             uint32_t res = 0xFF000000;
+-            for (int s = 0; s < 24; s += 8) {
+-                const int top = static_cast<int>((p00 >> s) & 0xFF) * (256 - fx) + static_cast<int>((p01 >> s) & 0xFF) * fx;
+-                const int bot = static_cast<int>((p10 >> s) & 0xFF) * (256 - fx) + static_cast<int>((p11 >> s) & 0xFF) * fx;
++            for (int sh = 0; sh < 24; sh += 8) {
++                const int top = static_cast<int>((p00 >> sh) & 0xFF) * (256 - fx) + static_cast<int>((p01 >> sh) & 0xFF) * fx;
++                const int bot = static_cast<int>((p10 >> sh) & 0xFF) * (256 - fx) + static_cast<int>((p11 >> sh) & 0xFF) * fx;
+                 const unsigned c = static_cast<unsigned>((top * (256 - fy) + bot * fy) >> 16);
+-                const unsigned b = (bg >> s) & 0xFF;
+-                res |= ((c * A + b * (256 - A)) >> 8) << s;
++                const unsigned b = (bg >> sh) & 0xFF;
++                res |= ((c * A + b * (256 - A)) >> 8) << sh;
+             }
+             d[ox] = res;
+         }
+     }
++    // B: 창 모서리 그림 — 누르는 창 👆(왼쪽 아래), 보기 창 👀(왼쪽 위), 고정이면 📌(오른쪽 위)
++    const int m = 3 * s + T, size = BADGE * s;
++    if (touchWindow) DrawBadge(out, S, x0 + m, y0 + bh - m - size, BADGE_FINGER);
++    else DrawBadge(out, S, x0 + m, y0 + m, BADGE_EYES);
++    if (pinned) DrawBadge(out, S, x0 + bw - m - size, y0 + m, BADGE_PIN);
++    // 창 안 펜 — 고침 2: 예전엔 그림보다 먼저 그려서, 펜이 왼쪽 아래 손가락 그림 자리에 들어가면 안 보였어요. 이제 맨 위에 그려요.
+     if (cursor) {
+-        const float r = std::max(1.0f, cursorRadius * 0.75f);
++        const float r = std::max(1.0f * s, cursorRadius * 0.75f * s);
+         const float cxf = x0 + (touch.x + 0.5f) * bw / SW, cyf = y0 + (touch.y + 0.5f) * bh / SH;
+         const int xa = std::max(0, static_cast<int>(std::floor(cxf - r))), xb = std::min(W, static_cast<int>(std::ceil(cxf + r)));
+         const int ya = std::max(0, static_cast<int>(std::floor(cyf - r))), yb = std::min(H, static_cast<int>(std::ceil(cyf + r)));
+         for (int y = ya; y < yb; y++) {
+-            uint32_t* row = buffer[static_cast<unsigned>(y)];
++            uint32_t* row = out[static_cast<unsigned>(y)];
+             for (int x = xa; x < xb; x++) row[x] = (0xFFFFFF - row[x]) | 0xFF000000;
+         }
+     }
+diff --git a/src/libretro/render/software.hpp b/src/libretro/render/software.hpp
+index 3fc96fc..cd8c1d8 100644
+--- a/src/libretro/render/software.hpp
++++ b/src/libretro/render/software.hpp
+@@ -17,7 +17,9 @@
+ #ifndef MELONDSDS_RENDER_SOFTWARE_HPP
+ #define MELONDSDS_RENDER_SOFTWARE_HPP
+ 
++#include <chrono>
+ #include <optional>
++#include <vector>
+ #include <span>
+ 
+ #include <glm/mat3x3.hpp>
+@@ -61,12 +63,31 @@ namespace MelonDsDs {
+         /// for the given layout; shared by both Render overloads.
+         void PrepareBuffers(const CoreConfig& config, const ScreenLayoutData& screenLayout) noexcept;
+         void CopyScreen(const uint32_t* src, glm::uvec2 destTranslation, ScreenLayout layout) noexcept;
+-        void DrawCursor(const InputState& input, const CoreConfig& config, const ScreenLayoutData& screenLayout) noexcept;
+-        // hanbang: opaque quarter-size PiP, underneath the existing pop-up
+-        void DrawPictureInPicture(const uint32_t* src, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept;
+-        // hanbang: translucent pop-up of the other screen while L2 is held or pinned
+-        void DrawPopup(const uint32_t* src, float t, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept;
++        // hanbang (ui-v2): 아래 그리기 함수는 모두 'out' 에 그려요. out 은 buffer(1배) 또는 hiresBuffer(2배, 작은 화면 선명하게).
++        // S = out 이 buffer 의 몇 배인지 (1 또는 2).
++        void DrawCursor(PixelBuffer& out, unsigned S, const InputState& input, const CoreConfig& config, const ScreenLayoutData& screenLayout) noexcept;
++        // hanbang: 왼쪽 위 1/4 크기 작은 화면(초록 테두리). mode 0 = 가까운 점, 1·2 = 넓이 평균
++        void DrawPictureInPicture(PixelBuffer& out, unsigned S, int mode, const uint32_t* src, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept;
++        // hanbang: 다른 화면 반투명 창. alpha256 = 불투명도(0~256). touchWindow = 누르는 화면 창(노란 테두리 + 손가락), 아니면 보기 창(눈)
++        void DrawPopup(PixelBuffer& out, unsigned S, const uint32_t* src, float t, int alpha256, bool cursor, glm::ivec2 touch,
++                       float cursorRadius, bool touchWindow, bool pinned) noexcept;
++        // hanbang: 11x11 점 그림 하나를 S 배로 (창 모서리 표시)
++        void DrawBadge(PixelBuffer& out, unsigned S, int x, int y, const char* const* rows) noexcept;
++        // hanbang: buffer → hiresBuffer 2배 (가까운 점)
++        void Upscale2x() noexcept;
+         int popupFrames = 0;
++        // hanbang (ui-v2) D·C 상태 (실제 시계로 재요 — 같이하기에서 장수가 줄어도 시간이 같게)
++        bool autoPopup = false;                               // D: 스틱 때문에 뜬 누르는 창
++        std::chrono::steady_clock::time_point autoPopupUntil; // D: 이 시각이 지나면 내림
++        bool fadeActive = false;                              // C: 보기 창 흐리게
++        std::chrono::steady_clock::time_point fadeUntil;      // C: 이 시각이 지나면 되돌림
++        float popupAlpha = -1.0f;                             // 지금 창 불투명도(0~256), 천천히 바뀜
++        glm::ivec2 lastTouch {-1, -1};                        // 고침 3: 지난 장면 펜 자리 (-1 = 아직 없음)
++        bool popupTopMain = false;                            // 고침 6: 창이 떠 있던 동안의 종류(true = 누르는 창). 내려갈 땐 이걸로 그림
++        std::chrono::steady_clock::time_point lastRender;
++        bool haveLastRender = false;
++        PixelBuffer hiresBuffer {1, 1};
++        std::vector<int> popupColumns;                        // 창 가로 표본 위치 표 (점마다 나눗셈 안 하게)
+         void CombineScreens(
+             std::span<const uint32_t, NDS_SCREEN_AREA<size_t>> topBuffer,
+             std::span<const uint32_t, NDS_SCREEN_AREA<size_t>> bottomBuffer,

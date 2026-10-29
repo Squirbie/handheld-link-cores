@@ -1,0 +1,100 @@
+diff --git a/src/machine/vsnes_machine.c b/src/machine/vsnes_machine.c
+index 6890f70..6160fd4 100644
+--- a/src/machine/vsnes_machine.c
++++ b/src/machine/vsnes_machine.c
+@@ -10,2 +10,3 @@ Nintendo VS UniSystem and DualSystem - (c) 1984 Nintendo of America
+ #include "driver.h"
++#include "state.h"	/* hanbang 10/21 */
+ #include "vidhrdw/ppu2c03b.h"
+@@ -795,2 +796,4 @@ static int MMC3_prg_chunks, MMC3_prg_mask;
+ static int IRQ_enable, IRQ_count, IRQ_count_latch;
++static UINT8 MMC3_last_bank = 0xff;	/* hanbang 10/21: was a function-local static in mapper4_w (not in the save state) */
++static int MMC3_mirror_reg = -1;	/* hanbang 10/21: last $a000 value, re-applied after a state load (-1 = never written) */
+ 
+@@ -847,4 +850,2 @@ static WRITE_HANDLER( mapper4_w )
+ {
+-	static UINT8 last_bank = 0xff;
+-
+ 	switch (offset & 0x7001)
+@@ -855,3 +856,3 @@ static WRITE_HANDLER( mapper4_w )
+ 			/* Toggle between switching $8000 and $c000 */
+-			if (last_bank != (data & 0xc0))
++			if (MMC3_last_bank != (data & 0xc0))
+ 			{
+@@ -862,3 +863,3 @@ static WRITE_HANDLER( mapper4_w )
+ 			}
+-			last_bank = data & 0xc0;
++			MMC3_last_bank = data & 0xc0;
+ 			break;
+@@ -896,2 +897,3 @@ static WRITE_HANDLER( mapper4_w )
+ 		case 0x2000: /* $a000 */
++			MMC3_mirror_reg = data;
+ 			if (data & 0x40)
+@@ -942,2 +944,20 @@ static WRITE_HANDLER( mapper4_w )
+ 
++/* hanbang 10/21: after a state load rebuild what the MMC3 registers imply
++   (PRG window is memcpy'd into the ROM area, which the save state does not hold) */
++static void mapper4_postload(void)
++{
++	mapper4_set_prg();
++	mapper4_set_chr();
++	if (MMC3_mirror_reg >= 0)
++	{
++		if (MMC3_mirror_reg & 0x40)
++			ppu2c03b_set_mirroring(0, PPU_MIRROR_HIGH);
++		else if (MMC3_mirror_reg & 0x01)
++			ppu2c03b_set_mirroring(0, PPU_MIRROR_HORZ);
++		else
++			ppu2c03b_set_mirroring(0, PPU_MIRROR_VERT);
++	}
++	ppu2c03b_set_scanline_callback(0, IRQ_enable ? mapper4_irq : 0);
++}
++
+ /* Common init for MMC3 games */
+@@ -963,2 +983,16 @@ DRIVER_INIT( MMC3 )
+ 
++	/* hanbang 10/21: mapper state for save states / netplay */
++	MMC3_last_bank = 0xff;
++	MMC3_mirror_reg = -1;
++	state_save_register_int("mmc3", 0, "cmd", &MMC3_cmd);
++	state_save_register_int("mmc3", 0, "prg0", &MMC3_prg0);
++	state_save_register_int("mmc3", 0, "prg1", &MMC3_prg1);
++	state_save_register_INT32("mmc3", 0, "chr", (INT32 *)MMC3_chr, 6);
++	state_save_register_int("mmc3", 0, "irq_enable", &IRQ_enable);
++	state_save_register_int("mmc3", 0, "irq_count", &IRQ_count);
++	state_save_register_int("mmc3", 0, "irq_count_latch", &IRQ_count_latch);
++	state_save_register_UINT8("mmc3", 0, "last_bank", &MMC3_last_bank, 1);
++	state_save_register_int("mmc3", 0, "mirror_reg", &MMC3_mirror_reg);
++	state_save_register_func_postload(mapper4_postload);
++
+ 	/* extra ram at $6000-$7fff */
+@@ -973,2 +1007,4 @@ DRIVER_INIT( MMC3 )
+ 
++static int VSindex;	/* hanbang 10/21: moved out of rbi_hack_r so the save state carries it */
++
+ static READ_HANDLER( rbi_hack_r)
+@@ -977,4 +1013,2 @@ static READ_HANDLER( rbi_hack_r)
+ 
+-	static int VSindex;
+-
+ 	if (offset == 0)
+@@ -1010,2 +1044,3 @@ DRIVER_INIT( rbibb )
+ 	install_mem_read_handler(0,0x5e00, 0x5e01, rbi_hack_r) ;
++	state_save_register_int("rbibb", 0, "VSindex", &VSindex);	/* hanbang 10/21 */
+ 
+@@ -1063,2 +1098,3 @@ DRIVER_INIT( supxevs )
+ 	install_mem_read_handler( 0, 0x5567, 0x5567, supxevs_read_prot_4_r );
++	state_save_register_int("supxevs", 0, "prot_index", &supxevs_prot_index);	/* hanbang 10/21 */
+ 
+@@ -1069,5 +1105,6 @@ DRIVER_INIT( supxevs )
+ 
++static int security_counter;	/* hanbang 10/21: moved out of tko_security_r so the save state carries it */
++
+ static READ_HANDLER( tko_security_r )
+ {
+-	static int security_counter;
+ 	static UINT8 security_data[] = {
+@@ -1095,2 +1132,3 @@ DRIVER_INIT( tkoboxng )
+ 	install_mem_read_handler( 0, 0x5e00, 0x5e01, tko_security_r );
++	state_save_register_int("tkoboxng", 0, "security_counter", &security_counter);	/* hanbang 10/21 */
+ 

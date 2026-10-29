@@ -1,0 +1,345 @@
+--- a/dual/libretro_dual.c
++++ b/dual/libretro_dual.c
+@@ -36,6 +36,14 @@
+  *   한 대짜리와 같은 속도). 게임을 불러올 때만 읽음.
+  * - 두 기기가 같아야 하는 안쪽 옵션(언어 · 이름 · 회전 · 60Hz · 표본율 등)은
+  *   이 래퍼가 고정값으로 대답함(fixedOptions).
++ * - 세로 게임(10/21, 0010): 바깥 옵션 wswan_rotate_display 가 portrait 면 게임을
++ *   불러올 때 한 번, 원래 코어(Beetle WonderSwan portrait + keymap auto)처럼
++ *   화면을 90도 세우고(화면비 9/14) 단추도 세로 기준으로 바꿈 — 1P · 2P 기계
++ *   같은 규칙, 래퍼에서만(안쪽 코어 옵션은 그대로 가로 고정 · SELECT 로 돌리기
++ *   계속 끔). manual · landscape · 없음 = 예전처럼 가로(바이트까지 같음).
++ *   세로 여부는 상태 머리 판 칸의 0x100 비트에 들어가고, 상태를 불러오면 그
++ *   값을 따름 → 넷플레이 손님은 접속 때 · CRC 재동기 때 방장 상태를 받으므로
++ *   두 기기 설정이 달라도 단추 해석(= 에뮬 결과)이 방장 것으로 맞음.
+  * - 상태 저장 = 머리 64바이트 + 1P 기계 + 2P 기계(크기 고정).
+  * - 1P 세이브 = 보통 .srm(RETRO_MEMORY_SAVE_RAM = 1P 기계 SRAM/EEPROM).
+  *   2P 세이브 = <세이브 폴더>/<롬 이름>.p2.sav — 이 코어가 직접 읽고 씀
+@@ -69,8 +77,9 @@
+ 
+ #define DUAL_LIBRARY_NAME  "Beetle WonderSwan Dual"
+ /* 넷플레이 버전 칸은 끝 문자 포함 32바이트다.
+- * 자기 세이브 판과 리비전 표시는 유지하고 길이 초과는 빌드 때 막는다. */
+-#define DUAL_VERSION       "1.2-os4"
++ * 자기 세이브 판과 리비전 표시는 유지하고 길이 초과는 빌드 때 막는다.
++ * 1.3(0010) = 1.2-os4 + 세로 게임 세워 보이기(상태 판 칸에 세로 비트) */
++#define DUAL_VERSION       "1.3-os4"
+ typedef char hb_version_fits_netplay[(sizeof(DUAL_VERSION GIT_VERSION) <= 32) ? 1 : -1];
+ #define DUAL_EXTENSIONS    "ws|wsc|pc2"
+ #define DUAL_WIDTH         224
+@@ -81,6 +90,8 @@
+ 
+ #define DUAL_STATE_MAGIC   0x31445748u /* "HWD1" */
+ #define DUAL_STATE_VERSION 1u
++#define DUAL_STATE_ROTATE  0x100u /* 판 칸(머리 4~7바이트)의 이 비트 = 세로. 가로면 0 → 1.2 와 같은 바이트,
++                                     1.2 이하 코어는 이 비트가 선 상태를 '판이 다름'으로 거절 */
+ #define DUAL_HEADER_SIZE   64
+ #include "hb_ownsave.h"
+ 
+@@ -270,8 +281,158 @@
+    }
+    if (logCallback)
+       logCallback(level, "[WonderSwan Dual] %s\n", message);
++}
++
++/* ---- 세로 게임(0010): 화면 · 단추 돌리기 — 래퍼에서만 ----
++ * 안쪽 두 기계는 그대로 가로(fixedOptions: landscape · keymap disabled)라서 에뮬 상태 ·
++ * 소리는 가로 때와 같고, 래퍼가 (1) 안쪽 코어가 읽는 단추를 원래 코어 세로 표대로 바꿔
++ * 주고 (2) 보이는 기계 화면을 앞단이 돌리게 하거나(앞단 회전) 직접 돌려 그림. */
++
++/* 원래 코어(libretro.c update_input)의 단추 표 그대로: [0] 가로, [1] 세로(portrait + auto).
++ * 원더스완 단추 X1 X2 X3 X4 Y1 Y2 Y3 Y4 START A B 마다 읽는 앞단 단추 번호 */
++static const unsigned rotateMaps[2][11] = {
++   {
++      RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_ID_JOYPAD_RIGHT, RETRO_DEVICE_ID_JOYPAD_DOWN,
++      RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_R2, RETRO_DEVICE_ID_JOYPAD_R,
++      RETRO_DEVICE_ID_JOYPAD_L2, RETRO_DEVICE_ID_JOYPAD_L, RETRO_DEVICE_ID_JOYPAD_START,
++      RETRO_DEVICE_ID_JOYPAD_A, RETRO_DEVICE_ID_JOYPAD_B,
++   },
++   {
++      RETRO_DEVICE_ID_JOYPAD_Y, RETRO_DEVICE_ID_JOYPAD_X, RETRO_DEVICE_ID_JOYPAD_A,
++      RETRO_DEVICE_ID_JOYPAD_B, RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_UP,
++      RETRO_DEVICE_ID_JOYPAD_RIGHT, RETRO_DEVICE_ID_JOYPAD_DOWN, RETRO_DEVICE_ID_JOYPAD_START,
++      RETRO_DEVICE_ID_JOYPAD_L, RETRO_DEVICE_ID_JOYPAD_R,
++   },
++};
++static int rotateFrom[16];      /* 안쪽 코어(가로 표)가 묻는 단추 → 대신 읽을 앞단 단추(-1 = 늘 뗌) */
++static bool rotateTall;         /* 지금 세로(화면 · 단추) */
++static bool rotateHw;           /* 앞단이 회전을 받음 = 앞단이 돌림(아니면 래퍼가 돌려 그림) */
++static bool rotateMaxTall;      /* 앞단에 알린 최대 크기에 세운 그림(144x224)이 들어감 */
++static bool rotatePending;      /* 상태를 따라 바뀜 → 다음 retro_run 처음에 앞단에 알림 */
++static uint16_t rotateBuf[DUAL_WIDTH * DUAL_HEIGHT];
++
++static void rotateInitMap(void)
++{
++   unsigned i;
++
++   for (i = 0; i < 16; i++)
++      rotateFrom[i] = -1;
++   /* 안쪽 코어가 가로 표 [0][i] 단추를 물으면 세로 표 [1][i] 단추 값을 줌
++    * → 원더스완 단추 i = 앞단 [1][i] (원래 코어 세로와 같은 결과) */
++   for (i = 0; i < 11; i++)
++      rotateFrom[rotateMaps[0][i]] = (int)rotateMaps[1][i];
++}
++
++static int16_t rotateInput(unsigned port, unsigned index, unsigned id)
++{
++   if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
++   {
++      uint16_t from = (uint16_t)inputCallback(port, RETRO_DEVICE_JOYPAD, index, RETRO_DEVICE_ID_JOYPAD_MASK);
++      uint16_t to = 0;
++      unsigned i;
++
++      for (i = 0; i < 16; i++)
++         if (rotateFrom[i] >= 0 && ((from >> rotateFrom[i]) & 1))
++            to |= (uint16_t)(1u << i);
++      return (int16_t)to;
++   }
++   if (id < 16)
++      return rotateFrom[id] >= 0 ? inputCallback(port, RETRO_DEVICE_JOYPAD, index, (unsigned)rotateFrom[id]) : 0;
++   return inputCallback(port, RETRO_DEVICE_JOYPAD, index, id);
++}
++
++/* 원래 코어 ROTATE_PIXEL_BUF 와 같은 방향(반시계 90도 = 앞단 회전 1):
++ * 입력 (x, y) → 출력 (y, width - 1 - x), 출력 크기 height x width */
++static void rotateFrame(const void *data, unsigned width, unsigned height, size_t pitch)
++{
++   const uint16_t *in = (const uint16_t *)data;
++   size_t stride = pitch / sizeof(uint16_t);
++   unsigned x, y;
++
++   if (!data || width * height > DUAL_WIDTH * DUAL_HEIGHT || stride < width)
++   {
++      videoCallback(NULL, height, width, height * sizeof(uint16_t));
++      return;
++   }
++   for (y = 0; y < height; y++)
++      for (x = 0; x < width; x++)
++         rotateBuf[y + (size_t)(width - 1 - x) * height] = in[x + (size_t)y * stride];
++   videoCallback(rotateBuf, height, width, height * sizeof(uint16_t));
++}
++
++/* 원래 코어 retro_get_system_av_info 와 같은 크기 · 화면비(가로면 안쪽 값 그대로) */
++static void rotateGeometry(struct retro_game_geometry *geometry)
++{
++   if (rotateTall)
++   {
++      geometry->base_width   = rotateHw ? DUAL_WIDTH : DUAL_HEIGHT;
++      geometry->base_height  = rotateHw ? DUAL_HEIGHT : DUAL_WIDTH;
++      geometry->aspect_ratio = 1.0f / (14.0 / 9.0);
++   }
++   if (rotateMaxTall)
++   {
++      geometry->max_width  = DUAL_WIDTH;
++      geometry->max_height = DUAL_WIDTH;
++   }
+ }
+ 
++/* 원래 코어처럼 먼저 0도로 떠보고(앞단이 회전을 받는지), 받을 때만 90도를 요청.
++ * 안 받는 앞단에 90도를 요청해 두면 레트로아크는 '코어가 요청한 회전'만큼 화면비를 뒤집어
++ * 세운 그림이 납작해짐. 레트로아크는 명령줄로 켤 때 retro_load_game 이 화면 드라이버보다
++ * 먼저라 처음엔 늘 '안 받음' → 래퍼가 돌려 그림(원래 코어도 같음). */
++static void rotateProbe(void)
++{
++   unsigned angle = 0;
++
++   rotateHw = environCallback(RETRO_ENVIRONMENT_SET_ROTATION, &angle);
++   if (rotateHw)
++   {
++      angle = 1;
++      environCallback(RETRO_ENVIRONMENT_SET_ROTATION, &angle);
++   }
++}
++
++/* 상태를 따라 세로/가로가 바뀐 뒤 retro_run 처음에: 앞단에 회전 · 크기를 알림 */
++static void rotateNotify(void)
++{
++   struct retro_system_av_info av;
++   bool grow;
++
++   rotatePending = false;
++   if (rotateTall)
++      rotateProbe();
++   else if (rotateHw)
++   {
++      unsigned angle = 0;
++      environCallback(RETRO_ENVIRONMENT_SET_ROTATION, &angle);
++      rotateHw = false;
++   }
++   /* 직접 돌려 그리는데 앞단 최대 크기가 가로(224x144)뿐이면 최대 크기부터 키움 */
++   grow = rotateTall && !rotateHw && !rotateMaxTall;
++   if (grow)
++      rotateMaxTall = true;
++   retro_get_system_av_info(&av);
++   if (grow)
++      environCallback(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
++   else
++      environCallback(RETRO_ENVIRONMENT_SET_GEOMETRY, &av.geometry);
++   dual_log(RETRO_LOG_INFO, "화면 %s(%s) %ux%u 화면비 %.3f", rotateTall ? "세로" : "가로",
++         !rotateTall ? "돌리기 없음" : rotateHw ? "앞단이 90도 돌림" : "래퍼가 돌려 그림",
++         av.geometry.base_width, av.geometry.base_height, av.geometry.aspect_ratio);
++}
++
++/* 불러온 상태의 세로 비트를 따름(넷플레이: 손님은 방장 상태를 받음 → 단추 해석이 방장과 같아짐).
++ * 단추는 바로(다음 장 입력부터), 앞단 알림은 다음 retro_run 처음에(상태 불러오기 안에서는 안 부름). */
++static void rotateFollow(bool tall)
++{
++   if (tall == rotateTall)
++      return;
++   rotateTall = tall;
++   rotatePending = true;
++   dual_log(RETRO_LOG_INFO, "불러온 상태를 따라 %s로 바꿈(넷플레이면 방장 상태 — 두 기기 단추 해석을 맞춤)",
++         tall ? "세로" : "가로");
++}
++
+ /* ---- 안쪽 코어 두 벌에게 주는 콜백 ---- */
+ 
+ static bool envProxy(int m, unsigned cmd, void *data)
+@@ -350,7 +511,12 @@
+ static void videoProxy(int m, const void *data, unsigned width, unsigned height, size_t pitch)
+ {
+    if (m == shown && videoCallback)
+-      videoCallback(data, width, height, pitch);
++   {
++      if (rotateTall && !rotateHw)
++         rotateFrame(data, width, height, pitch);
++      else
++         videoCallback(data, width, height, pitch);
++   }
+ }
+ 
+ static void videoA(const void *d, unsigned w, unsigned h, size_t p) { videoProxy(0, d, w, h, p); }
+@@ -385,6 +551,8 @@
+ {
+    if (port != 0 || !inputCallback)
+       return 0;
++   if (rotateTall && device == RETRO_DEVICE_JOYPAD)
++      return rotateInput((unsigned)m, index, id);
+    return inputCallback((unsigned)m, device, index, id);
+ }
+ 
+@@ -676,6 +844,11 @@
+    static const struct retro_variable vars[] = {
+       { "wswan_dual_screen", "Screen and sound (host/solo = 1P, guest = 2P); 1P|2P" },
+       { "wswan_dual_link", "2P WonderSwan on the link cable (off = solo, one console, faster); on|off" },
++      /* 원래 코어와 같은 키 · 같은 값 목록 · 같은 기본값(manual) — 게임별 .opt 의 portrait 를 그대로 읽고,
++       * 게임별 .opt 없이 전역 옵션 파일을 쓸 때도 원래 코어가 둔 값을 바꿔 쓰지 않음(레트로아크는 같은 값이면
++       * 파일을 안 고침). manual · landscape = 가로(이 코어는 SELECT 로 안 돌림).
++       * 설명 글에 '; '(쌍반점 + 빈칸)를 넣으면 레트로아크가 거기서 값 목록을 잘라 버림 → 쓰지 않음 */
++      { "wswan_rotate_display", "Display rotation at game load (portrait = vertical game with rotated D-pad, manual or landscape = landscape, SELECT never rotates); manual|landscape|portrait" },
+       { NULL, NULL },
+    };
+    int m;
+@@ -727,6 +900,7 @@
+    if (gameLoaded)
+    {
+       inner[0].get_system_av_info(info);
++      rotateGeometry(&info->geometry);
+       return;
+    }
+    memset(info, 0, sizeof(*info));
+@@ -761,6 +935,7 @@
+ #undef PORT_DESCS
+ #undef DESC
+ 
++   rotateInitMap();
+    logCallback = environCallback(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log) ? log.log : NULL;
+    rgb565 = environCallback(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
+    useBitmasks = environCallback(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL);
+@@ -817,6 +992,7 @@
+ {
+    const char *value;
+    size_t sizeB;
++   bool wantTall;
+ 
+    if (!game || !game->data || !game->size)
+    {
+@@ -837,6 +1013,9 @@
+    screenFileReset();
+    screenFileRefresh();
+    applyScreen();
++   value = getVariable("wswan_rotate_display");
++   wantTall = value && !strcmp(value, "portrait");
++   rotateTall = rotateHw = rotateMaxTall = rotatePending = false;
+ 
+    if (!inner[0].load_game(game))
+    {
+@@ -858,6 +1037,17 @@
+       inner[1].unload_game();
+       inner[0].unload_game();
+       return false;
++   }
++
++   /* 세로 게임: 불러올 때 한 번만 읽음(게임 중 옵션을 바꾸면 다음 불러오기부터) */
++   if (wantTall)
++   {
++      rotateTall = true;
++      rotateProbe();
++      rotateMaxTall = !rotateHw;
++      dual_log(RETRO_LOG_INFO, "세로 게임(wswan_rotate_display = portrait): %s · 단추도 세로 기준"
++            "(원래 코어 portrait + auto 와 같음, 1P · 2P 기계 같은 규칙) · SELECT 로 돌리기 꺼짐",
++            rotateHw ? "앞단이 90도 돌림" : "앞단 회전 안 받음 → 래퍼가 돌려 그림 144x224");
+    }
+ 
+    saveSize = inner[0].get_memory_size(RETRO_MEMORY_SAVE_RAM);
+@@ -907,6 +1097,7 @@
+    p2WrittenSize = 0;
+    saveSize = 0;
+    innerSize = 0;
++   rotateTall = rotateHw = rotateMaxTall = rotatePending = false;
+ }
+ 
+ void retro_reset(void)
+@@ -1003,6 +1194,8 @@
+ 
+    if (!gameLoaded)
+       return;
++   if (rotatePending)
++      rotateNotify();
+ 
+    inputPollCallback();
+    if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+@@ -1109,7 +1302,7 @@
+ 
+    memset(p, 0, DUAL_HEADER_SIZE);
+    store32(p + 0, DUAL_STATE_MAGIC);
+-   store32(p + 4, hb_has_token() ? 3 : DUAL_STATE_VERSION);
++   store32(p + 4, (hb_has_token() ? 3 : DUAL_STATE_VERSION) | (rotateTall ? DUAL_STATE_ROTATE : 0));
+    memcpy(p + 16, hb_own_token, 16);
+    hb_put32(p + 32, hb_own_save_hint);
+    hb_put32(p + 36, hb_has_token() ? hb_own_frame : 0);
+@@ -1130,6 +1323,7 @@
+ {
+    size_t total = retro_serialize_size();
+    const uint8_t *p = (const uint8_t *)data;
++   uint32_t version, base;
+ 
+    if (!total || size < total)
+       return false;
+@@ -1138,7 +1332,9 @@
+       dual_log(RETRO_LOG_ERROR, "WonderSwan Dual 상태가 아님");
+       return false;
+    }
+-   if ((load32(p + 4) != DUAL_STATE_VERSION && load32(p + 4) != 2 && load32(p + 4) != 3) ||
++   version = load32(p + 4);
++   base = version & ~DUAL_STATE_ROTATE;   /* 세로 비트를 뺀 판(1 · 2 · 3) */
++   if ((base != DUAL_STATE_VERSION && base != 2 && base != 3) ||
+          load32(p + 8) != 2 || load32(p + 12) != innerSize)
+    {
+       dual_log(RETRO_LOG_ERROR, "상태 판/크기가 다름");
+@@ -1162,11 +1358,13 @@
+    p2CopyPending = false;
+    memset(hb_own_token, 0, 16);
+    hb_own_save_hint = 0;
+-   if (load32(p + 4) >= 2) {
++   if (base >= 2) {
+       memcpy(hb_own_token, p + 16, 16);
+       hb_own_save_hint = hb_u32(p + 32);
+    }
+-   hb_own_restored(load32(p + 4) == 3 ? hb_u32(p + 36) : 0);
++   hb_own_restored(base == 3 ? hb_u32(p + 36) : 0);
++   /* 세로 여부도 상태를 따름(가로 상태 = 비트 없음 = 1.2 상태와 같음) */
++   rotateFollow((version & DUAL_STATE_ROTATE) != 0);
+    return true;
+ }
+ 

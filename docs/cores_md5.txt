@@ -1,0 +1,15 @@
+83032767d18ac489157269e56e770cd1  1685216  bluemsx_libretro.so
+20380390bed1c8042b5264b259d16e85  2627720  dosbox_pure_hb_ipx_libretro.so
+c942499fc72a61400d4e6a486841fb37  77036704  fbneo_libretro.so
+92e23de148cb45fb645cc270cba95bfd  72584  fbneo_mj_libretro.so
+d944c5c6451efea1aaab950317886426  4261840  fceumm_libretro.so
+8c0eb89d9c157eda094b293a4aa0b976  4367384  gambatte_libretro.so
+2db4468dac16b8754d268e90348639a0  11984232  genesisplusgx_gg_dual_libretro.so
+8bdd8b56e895a9625cddc932c3e2f926  902024  gpsp_libretro.so
+30e1ebc1ea097bd2cddd4e8e85b31f7e  42882544  mame2003_plus_libretro.so
+fb23fd640ae81b3cbdde89ad3d43f4e5  72584  mame2003_plus_mj_libretro.so
+91b8d251fbd72d776d1b2616b2a2b111  831096  mednafen_ngp_dual_libretro.so
+53e2b57da54e3af050614309872d7a4e  2312664  mednafen_wswan_dual_libretro.so
+e0f45595139d4c81ce8b442498c4f6ad  5546496  melondsds_libretro.so
+df34be2b181f863497fa749d04d5c1c0  1248696  mgba_dual_libretro.so
+# melondsds_libretro.so: the release copy has its 8 embedded build-path strings neutralized (/home/<builder> -> /opt/build/mds-src); otherwise byte-identical to the device build 5443e0001602467348f4df9ea42c5849.

@@ -1,0 +1,423 @@
+From 3dae92254572ca9973fa0890b2d0cce6a807b8cc Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Tue, 20 Oct 2026 00:54:00 +0900
+Subject: [PATCH 1/5] WonderSwan UART: accurate status, timing and level IRQs,
+ plus a link port
+
+Rewrite comm.c so two consoles can be wired together by a frontend:
+- 0xB3 status reports receive-ready (bit 0) and overrun (bit 1) whenever
+  they are true; the old code hid bit 0 unless control bit 5 was set,
+  which games that finish their init with 0x80 never do.
+- A byte takes 10 bit times (3200 CPU cycles at 9600 bps, 800 at 38400)
+  counted from the cycle it was written; only then is the transmitter
+  empty again and the byte handed out through Comm_LinkTake().
+- Comm_LinkGive() delivers a partner byte; a byte arriving while the
+  receive buffer is full sets overrun and is dropped; a byte arriving
+  while the UART is off is lost.
+- Turning the UART off flushes the receive buffer and overrun, but a
+  byte already being sent still goes out. One Piece Grand Battle Swan
+  Colosseum depends on both: it toggles the UART to discard stale
+  handshake bytes, and disables it right after writing a final reply.
+- Serial send (IRQ 0) is now level-triggered like serial receive.
+- All UART state, including the in-flight byte, is in the savestate.
+- Optional stderr tracing of 0xB1/0xB3 and serial IRQs for testing.
+
+---
+ mednafen/wswan/comm.c      | 254 +++++++++++++++++++++++++++++++------
+ mednafen/wswan/comm.h      |   7 +
+ mednafen/wswan/interrupt.c |  14 +-
+ 3 files changed, 234 insertions(+), 41 deletions(-)
+
+diff --git a/mednafen/wswan/comm.c b/mednafen/wswan/comm.c
+index 5ffa27b..d282ed5 100644
+--- a/mednafen/wswan/comm.c
++++ b/mednafen/wswan/comm.c
+@@ -15,49 +15,127 @@
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ 
+-/* WonderSwan serial port emulation, ported from upstream comm.cpp.
++/* WonderSwan serial port (EXT port UART).
+  *
+- * No external link is emulated (upstream's optional WonderFence
+- * child-process bridge is intentionally left out; it is unix-only,
+- * non-deterministic, and unusable on statically linked console
+- * builds). Behavior matches upstream when no link peer is present:
+- * transmitted bytes complete immediately and raise the serial-send
+- * interrupt; nothing is ever received. */
++ * 한방(hanbang) 10/20 다시 씀 — 원더스완 두 대를 한 코어에서 잇기 위해
++ * WSdev 위키(https://ws.nesdev.org/wiki/UART , /wiki/Interrupts) 기준으로:
++ *  - 0xB3 읽기: 비트7 켜짐 · 비트6 속도 · 비트2 송신 버퍼 비어 있음 ·
++ *    비트1 수신 넘침(overrun) · 비트0 수신 데이터 있음.
++ *    (예전 코드는 제어 비트5 가 켜져 있을 때만 비트0 을 보여 줘서, 마지막에
++ *    0x80 만 쓰는 게임은 상대 바이트를 영영 못 봄 — 그 조건을 없앰.)
++ *  - 0xB3 쓰기: 비트7 켜기 · 비트6 속도 · 비트5 = 1 이면 overrun 지움.
++ *    끄면(비트7 = 0) 수신 버퍼 · overrun 을 비움, 보내던 바이트는 끝까지 나감.
++ *  - 한 바이트 = 10비트: 9600bps = 3200 CPU 사이클, 38400bps = 800 사이클.
++ *    그 시간이 지나야 '송신 비어 있음'이 되고, 그때 바이트가 선 밖으로
++ *    나가 상대에게 넘어감(Comm_LinkTake → 앞단 → 상대 Comm_LinkGive).
++ *  - 받을 때 수신 버퍼가 이미 차 있으면 overrun(비트1)을 켜고 새 바이트는
++ *    버림(먼저 온 바이트 유지). 수신 쪽 UART 가 꺼져 있으면 바이트는 사라짐.
++ *  - 인터럽트는 둘 다 레벨: IRQ 0 = 켜짐 && 송신 비어 있음,
++ *    IRQ 3 = 켜짐 && 수신 데이터 있음 (interrupt.c 의 LevelTriggeredMask).
++ *  - 전송 중인 바이트 · 남은 사이클 · 넘겨줄 바이트까지 모두 상태 저장에 들어감
++ *    (넷플레이 되감기 · 런어헤드에서 같은 결과).
++ * 상대가 없으면(한 대짜리 코어) 보낸 바이트는 그냥 사라지고 아무것도 안 옴 —
++ * 예전과 같은 '혼자' 동작. */
+ 
++#include <stdio.h>
+ #include <string.h>
+ 
+ #include "wswan.h"
+ #include "interrupt.h"
+ #include "comm.h"
++#include "v30mz.h"
+ 
+ #include "../state_inline.h"
+ 
+-static uint8 Control;
+-static uint8 SendBuf, RecvBuf;
+-static bool SendLatched, RecvLatched;
++#define COMM_OUTQ 4
+ 
+-void Comm_Reset(void)
++static uint8 Control;        /* 0xB3 에 쓴 비트7(켜짐) · 비트6(38400) */
++static uint8 SendBuf;        /* 보내는 중인 바이트 */
++static bool SendBusy;        /* 보내는 중(= 상태 비트2 꺼짐) */
++static int32 SendRemain;     /* 이번 줄 시작부터 따져 남은 사이클 */
++static uint8 RecvBuf;
++static bool RecvFull;        /* 상태 비트0 */
++static bool Overrun;         /* 상태 비트1 */
++static uint32 LineStartTS;   /* 마지막 Comm_Process 때의 v30mz_timestamp */
++
++/* 다 보낸 바이트(앞단이 상대에게 넘길 것) */
++static uint8 OutQ[COMM_OUTQ];
++static uint8 OutCount;
++
++/* 통계(시험용 · 상태 저장 안 함 · 에뮬 결과에 영향 없음) */
++static uint32 StatSent, StatRecv, StatOverrun, StatLost, StatTxIgnored;
++
++/* 시험용 추적: 켜면 0xB1 읽기/쓰기 · 0xB3 쓰기를 CPU 위치와 함께 stderr 로 */
++static int TraceOn;
++static char TraceTag[8];
++
++static void TraceAccess(const char *what, uint8 A, uint8 V)
+ {
+-   SendBuf = 0x00;
+-   RecvBuf = 0x00;
++   if(TraceOn)
++      fprintf(stderr, "[%s] %04X:%04X %s %02X=%02X\n", TraceTag,
++            v30mz_get_reg(NEC_PS), v30mz_get_reg(NEC_PC), what, A, V);
++}
+ 
+-   SendLatched = false;
+-   RecvLatched = false;
++/* interrupt.c 가 부름: 인터럽트 포트 쓰기 · 직렬 인터럽트 진입 추적 */
++void Comm_TraceIRQ(const char *what, unsigned a, unsigned v)
++{
++   if(TraceOn)
++      fprintf(stderr, "[%s] %04X:%04X %s %02X=%02X\n", TraceTag,
++            v30mz_get_reg(NEC_PS), v30mz_get_reg(NEC_PC), what, a, v);
++}
+ 
+-   Control = 0x00;
++void Comm_SetTrace(int on, const char *tag)
++{
++   TraceOn = on;
++   snprintf(TraceTag, sizeof(TraceTag), "%s", tag ? tag : "");
++}
++
++static void UpdateIRQ(void)
++{
++   bool on = (Control & 0x80) != 0;
+ 
+-   WSwan_InterruptAssert(WSINT_SERIAL_RECV, RecvLatched);
++   WSwan_InterruptAssert(WSINT_SERIAL_SEND, on && !SendBusy);
++   WSwan_InterruptAssert(WSINT_SERIAL_RECV, on && RecvFull);
++}
++
++static int32 ByteCycles(void)
++{
++   /* 시작 1 + 데이터 8 + 정지 1 = 10비트 */
++   return (Control & 0x40) ? 800 : 3200;
+ }
+ 
+-/* Called once per scanline from wsExecuteLine(). */
++void Comm_Reset(void)
++{
++   Control     = 0x00;
++   SendBuf     = 0x00;
++   SendBusy    = false;
++   SendRemain  = 0;
++   RecvBuf     = 0x00;
++   RecvFull    = false;
++   Overrun     = false;
++   LineStartTS = v30mz_timestamp;
++   OutCount    = 0;
++
++   UpdateIRQ();
++}
++
++/* wsExecuteLine() 이 줄마다 CPU 를 돌리기 전에 부름. 한 줄 = 256 사이클
++ * (CPU 가 넘겨 쓴 사이클은 다음 줄에서 빠지므로 평균은 정확히 256). */
+ void Comm_Process(void)
+ {
+-   if(SendLatched && (Control & 0x80))
++   LineStartTS = v30mz_timestamp;
++
++   if(SendBusy)
+    {
+-      /* No link peer; the byte leaves the shift register
+-       * immediately. */
+-      SendLatched = false;
+-      WSwan_Interrupt(WSINT_SERIAL_SEND);
++      SendRemain -= 256;
++      if(SendRemain <= 0)
++      {
++         SendBusy = false;
++         if(OutCount < COMM_OUTQ)
++            OutQ[OutCount++] = SendBuf;
++         StatSent++;
++         UpdateIRQ();
++      }
+    }
+ }
+ 
+@@ -65,20 +143,24 @@ uint8 Comm_Read(uint8 A)
+ {
+    if(A == 0xB1)
+    {
+-      RecvLatched = false;
+-      WSwan_InterruptAssert(WSINT_SERIAL_RECV, RecvLatched);
++      uint8 ret = RecvBuf;
++
++      TraceAccess(RecvFull ? "읽기" : "읽기(빈)", A, ret);
++      RecvFull = false;
++      UpdateIRQ();
+ 
+-      return(RecvBuf);
++      return(ret);
+    }
+    else if(A == 0xB3)
+    {
+-      uint8 ret = Control & 0xF0;
+-
+-      if((Control & 0x80) && !SendLatched)
+-         ret |= 0x4;
++      uint8 ret = Control & 0xC0;
+ 
+-      if((Control & 0x20) && RecvLatched)
+-         ret |= 0x1;
++      if(RecvFull)
++         ret |= 0x01;
++      if(Overrun)
++         ret |= 0x02;
++      if((Control & 0x80) && !SendBusy)
++         ret |= 0x04;
+ 
+       return(ret);
+    }
+@@ -88,16 +170,99 @@ uint8 Comm_Read(uint8 A)
+ 
+ void Comm_Write(uint8 A, uint8 V)
+ {
++   TraceAccess("쓰기", A, V);
+    if(A == 0xB1)
+    {
+-      if(Control & 0x80)
++      if((Control & 0x80) && !SendBusy)
+       {
+-         SendBuf = V;
+-         SendLatched = true;
++         SendBuf    = V;
++         SendBusy   = true;
++         /* 이 줄 안에서 이미 지난 사이클만큼 더해, 다음 줄들에서 256 씩 뺌 */
++         SendRemain = ByteCycles() + (int32)(v30mz_timestamp - LineStartTS);
+       }
++      else
++         StatTxIgnored++;
+    }
+    else if(A == 0xB3)
+-      Control = V & 0xF0;
++   {
++      if(V & 0x20)
++         Overrun = false;
++
++      Control = V & 0xC0;
++
++      /* 끄면 수신 버퍼 · overrun 을 비움. 보내던 바이트는 끝까지 나감.
++       * 근거(원피스 그랜드 배틀 맥 시험 10/20): 게임은 연결 직후 · 블록 교환
++       * 앞마다 '끄기 → 켜기' 로 묵은 수신 바이트를 지우는 것으로 보고(안 지우면
++       * 묵은 0x3A 를 상대 ID 로 읽어 실패), 마지막 바이트를 쓰자마자 끄는데도
++       * 상대는 그 바이트를 받아야 함(버리면 상대가 NETWORK ERROR). */
++      if(!(Control & 0x80))
++      {
++         RecvFull = false;
++         Overrun  = false;
++      }
++   }
++
++   UpdateIRQ();
++}
++
++/* 앞단(두 대 묶는 쪽): 다 보낸 바이트 하나 꺼내기. 없으면 -1. */
++int Comm_LinkTake(void)
++{
++   int ret;
++
++   if(!OutCount)
++      return -1;
++
++   ret = OutQ[0];
++   OutCount--;
++   if(OutCount)
++      memmove(&OutQ[0], &OutQ[1], OutCount);
++
++   return ret;
++}
++
++/* 앞단: 상대가 보낸 바이트가 선을 타고 도착함. */
++void Comm_LinkGive(uint8 V)
++{
++   if(!(Control & 0x80))
++   {
++      StatLost++;
++      return;
++   }
++
++   if(RecvFull)
++   {
++      Overrun = true;
++      StatOverrun++;
++   }
++   else
++   {
++      RecvBuf  = V;
++      RecvFull = true;
++      StatRecv++;
++   }
++
++   UpdateIRQ();
++}
++
++void Comm_GetStats(uint32 *out, unsigned n)
++{
++   uint32 s[10];
++   unsigned i;
++
++   s[0] = StatSent;
++   s[1] = StatRecv;
++   s[2] = StatOverrun;
++   s[3] = StatLost;
++   s[4] = StatTxIgnored;
++   s[5] = Control;
++   s[6] = SendBusy;
++   s[7] = RecvFull;
++   s[8] = Overrun;
++   s[9] = RecvBuf;
++
++   for(i = 0; i < n && i < 10; i++)
++      out[i] = s[i];
+ }
+ 
+ int Comm_StateAction(StateMem *sm, int load, int data_only)
+@@ -107,10 +272,16 @@ int Comm_StateAction(StateMem *sm, int load, int data_only)
+       SFVARN(SendBuf, "SendBuf"),
+       SFVARN(RecvBuf, "RecvBuf"),
+ 
+-      SFVARN_BOOL(SendLatched, "SendLatched"),
+-      SFVARN_BOOL(RecvLatched, "RecvLatched"),
++      SFVARN_BOOL(SendBusy, "SendLatched"),
++      SFVARN_BOOL(RecvFull, "RecvLatched"),
+ 
+       SFVARN(Control, "Control"),
++
++      SFVARN_BOOL(Overrun, "HBOverrun"),
++      SFVARN(SendRemain, "HBSendRemain"),
++      SFVARN(LineStartTS, "HBLineStart"),
++      SFARRAYN(OutQ, COMM_OUTQ, "HBOutQ"),
++      SFVARN(OutCount, "HBOutCount"),
+       { 0, 0, 0, 0 }
+    };
+ 
+@@ -118,7 +289,12 @@ int Comm_StateAction(StateMem *sm, int load, int data_only)
+       return 0;
+ 
+    if(load)
+-      WSwan_InterruptAssert(WSINT_SERIAL_RECV, RecvLatched);
++   {
++      Control &= 0xC0;
++      if(OutCount > COMM_OUTQ)
++         OutCount = COMM_OUTQ;
++      UpdateIRQ();
++   }
+ 
+    return 1;
+ }
+diff --git a/mednafen/wswan/comm.h b/mednafen/wswan/comm.h
+index 7018feb..be43757 100644
+--- a/mednafen/wswan/comm.h
++++ b/mednafen/wswan/comm.h
+@@ -14,6 +14,13 @@ uint8 Comm_Read(uint8 A);
+ void Comm_Write(uint8 A, uint8 V);
+ int Comm_StateAction(StateMem *sm, int load, int data_only);
+ 
++/* 한방 10/20: 두 대 잇기 — 다 보낸 바이트 꺼내기(-1 = 없음) · 상대 바이트 받기 · 시험용 통계 */
++int Comm_LinkTake(void);
++void Comm_LinkGive(uint8 V);
++void Comm_GetStats(uint32 *out, unsigned n);
++void Comm_SetTrace(int on, const char *tag);
++void Comm_TraceIRQ(const char *what, unsigned a, unsigned v);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/mednafen/wswan/interrupt.c b/mednafen/wswan/interrupt.c
+index 11e1140..03306f3 100644
+--- a/mednafen/wswan/interrupt.c
++++ b/mednafen/wswan/interrupt.c
+@@ -1,14 +1,17 @@
+ #include "wswan.h"
+ #include "interrupt.h"
+ #include "v30mz.h"
++#include "comm.h"
+ #include "../state.h"
+ 
+ static uint8 IStatus;
+ static uint8 IEnable;
+ static uint8 IVectorBase;
+ 
+-/* Level-triggered interrupt lines (currently only serial receive). */
+-static const uint8 LevelTriggeredMask = (1U << WSINT_SERIAL_RECV);
++/* Level-triggered interrupt lines: serial send (transmit buffer empty)
++ * and serial receive (receive buffer full), as on hardware
++ * (https://ws.nesdev.org/wiki/Interrupts). 한방 10/20: 송신도 레벨로. */
++static const uint8 LevelTriggeredMask = (1U << WSINT_SERIAL_RECV) | (1U << WSINT_SERIAL_SEND);
+ static uint8 IAsserted;
+ 
+ static bool IOn_Cache;
+@@ -57,6 +60,8 @@ void WSwan_Interrupt(int which)
+ 
+ void WSwan_InterruptWrite(uint32 A, uint8 V)
+ {
++   if(A == 0xB2 || A == 0xB0)
++      Comm_TraceIRQ("인터럽트포트", A, V);
+    switch(A)
+    {
+       case 0xB0:
+@@ -93,7 +98,12 @@ uint8 WSwan_InterruptRead(uint32 A)
+ void WSwan_InterruptCheck(void)
+ {
+    if(IOn_Cache)
++   {
++      if((IOn_Which == WSINT_SERIAL_RECV || IOn_Which == WSINT_SERIAL_SEND) &&
++            (v30mz_get_reg(NEC_FLAGS) & 0x200))
++         Comm_TraceIRQ("직렬인터럽트", IOn_Which, IStatus);
+       v30mz_int(IVector_Cache, false);
++   }
+ }
+ 
+ void WSwan_InterruptReset(void)
+-- 
+2.53.0
+

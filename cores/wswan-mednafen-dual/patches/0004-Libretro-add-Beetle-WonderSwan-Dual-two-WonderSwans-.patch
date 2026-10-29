@@ -1,0 +1,1240 @@
+From 5278342497729e1d8eb011c35a0cb1510122422f Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Tue, 20 Oct 2026 01:20:34 +0900
+Subject: [PATCH 4/5] Libretro: add Beetle WonderSwan Dual (two WonderSwans on
+ one link cable)
+
+dual/libretro_dual.c is a new libretro frontend that runs two copies of
+this core, built twice with every external name prefixed (wsA_, wsB_;
+dual/build_dual.sh generates the prefix headers from the plain build),
+and steps them line by line, handing finished serial bytes to the other
+console after both ran the line. Port 0 drives the 1P console, port 1
+the 2P console; wswan_dual_screen picks whose picture and sound are
+output, wswan_dual_link=off runs the 1P console alone. Options that must
+match between netplay peers are fixed by the wrapper. Savestates hold
+both consoles; the 2P save is <save dir>/<rom>.p2.sav (copied from the
+1P save when missing), written by the host only.
+
+---
+ dual/build_dual.sh   |   64 +++
+ dual/exports_mac.txt |    1 +
+ dual/libretro_dual.c | 1116 ++++++++++++++++++++++++++++++++++++++++++
+ dual/link_dual.T     |    4 +
+ 4 files changed, 1185 insertions(+)
+ create mode 100644 dual/build_dual.sh
+ create mode 100644 dual/exports_mac.txt
+ create mode 100644 dual/libretro_dual.c
+ create mode 100644 dual/link_dual.T
+
+diff --git a/dual/build_dual.sh b/dual/build_dual.sh
+new file mode 100644
+index 0000000..f160499
+--- /dev/null
++++ b/dual/build_dual.sh
+@@ -0,0 +1,64 @@
++#!/bin/bash
++# 래퍼 코어(원더스완 두 대) 빌드 — build_mac.sh / build_linux.sh 가 부름
++#   bash dual/build_dual.sh mac|linux 빌드폴더 "안쪽 소스 목록"
++# 빌드폴더에 inner_*.o(안쪽 코어 보통 빌드 결과)와 flags(컴파일 옵션 파일)가 있어야 함.
++# 1) inner_*.o 에서 밖으로 보이는 이름(정의된 전역 이름)을 뽑아 머리 파일 두 개를 만듦:
++#    prefix_wsA.h = '#define 이름 wsA_이름' …, prefix_wsB.h = wsB_ …
++# 2) 안쪽 소스를 두 번 컴파일(-include 머리 파일) → 전역 변수가 따로인 두 대
++# 3) dual/libretro_dual.c + 두 벌을 묶어 하나의 코어로. 밖으로는 retro_* 만 내보냄(확인까지).
++# 빠진 이름이 있으면 두 벌이 같은 이름을 정의해 링크가 실패하므로 조용히 섞일 일은 없음.
++set -euo pipefail
++PLAT="$1"; B="$2"; SRCS="$3"
++D="$(cd "$(dirname "$0")" && pwd)"
++SRC="$(dirname "$D")"
++cd "$SRC"
++CC="${CC:-cc}"; NM="${NM:-nm}"
++
++# 1) 이름 목록
++if [ "$PLAT" = mac ]; then
++  "$NM" -g "$B"/inner_*.o | awk 'NF==3 && $2 != "U" {print $3}' | sed 's/^_//'
++else
++  "$NM" -g --defined-only "$B"/inner_*.o | awk 'NF==3 {print $3}'
++fi | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u > "$B/inner_syms.txt"
++N=$(wc -l < "$B/inner_syms.txt" | tr -d ' ')
++grep -qx retro_run "$B/inner_syms.txt" && grep -qx hb_ws_emu_line "$B/inner_syms.txt" || { echo "이름 목록 이상($N개)"; exit 1; }
++for P in wsA wsB; do
++  { echo "/* 자동 생성(build_dual.sh): 안쪽 코어 바깥 이름 ${N}개에 ${P}_ 붙이기 */"
++    awk -v p="$P" '{printf "#define %s %s_%s\n", $1, p, $1}' "$B/inner_syms.txt"; } > "$B/prefix_$P.h"
++done
++echo "  안쪽 바깥 이름 ${N}개 → wsA_ / wsB_"
++
++# 2) 두 벌 컴파일(두 개씩)
++: > "$B/dual_jobs.txt"
++for P in wsA wsB; do
++  for s in $SRCS; do
++    echo "$CC @$B/flags -fno-common -include $B/prefix_$P.h -c -o $B/${P}_$(echo "$s" | tr / _).o $s" >> "$B/dual_jobs.txt"
++  done
++done
++while read -r a; do
++  read -r b || b=""
++  bash -c "$a" &
++  if [ -n "$b" ]; then bash -c "$b" & fi
++  wait
++done < "$B/dual_jobs.txt"
++NS=$(echo $SRCS | wc -w | tr -d ' ')
++NA=$(ls "$B"/wsA_*.o 2>/dev/null | wc -l | tr -d ' '); NB=$(ls "$B"/wsB_*.o 2>/dev/null | wc -l | tr -d ' ')
++[ "$NA" = "$NS" ] && [ "$NB" = "$NS" ] || { echo "두 벌 컴파일 실패(wsA $NA · wsB $NB / $NS)"; exit 1; }
++"$CC" @"$B/flags" -c -o "$B/dual_wrapper.o" dual/libretro_dual.c
++
++# 3) 묶기 + 내보낸 이름 확인
++if [ "$PLAT" = mac ]; then
++  OUT="$B/mednafen_wswan_dual_libretro.dylib"
++  "$CC" -dynamiclib -o "$OUT" "$B/dual_wrapper.o" "$B"/wsA_*.o "$B"/wsB_*.o -Wl,-exported_symbols_list,"$D/exports_mac.txt"
++  "$NM" -gU "$OUT" | awk '{print $3}' | sed 's/^_//' > "$B/exported.txt"
++else
++  OUT="$B/mednafen_wswan_dual_libretro.so"
++  "$CC" -shared -o "$OUT" "$B/dual_wrapper.o" "$B"/wsA_*.o "$B"/wsB_*.o \
++    -Wl,--version-script="$D/link_dual.T" -Wl,--no-undefined -lm
++  "$NM" -D --defined-only "$OUT" | awk 'NF==3 {print $3}' | grep -v '^_\|^GLIBC' > "$B/exported.txt" || true
++fi
++NE=$(grep -c '^retro_' "$B/exported.txt" || true)
++if grep -v '^retro_' "$B/exported.txt" | grep -q .; then
++  echo "retro_* 아닌 이름이 밖으로 나감:"; grep -v '^retro_' "$B/exported.txt" | head; exit 1
++fi
++echo "  래퍼 코어: 내보낸 이름 retro_* ${NE}개뿐"
+diff --git a/dual/exports_mac.txt b/dual/exports_mac.txt
+new file mode 100644
+index 0000000..ec81530
+--- /dev/null
++++ b/dual/exports_mac.txt
+@@ -0,0 +1 @@
++_retro_*
+diff --git a/dual/libretro_dual.c b/dual/libretro_dual.c
+new file mode 100644
+index 0000000..77c3fb6
+--- /dev/null
++++ b/dual/libretro_dual.c
+@@ -0,0 +1,1116 @@
++/* Beetle WonderSwan Dual — 원더스완 두 대를 한 libretro 코어에 (한방 10/20)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++/* 무엇: 같은 롬을 돌리는 원더스완 두 대(1P 기계 · 2P 기계)를 EXT 포트 시리얼
++ * (UART)로 이은 libretro 코어. 두 기기는 레트로아크 넷플레이로 패드 입력만
++ * 맞추고, 두 대의 에뮬은 양쪽 기기에서 똑같이 돌아감(GBA 때 만든 mGBA Dual 과
++ * 같은 생각).
++ *
++ * 어떻게:
++ * - 안쪽 코어(beetle-wswan + UART 다시 쓰기 + hb_ws_* 줄 단위 실행)를 빌드 때
++ *   두 번 컴파일함. 한 번은 모든 바깥 이름 앞에 wsA_, 한 번은 wsB_ 를 붙여서
++ *   (dual/build_dual.sh 가 이름 목록을 뽑아 머리 파일을 만듦) → 전역 변수가
++ *   완전히 따로인 두 대가 한 .so 안에 들어감. 밖으로 내보내는 건 이 파일의
++ *   retro_* 뿐.
++ * - 한 번의 retro_run 에서 두 기계를 한 줄(256 CPU 사이클)씩 번갈아 돌리고,
++ *   줄마다 다 보낸 시리얼 바이트를 상대 수신으로 넘김(두 기계가 그 줄을 다 돈
++ *   뒤 — 양쪽 대칭). 결과는 두 패드 입력만의 함수라서 넷플레이 되감기와 맞음.
++ * - 0번 패드 → 1P 기계, 1번 패드 → 2P 기계. 옵션 wswan_dual_screen(1P|2P)은
++ *   어느 기계의 화면 · 소리를 내보낼지만 고름(에뮬 상태에는 영향 없음 —
++ *   안 보이는 기계는 그리기만 건너뜀).
++ * - 옵션 wswan_dual_link(on|off): off 면 2P 기계를 아예 안 돌림(혼자 할 때 —
++ *   한 대짜리와 같은 속도). 게임을 불러올 때만 읽음.
++ * - 두 기기가 같아야 하는 안쪽 옵션(언어 · 이름 · 회전 · 60Hz · 표본율 등)은
++ *   이 래퍼가 고정값으로 대답함(fixedOptions).
++ * - 상태 저장 = 머리 64바이트 + 1P 기계 + 2P 기계(크기 고정).
++ * - 1P 세이브 = 보통 .srm(RETRO_MEMORY_SAVE_RAM = 1P 기계 SRAM/EEPROM).
++ *   2P 세이브 = <세이브 폴더>/<롬 이름>.p2.sav — 이 코어가 직접 읽고 씀
++ *   (mGBA Dual 0007 · 0009 방식: 압축 안 파일 이름 따름 · 임시 파일 후 이름
++ *   바꾸기, 안 되면 제자리 쓰기 · fsync). 2P 화면(손님)이거나 link off 면
++ *   안 씀. 2P 세이브가 없으면 첫 장 전에 1P 세이브를 2P 기계에 복사함
++ *   (원피스 그랜드 배틀은 한 번도 대전 안 한 빈 세이브로 통신 대전을 시작하면
++ *   게임 쪽 빈 포인터 때문에 멈춤 — BUILD_REPORT 참고).
++ *
++ * 시험용 환경 변수: WSWAN_DUAL_RENDER_BOTH=1(두 기계 다 그림) ·
++ * WSWAN_DUAL_TRACE=<파일>(밖에서 온 상태 · 2P 세이브 기록).
++ * 시험용 메모리 번호(레트로아크는 안 씀): 아래 DUAL_MEMORY_*. */
++
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <fcntl.h>
++#ifndef _WIN32
++#include <unistd.h>
++#endif
++
++#include <libretro.h>
++
++#ifndef GIT_VERSION
++#define GIT_VERSION ""
++#endif
++
++#define DUAL_LIBRARY_NAME  "Beetle WonderSwan Dual"
++#define DUAL_VERSION       "1.0"
++#define DUAL_EXTENSIONS    "ws|wsc|pc2"
++#define DUAL_WIDTH         224
++#define DUAL_HEIGHT        144
++#define DUAL_MAX_LINES     1024   /* 한 장은 길어야 256줄 — 넘으면 멈춤으로 셈 */
++#define DUAL_P2_SAVE_EVERY 7200   /* retro_run 7200번(약 2분)마다, 2P 세이브가 바뀌었으면 씀 */
++#define DUAL_PATH_MAX      4096
++
++#define DUAL_STATE_MAGIC   0x31445748u /* "HWD1" */
++#define DUAL_STATE_VERSION 1u
++#define DUAL_HEADER_SIZE   64
++
++/* 시험 도구용 메모리 번호 */
++#define DUAL_MEMORY_WRAM   0x5700 /* + 기계(0 = 1P, 1 = 2P): 내부 RAM 64KB */
++#define DUAL_MEMORY_SAVE   0x5710 /* + 기계: 세이브 메모리(SRAM/EEPROM) */
++#define DUAL_MEMORY_FRAME  0x5720 /* + 기계: 화면 RGB565 224x144 */
++#define DUAL_MEMORY_STATS  0x5730
++
++/* ---- 안쪽 코어 두 벌(빌드 때 이름 앞에 wsA_ / wsB_ 가 붙음) ---- */
++#define INNER_DECLS(P) \
++   void P##retro_init(void); \
++   void P##retro_deinit(void); \
++   void P##retro_set_environment(retro_environment_t); \
++   void P##retro_set_video_refresh(retro_video_refresh_t); \
++   void P##retro_set_audio_sample(retro_audio_sample_t); \
++   void P##retro_set_audio_sample_batch(retro_audio_sample_batch_t); \
++   void P##retro_set_input_poll(retro_input_poll_t); \
++   void P##retro_set_input_state(retro_input_state_t); \
++   void P##retro_get_system_av_info(struct retro_system_av_info *); \
++   bool P##retro_load_game(const struct retro_game_info *); \
++   void P##retro_unload_game(void); \
++   void P##retro_run(void); \
++   void P##retro_reset(void); \
++   size_t P##retro_serialize_size(void); \
++   bool P##retro_serialize(void *, size_t); \
++   bool P##retro_unserialize(const void *, size_t); \
++   void *P##retro_get_memory_data(unsigned); \
++   size_t P##retro_get_memory_size(unsigned); \
++   void P##retro_cheat_reset(void); \
++   void P##retro_cheat_set(unsigned, bool, const char *); \
++   void P##hb_ws_run_pre(void); \
++   int P##hb_ws_subframes(void); \
++   void P##hb_ws_emu_begin(int, int); \
++   int P##hb_ws_emu_line(void); \
++   void P##hb_ws_emu_end(int, int); \
++   void P##hb_ws_run_post(void); \
++   int P##hb_ws_link_take(void); \
++   void P##hb_ws_link_give(unsigned); \
++   void P##hb_ws_link_stats(uint32_t *, unsigned); \
++   void P##hb_ws_set_render(int); \
++   const void *P##hb_ws_framebuffer(void);
++
++INNER_DECLS(wsA_)
++INNER_DECLS(wsB_)
++
++struct Inner
++{
++   void (*init)(void);
++   void (*deinit)(void);
++   void (*set_environment)(retro_environment_t);
++   void (*set_video_refresh)(retro_video_refresh_t);
++   void (*set_audio_sample)(retro_audio_sample_t);
++   void (*set_audio_sample_batch)(retro_audio_sample_batch_t);
++   void (*set_input_poll)(retro_input_poll_t);
++   void (*set_input_state)(retro_input_state_t);
++   void (*get_system_av_info)(struct retro_system_av_info *);
++   bool (*load_game)(const struct retro_game_info *);
++   void (*unload_game)(void);
++   void (*run)(void);
++   void (*reset)(void);
++   size_t (*serialize_size)(void);
++   bool (*serialize)(void *, size_t);
++   bool (*unserialize)(const void *, size_t);
++   void *(*get_memory_data)(unsigned);
++   size_t (*get_memory_size)(unsigned);
++   void (*cheat_reset)(void);
++   void (*cheat_set)(unsigned, bool, const char *);
++   void (*run_pre)(void);
++   int (*subframes)(void);
++   void (*emu_begin)(int, int);
++   int (*emu_line)(void);
++   void (*emu_end)(int, int);
++   void (*run_post)(void);
++   int (*link_take)(void);
++   void (*link_give)(unsigned);
++   void (*link_stats)(uint32_t *, unsigned);
++   void (*set_render)(int);
++   const void *(*framebuffer)(void);
++};
++
++#define INNER_TABLE(P) { \
++   P##retro_init, P##retro_deinit, P##retro_set_environment, \
++   P##retro_set_video_refresh, P##retro_set_audio_sample, \
++   P##retro_set_audio_sample_batch, P##retro_set_input_poll, \
++   P##retro_set_input_state, P##retro_get_system_av_info, \
++   P##retro_load_game, P##retro_unload_game, P##retro_run, P##retro_reset, \
++   P##retro_serialize_size, P##retro_serialize, P##retro_unserialize, \
++   P##retro_get_memory_data, P##retro_get_memory_size, \
++   P##retro_cheat_reset, P##retro_cheat_set, \
++   P##hb_ws_run_pre, P##hb_ws_subframes, P##hb_ws_emu_begin, \
++   P##hb_ws_emu_line, P##hb_ws_emu_end, P##hb_ws_run_post, \
++   P##hb_ws_link_take, P##hb_ws_link_give, P##hb_ws_link_stats, \
++   P##hb_ws_set_render, P##hb_ws_framebuffer }
++
++static const struct Inner inner[2] = { INNER_TABLE(wsA_), INNER_TABLE(wsB_) };
++
++/* 링크 진단(상태 저장에 안 들어감 · 에뮬에 영향 없음) */
++struct DualStats
++{
++   uint32_t magic;          /* "HWST" */
++   uint32_t version;
++   uint32_t frames;         /* retro_run 횟수 */
++   uint32_t linkOn;
++   uint32_t screen;         /* 0 = 1P, 1 = 2P */
++   uint32_t linesLast;      /* 마지막 장(부분 장)의 줄 단계 수 */
++   uint32_t linesMax;
++   uint32_t stalls;         /* 줄 수 한도에 걸린 횟수(0 이어야 함) */
++   uint32_t bytes[2];       /* 넘긴 바이트: [0] 1P→2P, [1] 2P→1P */
++   uint32_t outsideLoads;   /* WSWAN_DUAL_TRACE 일 때만: 이 코어가 만든 적 없는 상태를 불러온 횟수 */
++   uint32_t p2Loaded;       /* 1 = .p2.sav 를 읽음 */
++   uint32_t p2Copied;       /* 1 = .p2.sav 가 없어 1P 세이브를 2P 기계에 복사함 */
++   uint32_t p2Writes;       /* .p2.sav 를 쓴 횟수 */
++   uint32_t subframeSkew;   /* 두 기계의 60Hz 장 수가 달랐던 retro_run 수 */
++   uint32_t reserved;
++   uint32_t comm[2][10];    /* 기계별 UART 통계(hb_ws_link_stats) */
++};
++
++/* 두 기기가 같아야 하는 안쪽 옵션 — 래퍼가 고정. 없는 키(생일 · 성별 · 혈액형)는
++ * 코어 기본값(1989-06-23 · 2 · 3). 이름 = "Mednafen"(앞단 사용자 이름을 쓰면
++ * 기기마다 달라지고, 리셋 때 내부 EEPROM 이 다시 만들어지면 어긋날 수 있음). */
++struct FixedOption
++{
++   const char *key;
++   const char *value;
++};
++
++static const struct FixedOption fixedOptions[] = {
++   { "wswan_language",            "english"   },
++   { "wswan_name_source",         "default"   },
++   { "wswan_rotate_display",      "landscape" }, /* SELECT 로 회전(상태 저장 밖) 끔 */
++   { "wswan_rotate_keymap",       "disabled"  },
++   { "wswan_mono_palette",        "default"   },
++   { "wswan_gfx_colors",          "16bit"     },
++   { "wswan_frameskip",           "disabled"  },
++   { "wswan_frameskip_threshold", "33"        },
++   { "wswan_60hz_mode",           "enabled"   },
++   { "wswan_sound_sample_rate",   "44100"     },
++   { "wswan_sound_low_pass",      "disabled"  },
++   { NULL, NULL }
++};
++
++static retro_environment_t environCallback;
++static retro_video_refresh_t videoCallback;
++static retro_audio_sample_batch_t audioCallback;
++static retro_input_poll_t inputPollCallback;
++static retro_input_state_t inputCallback;
++static retro_log_printf_t logCallback;
++
++static bool useBitmasks;
++static bool rgb565;
++static bool renderBoth;
++static bool gameLoaded;
++static bool linkOn = true;
++static int screenOption;       /* 옵션: 0 = 1P, 1 = 2P */
++static int shown;              /* 이번 장에 내보내는 기계 */
++static bool audioOn = true;
++static size_t innerSize;       /* 기계 하나의 상태 크기 */
++static struct DualStats stats;
++
++static char p2SavePath[DUAL_PATH_MAX];
++static uint8_t *p2Written;     /* 마지막으로 쓴(또는 읽은) .p2.sav 내용 */
++static size_t p2WrittenSize;   /* 0 = 디스크에 아직 없음 */
++static size_t saveSize;        /* 기계 하나의 세이브 크기(0 = 세이브 없는 게임) */
++static bool p2CopyPending;
++static unsigned p2Countdown;
++
++static FILE *traceFile;
++#define DUAL_SEEN_STATES 256
++static uint64_t seenStates[DUAL_SEEN_STATES];
++static unsigned seenNext;
++
++static void dual_log(enum retro_log_level level, const char *fmt, ...)
++{
++   char message[512];
++   va_list args;
++
++   va_start(args, fmt);
++   vsnprintf(message, sizeof(message), fmt, args);
++   va_end(args);
++
++   if (traceFile)
++   {
++      fprintf(traceFile, "f=%u %s\n", stats.frames, message);
++      fflush(traceFile);
++   }
++   if (logCallback)
++      logCallback(level, "[WonderSwan Dual] %s\n", message);
++}
++
++/* ---- 안쪽 코어 두 벌에게 주는 콜백 ---- */
++
++static bool envProxy(int m, unsigned cmd, void *data)
++{
++   (void)m;
++
++   switch (cmd)
++   {
++      case RETRO_ENVIRONMENT_GET_VARIABLE:
++      {
++         struct retro_variable *var = (struct retro_variable *)data;
++         const struct FixedOption *o;
++
++         var->value = NULL;
++         for (o = fixedOptions; o->key; o++)
++         {
++            if (!strcmp(o->key, var->key))
++            {
++               var->value = o->value;
++               return true;
++            }
++         }
++         return false;
++      }
++      case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
++         /* 안쪽 옵션은 고정. 앞단의 '바뀜' 표시는 래퍼만 읽음 */
++         *(bool *)data = false;
++         return true;
++      case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION:
++         *(unsigned *)data = 2;
++         return true;
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS:
++      case RETRO_ENVIRONMENT_SET_VARIABLES:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
++         /* 메뉴에는 래퍼 옵션만 */
++         return false;
++      case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
++         if (!logCallback)
++            return false;
++         ((struct retro_log_callback *)data)->log = logCallback;
++         return true;
++      case RETRO_ENVIRONMENT_GET_INPUT_BITMASKS:
++         return useBitmasks;
++      case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
++      {
++         enum retro_pixel_format fmt = *(const enum retro_pixel_format *)data;
++         if (fmt == RETRO_PIXEL_FORMAT_RGB565)
++            return rgb565;
++         return fmt == RETRO_PIXEL_FORMAT_0RGB1555 && !rgb565;
++      }
++      case RETRO_ENVIRONMENT_SET_ROTATION:
++         /* 가로 고정 — 0도만 받음(앞단 회전은 기본 0) */
++         return *(const unsigned *)data == 0;
++      case RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL:
++      case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
++      case RETRO_ENVIRONMENT_SET_GEOMETRY:
++      case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
++         /* 입력 설명은 래퍼가 두 포트로 따로 냄. 화면 크기 · 표본율은 고정이라
++          * 바뀔 일이 없음 */
++         return true;
++      case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
++      case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
++         return environCallback ? environCallback(cmd, data) : false;
++      default:
++         /* 사용자 이름 · 언어 · 소리 버퍼 상태(프레임 건너뛰기) 등은 모름 = 기본값 */
++         return false;
++   }
++}
++
++static bool envA(unsigned cmd, void *data) { return envProxy(0, cmd, data); }
++static bool envB(unsigned cmd, void *data) { return envProxy(1, cmd, data); }
++
++static void videoProxy(int m, const void *data, unsigned width, unsigned height, size_t pitch)
++{
++   if (m == shown && videoCallback)
++      videoCallback(data, width, height, pitch);
++}
++
++static void videoA(const void *d, unsigned w, unsigned h, size_t p) { videoProxy(0, d, w, h, p); }
++static void videoB(const void *d, unsigned w, unsigned h, size_t p) { videoProxy(1, d, w, h, p); }
++
++static size_t audioProxy(int m, const int16_t *data, size_t frames)
++{
++   if (m == shown && audioOn && audioCallback)
++   {
++      size_t taken = audioCallback(data, frames);
++      /* 0 을 돌려주는 앞단이면 안쪽 코어가 영영 다시 보내므로 다 받은 것으로 */
++      return taken ? taken : frames;
++   }
++   return frames;
++}
++
++static size_t audioA(const int16_t *d, size_t f) { return audioProxy(0, d, f); }
++static size_t audioB(const int16_t *d, size_t f) { return audioProxy(1, d, f); }
++
++static void audioSampleNop(int16_t left, int16_t right)
++{
++   (void)left;
++   (void)right;
++}
++
++/* 앞단 입력은 retro_run 처음에 한 번만 읽음(넷플레이) */
++static void pollNop(void)
++{
++}
++
++static int16_t inputProxy(int m, unsigned port, unsigned device, unsigned index, unsigned id)
++{
++   if (port != 0 || !inputCallback)
++      return 0;
++   return inputCallback((unsigned)m, device, index, id);
++}
++
++static int16_t inputA(unsigned p, unsigned d, unsigned i, unsigned id) { return inputProxy(0, p, d, i, id); }
++static int16_t inputB(unsigned p, unsigned d, unsigned i, unsigned id) { return inputProxy(1, p, d, i, id); }
++
++static const retro_environment_t envs[2] = { envA, envB };
++static const retro_video_refresh_t videos[2] = { videoA, videoB };
++static const retro_audio_sample_batch_t audios[2] = { audioA, audioB };
++static const retro_input_state_t inputs[2] = { inputA, inputB };
++
++/* ---- 옵션 ---- */
++
++static const char *getVariable(const char *key)
++{
++   struct retro_variable var;
++
++   var.key = key;
++   var.value = NULL;
++   if (environCallback && environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
++      return var.value;
++   return NULL;
++}
++
++static void readScreenOption(void)
++{
++   const char *value = getVariable("wswan_dual_screen");
++   screenOption = (value && !strcmp(value, "2P")) ? 1 : 0;
++}
++
++/* ---- 2P 세이브(.p2.sav) ---- */
++
++static uint8_t *saveMemory(int m)
++{
++   return (uint8_t *)inner[m].get_memory_data(RETRO_MEMORY_SAVE_RAM);
++}
++
++static void setP2SavePath(const struct retro_game_info *game)
++{
++   const char *base;
++   const char *inner_name = NULL;
++   const char *hash;
++   const char *dir = NULL;
++   char name[DUAL_PATH_MAX];
++   char romDir[DUAL_PATH_MAX];
++   char *dot;
++   size_t len;
++   int written;
++
++   p2SavePath[0] = '\0';
++   if (!game->path || !game->path[0])
++      return;
++
++   base = strrchr(game->path, '/');
++   base = base ? base + 1 : game->path;
++
++   /* 레트로아크는 압축 파일 안의 롬이면 그 안 파일 이름으로 세이브를 만듦
++    * ("x.zip#y.wsc" → "y") */
++   for (hash = strchr(base, '#'); hash; hash = strchr(hash + 1, '#'))
++   {
++      size_t at = (size_t)(hash - base);
++      if ((at >= 4 && (!strncasecmp(hash - 4, ".zip", 4) || !strncasecmp(hash - 4, ".apk", 4))) ||
++          (at >= 3 && !strncasecmp(hash - 3, ".7z", 3)))
++      {
++         inner_name = hash + 1;
++         break;
++      }
++   }
++   snprintf(name, sizeof(name), "%s", (inner_name && inner_name[0]) ? inner_name : base);
++   dot = strrchr(name, '.');
++   if (dot && dot != name)
++      *dot = '\0';
++
++   if (!environCallback(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &dir) || !dir || !dir[0])
++   {
++      snprintf(romDir, sizeof(romDir), "%.*s", (int)(base - game->path), game->path);
++      dir = romDir;
++   }
++   len = strlen(dir);
++   written = snprintf(p2SavePath, sizeof(p2SavePath), "%s%s%s.p2.sav", dir,
++         (len && dir[len - 1] != '/') ? "/" : "", name);
++   if (written < 0 || (size_t)written >= sizeof(p2SavePath))
++   {
++      dual_log(RETRO_LOG_ERROR, "2P 세이브 경로가 너무 김 — 2P 세이브 안 씀");
++      p2SavePath[0] = '\0';
++   }
++}
++
++static void loadP2Save(void)
++{
++   FILE *f;
++   size_t got;
++   uint8_t *save = saveMemory(1);
++
++   p2WrittenSize = 0;
++   if (!p2SavePath[0] || !saveSize || !save)
++      return;
++
++   f = fopen(p2SavePath, "rb");
++   if (!f)
++   {
++      dual_log(RETRO_LOG_INFO, "2P 세이브 아직 없음: %s", p2SavePath);
++      return;
++   }
++   got = fread(save, 1, saveSize, f);
++   fclose(f);
++   if (got != saveSize)
++      dual_log(RETRO_LOG_WARN, "2P 세이브 크기가 다름(%u / %u 바이트) — 읽은 만큼만 씀",
++            (unsigned)got, (unsigned)saveSize);
++   if (!got)
++      return;
++   memcpy(p2Written, save, saveSize);
++   p2WrittenSize = saveSize;
++   stats.p2Loaded = 1;
++   dual_log(RETRO_LOG_INFO, "2P 세이브 읽음(%u 바이트): %s", (unsigned)got, p2SavePath);
++}
++
++static bool writeAll(const char *path, const uint8_t *data, size_t size)
++{
++   FILE *f = fopen(path, "wb");
++   bool ok;
++
++   if (!f)
++      return false;
++   ok = fwrite(data, 1, size, f) == size;
++   ok = fflush(f) == 0 && ok;
++#ifndef _WIN32
++   ok = fsync(fileno(f)) == 0 && ok;
++#endif
++   ok = fclose(f) == 0 && ok;
++   return ok;
++}
++
++/* 기기 /userdata 는 FUSE 위 exFAT — fsync 해야 디렉터리 항목까지 확정됨 */
++static void syncPath(const char *path)
++{
++#ifndef _WIN32
++   int fd = open(path, O_RDONLY);
++   if (fd >= 0)
++   {
++      fsync(fd);
++      close(fd);
++   }
++#else
++   (void)path;
++#endif
++}
++
++static void writeP2Save(bool force)
++{
++   char tmpPath[DUAL_PATH_MAX + 8];
++   const uint8_t *save;
++   bool ok;
++
++   /* 2P 화면(손님)이면 2P 세이브는 방장 기기 것 · link off 면 2P 기계가 안 돔 */
++   if (!gameLoaded || !linkOn || screenOption == 1 || !p2SavePath[0] || !saveSize)
++      return;
++   save = saveMemory(1);
++   if (!save)
++      return;
++   if (!force && p2WrittenSize == saveSize && !memcmp(p2Written, save, saveSize))
++      return;
++   if (p2WrittenSize == 0)
++   {
++      /* 디스크에 아직 없음: 게임이 무언가 쓴 뒤에만 만듦 */
++      size_t i;
++      for (i = 0; i < saveSize && save[i] == 0x00; i++);
++      if (i == saveSize)
++         return;
++   }
++
++   snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", p2SavePath);
++   ok = writeAll(tmpPath, save, saveSize);
++   if (ok && rename(tmpPath, p2SavePath) != 0)
++   {
++      /* 이름 바꾸기로 덮어쓰기를 거부하는 FUSE 면 제자리 쓰기 */
++      ok = writeAll(p2SavePath, save, saveSize);
++      remove(tmpPath);
++   }
++   if (!ok)
++   {
++      dual_log(RETRO_LOG_ERROR, "2P 세이브 쓰기 실패: %s", p2SavePath);
++      remove(tmpPath);
++      return;
++   }
++   syncPath(p2SavePath);
++   memcpy(p2Written, save, saveSize);
++   p2WrittenSize = saveSize;
++   stats.p2Writes++;
++   dual_log(RETRO_LOG_INFO, "2P 세이브 씀(%u 바이트): %s", (unsigned)saveSize, p2SavePath);
++}
++
++/* ---- libretro API ---- */
++
++unsigned retro_api_version(void)
++{
++   return RETRO_API_VERSION;
++}
++
++void retro_set_environment(retro_environment_t env)
++{
++   /* 메뉴 글씨: 기기 레트로아크 글꼴에 한글이 없을 수 있어 mGBA Dual 처럼 영어 */
++   static const struct retro_variable vars[] = {
++      { "wswan_dual_screen", "Screen and sound (host/solo = 1P, guest = 2P); 1P|2P" },
++      { "wswan_dual_link", "2P WonderSwan on the link cable (off = solo, one console, faster); on|off" },
++      { NULL, NULL },
++   };
++   int m;
++
++   environCallback = env;
++   env(RETRO_ENVIRONMENT_SET_VARIABLES, (void *)vars);
++
++   for (m = 0; m < 2; m++)
++      inner[m].set_environment(envs[m]);
++}
++
++void retro_set_video_refresh(retro_video_refresh_t cb)
++{
++   videoCallback = cb;
++}
++
++void retro_set_audio_sample(retro_audio_sample_t cb)
++{
++   (void)cb;
++}
++
++void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb)
++{
++   audioCallback = cb;
++}
++
++void retro_set_input_poll(retro_input_poll_t cb)
++{
++   inputPollCallback = cb;
++}
++
++void retro_set_input_state(retro_input_state_t cb)
++{
++   inputCallback = cb;
++}
++
++void retro_get_system_info(struct retro_system_info *info)
++{
++   memset(info, 0, sizeof(*info));
++   info->library_name     = DUAL_LIBRARY_NAME;
++   info->library_version  = DUAL_VERSION GIT_VERSION;
++   info->need_fullpath    = false;
++   info->valid_extensions = DUAL_EXTENSIONS;
++   info->block_extract    = false;
++}
++
++void retro_get_system_av_info(struct retro_system_av_info *info)
++{
++   if (gameLoaded)
++   {
++      inner[0].get_system_av_info(info);
++      return;
++   }
++   memset(info, 0, sizeof(*info));
++   info->geometry.base_width   = DUAL_WIDTH;
++   info->geometry.base_height  = DUAL_HEIGHT;
++   info->geometry.max_width    = DUAL_WIDTH;
++   info->geometry.max_height   = DUAL_HEIGHT;
++   info->geometry.aspect_ratio = 14.0f / 9.0f;
++   info->timing.fps            = (4.0 * (3072000.0 / (159.0 * 256.0))) / 5.0;
++   info->timing.sample_rate    = 44100.0;
++}
++
++void retro_init(void)
++{
++   struct retro_log_callback log;
++   enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
++   const char *env;
++   int m;
++
++#define DESC(PORT, ID, NAME) { PORT, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_ ## ID, NAME }
++#define PORT_DESCS(PORT) \
++   DESC(PORT, LEFT, "X Cursor Left"), DESC(PORT, UP, "X Cursor Up"), \
++   DESC(PORT, DOWN, "X Cursor Down"), DESC(PORT, RIGHT, "X Cursor Right"), \
++   DESC(PORT, L, "Y Cursor Left"), DESC(PORT, R2, "Y Cursor Up"), \
++   DESC(PORT, L2, "Y Cursor Down"), DESC(PORT, R, "Y Cursor Right"), \
++   DESC(PORT, A, "A"), DESC(PORT, B, "B"), DESC(PORT, START, "Start")
++   struct retro_input_descriptor desc[] = {
++      PORT_DESCS(0),
++      PORT_DESCS(1),
++      { 0, 0, 0, 0, NULL },
++   };
++#undef PORT_DESCS
++#undef DESC
++
++   logCallback = environCallback(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log) ? log.log : NULL;
++   rgb565 = environCallback(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
++   useBitmasks = environCallback(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL);
++   environCallback(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
++
++   env = getenv("WSWAN_DUAL_RENDER_BOTH");
++   renderBoth = env && env[0] == '1';
++   env = getenv("WSWAN_DUAL_TRACE");
++   if (env && env[0] && !traceFile)
++      traceFile = fopen(env, "w");
++
++   for (m = 0; m < 2; m++)
++   {
++      inner[m].set_video_refresh(videos[m]);
++      inner[m].set_audio_sample(audioSampleNop);
++      inner[m].set_audio_sample_batch(audios[m]);
++      inner[m].set_input_poll(pollNop);
++      inner[m].set_input_state(inputs[m]);
++      inner[m].init();
++   }
++}
++
++void retro_deinit(void)
++{
++   int m;
++
++   for (m = 1; m >= 0; m--)
++      inner[m].deinit();
++   if (traceFile)
++   {
++      fclose(traceFile);
++      traceFile = NULL;
++   }
++}
++
++bool retro_load_game(const struct retro_game_info *game)
++{
++   const char *value;
++   size_t sizeB;
++
++   if (!game || !game->data || !game->size)
++   {
++      dual_log(RETRO_LOG_ERROR, "롬을 메모리로 받아야 함");
++      return false;
++   }
++
++   memset(&stats, 0, sizeof(stats));
++   stats.magic = 0x54535748u; /* "HWST" */
++   stats.version = 1;
++   memset(seenStates, 0, sizeof(seenStates));
++   seenNext = 0;
++
++   value = getVariable("wswan_dual_link");
++   linkOn = !(value && !strcmp(value, "off"));
++   readScreenOption();
++   shown = linkOn ? screenOption : 0;
++
++   if (!inner[0].load_game(game))
++   {
++      dual_log(RETRO_LOG_ERROR, "1P 원더스완을 못 켬");
++      return false;
++   }
++   if (!inner[1].load_game(game))
++   {
++      dual_log(RETRO_LOG_ERROR, "2P 원더스완을 못 켬");
++      inner[0].unload_game();
++      return false;
++   }
++
++   innerSize = inner[0].serialize_size();
++   sizeB = inner[1].serialize_size();
++   if (!innerSize || innerSize != sizeB)
++   {
++      dual_log(RETRO_LOG_ERROR, "두 기계 상태 크기가 다름(%u / %u)", (unsigned)innerSize, (unsigned)sizeB);
++      inner[1].unload_game();
++      inner[0].unload_game();
++      return false;
++   }
++
++   saveSize = inner[0].get_memory_size(RETRO_MEMORY_SAVE_RAM);
++   if (saveSize != inner[1].get_memory_size(RETRO_MEMORY_SAVE_RAM) || !saveMemory(0) || !saveMemory(1))
++      saveSize = 0;
++   p2Written = saveSize ? (uint8_t *)calloc(1, saveSize) : NULL;
++   if (saveSize && !p2Written)
++      saveSize = 0;
++   p2WrittenSize = 0;
++   setP2SavePath(game);
++   if (linkOn)
++      loadP2Save();
++   p2CopyPending = linkOn && saveSize && !stats.p2Loaded;
++   p2Countdown = DUAL_P2_SAVE_EVERY;
++
++   stats.linkOn = linkOn;
++   stats.screen = (uint32_t)screenOption;
++   gameLoaded = true;
++   dual_log(RETRO_LOG_INFO, "켬: 원더스완 %s, 화면 %dP, 세이브 %u 바이트, 상태 %u 바이트",
++         linkOn ? "두 대(통신 케이블 연결)" : "한 대(link off)", shown + 1,
++         (unsigned)saveSize, (unsigned)retro_serialize_size());
++   return true;
++}
++
++bool retro_load_game_special(unsigned game_type, const struct retro_game_info *info, size_t num_info)
++{
++   (void)game_type;
++   (void)info;
++   (void)num_info;
++   return false;
++}
++
++void retro_unload_game(void)
++{
++   if (!gameLoaded)
++      return;
++   writeP2Save(false);
++   gameLoaded = false;
++   inner[1].unload_game();
++   inner[0].unload_game();
++   free(p2Written);
++   p2Written = NULL;
++   p2WrittenSize = 0;
++   saveSize = 0;
++   innerSize = 0;
++}
++
++void retro_reset(void)
++{
++   inner[0].reset();
++   inner[1].reset();
++}
++
++/* 줄마다: 다 보낸 바이트를 상대 수신으로(두 기계가 그 줄을 다 돈 뒤 — 대칭) */
++static void exchange(void)
++{
++   for (;;)
++   {
++      int a = inner[0].link_take();
++      int b = inner[1].link_take();
++
++      if (a < 0 && b < 0)
++         break;
++      if (a >= 0)
++      {
++         inner[1].link_give((unsigned)a);
++         stats.bytes[0]++;
++      }
++      if (b >= 0)
++      {
++         inner[0].link_give((unsigned)b);
++         stats.bytes[1]++;
++      }
++   }
++}
++
++/* 두 기계를 한 줄씩 번갈아. 60Hz 장 수(1 또는 2)가 다르면 남는 장(앞쪽의
++ * '건너뛴 장')은 그 기계 혼자 돌림 — 어느 기기에서나 같은 순서. */
++static void runLinked(void)
++{
++   int nA, nB, n, s;
++
++   inner[0].run_pre();
++   inner[1].run_pre();
++   nA = inner[0].subframes();
++   nB = inner[1].subframes();
++   n = nA > nB ? nA : nB;
++   if (nA != nB)
++      stats.subframeSkew++;
++
++   for (s = 0; s < n; s++)
++   {
++      int runA = s >= n - nA;
++      int runB = s >= n - nB;
++      int subA = s - (n - nA);
++      int subB = s - (n - nB);
++      int doneA = !runA;
++      int doneB = !runB;
++      unsigned lines = 0;
++
++      if (runA)
++         inner[0].emu_begin(subA, nA);
++      if (runB)
++         inner[1].emu_begin(subB, nB);
++      while (!doneA || !doneB)
++      {
++         if (!doneA)
++            doneA = inner[0].emu_line();
++         if (!doneB)
++            doneB = inner[1].emu_line();
++         exchange();
++         if (++lines >= DUAL_MAX_LINES)
++         {
++            if (stats.stalls < 4)
++               dual_log(RETRO_LOG_ERROR, "한 장이 %u 줄을 넘음(%d/%d) — 멈춤으로 셈", lines, doneA, doneB);
++            stats.stalls++;
++            break;
++         }
++      }
++      stats.linesLast = lines;
++      if (lines > stats.linesMax)
++         stats.linesMax = lines;
++      if (runA)
++         inner[0].emu_end(subA, nA);
++      if (runB)
++         inner[1].emu_end(subB, nB);
++   }
++
++   inner[0].run_post();
++   inner[1].run_post();
++}
++
++void retro_run(void)
++{
++   bool updated = false;
++   int av = 3;
++   bool videoOn;
++
++   if (!gameLoaded)
++      return;
++
++   inputPollCallback();
++   if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
++      readScreenOption();
++   if (!environCallback(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av))
++      av = 3;
++   videoOn = (av & 1) != 0;
++   audioOn = (av & 2) != 0;
++   shown = linkOn ? screenOption : 0;
++   stats.screen = (uint32_t)screenOption;
++
++   if (p2CopyPending)
++   {
++      /* .p2.sav 가 없음: 앞단이 1P 세이브(.srm)를 넣은 뒤인 첫 장 전에 복사 */
++      memcpy(saveMemory(1), saveMemory(0), saveSize);
++      p2CopyPending = false;
++      stats.p2Copied = 1;
++      dual_log(RETRO_LOG_INFO, "2P 세이브가 없어 1P 세이브를 2P 기계에 복사함");
++   }
++
++   /* 그리기는 에뮬 결과와 무관하고 상태에도 없음: 보이는 기계만 그림 */
++   inner[0].set_render(renderBoth || (videoOn && shown == 0));
++   inner[1].set_render(renderBoth || (videoOn && shown == 1));
++
++   if (linkOn)
++      runLinked();
++   else
++   {
++      inner[0].run();
++      while (inner[0].link_take() >= 0); /* 선 없음: 보낸 바이트는 사라짐 */
++   }
++   stats.frames++;
++   inner[0].link_stats(stats.comm[0], 10);
++   inner[1].link_stats(stats.comm[1], 10);
++
++   if (linkOn && --p2Countdown == 0)
++   {
++      p2Countdown = DUAL_P2_SAVE_EVERY;
++      writeP2Save(false);
++   }
++}
++
++/* ---- 상태 저장 ---- */
++
++size_t retro_serialize_size(void)
++{
++   if (!gameLoaded)
++      return 0;
++   return DUAL_HEADER_SIZE + 2 * innerSize;
++}
++
++static void store32(uint8_t *p, uint32_t v)
++{
++   p[0] = (uint8_t)v;
++   p[1] = (uint8_t)(v >> 8);
++   p[2] = (uint8_t)(v >> 16);
++   p[3] = (uint8_t)(v >> 24);
++}
++
++static uint32_t load32(const uint8_t *p)
++{
++   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint64_t hashState(const void *data, size_t size)
++{
++   const uint8_t *bytes = (const uint8_t *)data;
++   uint64_t hash = 0xCBF29CE484222325ULL;
++   size_t i;
++
++   for (i = 0; i < size; i++)
++      hash = (hash ^ bytes[i]) * 0x100000001B3ULL;
++   return hash;
++}
++
++static void rememberState(uint64_t hash)
++{
++   seenStates[seenNext] = hash;
++   seenNext = (seenNext + 1) % DUAL_SEEN_STATES;
++}
++
++static bool stateSeen(uint64_t hash)
++{
++   unsigned i;
++
++   for (i = 0; i < DUAL_SEEN_STATES; i++)
++      if (seenStates[i] == hash)
++         return true;
++   return false;
++}
++
++bool retro_serialize(void *data, size_t size)
++{
++   size_t total = retro_serialize_size();
++   uint8_t *p = (uint8_t *)data;
++
++   if (!total || size < total)
++      return false;
++
++   memset(p, 0, DUAL_HEADER_SIZE);
++   store32(p + 0, DUAL_STATE_MAGIC);
++   store32(p + 4, DUAL_STATE_VERSION);
++   store32(p + 8, 2);
++   store32(p + 12, (uint32_t)innerSize);
++   if (!inner[0].serialize(p + DUAL_HEADER_SIZE, innerSize))
++      return false;
++   if (!inner[1].serialize(p + DUAL_HEADER_SIZE + innerSize, innerSize))
++      return false;
++   if (size > total)
++      memset(p + total, 0, size - total);
++   if (traceFile)
++      rememberState(hashState(data, total));
++   return true;
++}
++
++bool retro_unserialize(const void *data, size_t size)
++{
++   size_t total = retro_serialize_size();
++   const uint8_t *p = (const uint8_t *)data;
++
++   if (!total || size < total)
++      return false;
++   if (load32(p) != DUAL_STATE_MAGIC)
++   {
++      dual_log(RETRO_LOG_ERROR, "WonderSwan Dual 상태가 아님");
++      return false;
++   }
++   if (load32(p + 4) != DUAL_STATE_VERSION || load32(p + 8) != 2 || load32(p + 12) != innerSize)
++   {
++      dual_log(RETRO_LOG_ERROR, "상태 판/크기가 다름");
++      return false;
++   }
++   if (traceFile)
++   {
++      uint64_t hash = hashState(data, total);
++      if (!stateSeen(hash))
++      {
++         stats.outsideLoads++;
++         rememberState(hash);
++         dual_log(RETRO_LOG_INFO, "밖에서 온 상태 #%u (넷플레이 접속 또는 CRC 재동기)", stats.outsideLoads);
++      }
++   }
++   if (!inner[0].unserialize(p + DUAL_HEADER_SIZE, innerSize))
++      return false;
++   if (!inner[1].unserialize(p + DUAL_HEADER_SIZE + innerSize, innerSize))
++      return false;
++   /* 불러온 상태에 두 세이브가 다 들어 있음 */
++   p2CopyPending = false;
++   return true;
++}
++
++/* ---- 그 밖 ---- */
++
++void retro_cheat_reset(void)
++{
++   inner[0].cheat_reset();
++   inner[1].cheat_reset();
++}
++
++/* 치트는 두 기계 모두에(같은 게임 두 벌) */
++void retro_cheat_set(unsigned index, bool enabled, const char *code)
++{
++   inner[0].cheat_set(index, enabled, code);
++   inner[1].cheat_set(index, enabled, code);
++}
++
++unsigned retro_get_region(void)
++{
++   return RETRO_REGION_NTSC;
++}
++
++void retro_set_controller_port_device(unsigned port, unsigned device)
++{
++   (void)port;
++   (void)device;
++}
++
++void *retro_get_memory_data(unsigned id)
++{
++   if (!gameLoaded)
++      return NULL;
++
++   switch (id)
++   {
++      case RETRO_MEMORY_SAVE_RAM:
++      case RETRO_MEMORY_SYSTEM_RAM:
++         return inner[0].get_memory_data(id);
++      case DUAL_MEMORY_WRAM:
++      case DUAL_MEMORY_WRAM + 1:
++         return inner[id - DUAL_MEMORY_WRAM].get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
++      case DUAL_MEMORY_SAVE:
++      case DUAL_MEMORY_SAVE + 1:
++         return inner[id - DUAL_MEMORY_SAVE].get_memory_data(RETRO_MEMORY_SAVE_RAM);
++      case DUAL_MEMORY_FRAME:
++      case DUAL_MEMORY_FRAME + 1:
++         return (void *)inner[id - DUAL_MEMORY_FRAME].framebuffer();
++      case DUAL_MEMORY_STATS:
++         return &stats;
++      default:
++         return NULL;
++   }
++}
++
++size_t retro_get_memory_size(unsigned id)
++{
++   if (!gameLoaded)
++      return 0;
++
++   switch (id)
++   {
++      case RETRO_MEMORY_SAVE_RAM:
++      case RETRO_MEMORY_SYSTEM_RAM:
++         return inner[0].get_memory_size(id);
++      case DUAL_MEMORY_WRAM:
++      case DUAL_MEMORY_WRAM + 1:
++         return inner[id - DUAL_MEMORY_WRAM].get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
++      case DUAL_MEMORY_SAVE:
++      case DUAL_MEMORY_SAVE + 1:
++         return inner[id - DUAL_MEMORY_SAVE].get_memory_size(RETRO_MEMORY_SAVE_RAM);
++      case DUAL_MEMORY_FRAME:
++      case DUAL_MEMORY_FRAME + 1:
++         return DUAL_WIDTH * DUAL_HEIGHT * 2;
++      case DUAL_MEMORY_STATS:
++         return sizeof(stats);
++      default:
++         return 0;
++   }
++}
+diff --git a/dual/link_dual.T b/dual/link_dual.T
+new file mode 100644
+index 0000000..9e82b5d
+--- /dev/null
++++ b/dual/link_dual.T
+@@ -0,0 +1,4 @@
++{
++   global: retro_*;
++   local: *;
++};
+-- 
+2.53.0
+

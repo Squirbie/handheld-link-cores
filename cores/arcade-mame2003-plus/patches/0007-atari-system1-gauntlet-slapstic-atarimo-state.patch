@@ -1,0 +1,246 @@
+--- a/src/machine/atarigen.c
++++ b/src/machine/atarigen.c
+@@ -460,6 +460,19 @@
+ }
+ 
+ 
++/* hanbang 10/21: the banked slapstic ROM copy is not part of the save state; after a load,
++   copy the bank the restored chip state points at (atarigen_slapstic_bank always equals
++   slapstic_bank() while running, so this only rebuilds what the saving side already had) */
++static void atarigen_slapstic_postload(void)
++{
++	if (atarigen_slapstic_num && atarigen_slapstic && atarigen_slapstic_bank0)
++	{
++		atarigen_slapstic_bank = -1;
++		update_bank(slapstic_bank());
++	}
++}
++
++
+ /*---------------------------------------------------------------
+ 	atarigen_slapstic_init: Installs memory handlers for the
+ 	slapstic and sets the chip number.
+@@ -484,6 +497,7 @@
+ 		atarigen_slapstic_bank0 = auto_malloc(0x2000);
+ 		if (atarigen_slapstic_bank0)
+ 			memcpy(atarigen_slapstic_bank0, atarigen_slapstic, 0x2000);
++		state_save_register_func_postload(atarigen_slapstic_postload);
+ 	}
+ }
+ 
+--- a/src/vidhrdw/atarimo_vidhrdw.c
++++ b/src/vidhrdw/atarimo_vidhrdw.c
+@@ -7,6 +7,7 @@
+ ##########################################################################*/
+ 
+ #include "driver.h"
++#include "state.h"
+ #include "atarimo.h"
+ #include "tilemap.h"
+ 
+@@ -257,6 +258,15 @@
+ 	GLOBAL FUNCTIONS
+ ##########################################################################*/
+ 
++/* hanbang 10/21: the active list is a cache keyed only by last_link; sprite RAM and bank
++   come back from the save state, so drop the cache and rebuild it on the next render */
++static void atarimo_postload(void)
++{
++	int i;
++	for (i = 0; i < ATARIMO_MAX; i++)
++		atarimo[i].last_link = -1;
++}
++
+ static void force_update(int scanline)
+ {
+ 	if (scanline > 0)
+@@ -362,6 +372,7 @@
+ 	state_save_register_INT32("atarimo", map, "xscroll", &mo->xscroll, 1);
+ 	state_save_register_INT32("atarimo", map, "yscroll", &mo->yscroll, 1);
+ 	state_save_register_INT32("atarimo", map, "palettebase", &mo->palettebase, 1);
++	state_save_register_func_postload(atarimo_postload);
+ 
+ 
+ 	/* allocate the code lookup */
+--- a/src/drivers/gauntlet.c
++++ b/src/drivers/gauntlet.c
+@@ -119,6 +119,7 @@
+ 
+ 
+ #include "driver.h"
++#include "state.h"
+ #include "machine/atarigen.h"
+ #include "gauntlet.h"
+ 
+@@ -172,6 +173,9 @@
+ {
+ 	last_speech_write = 0x80;
+ 	sound_reset_val = 1;
++	state_save_register_UINT8("gauntlet", 0, "speech_val", &speech_val, 1);
++	state_save_register_UINT8("gauntlet", 0, "last_speech_write", &last_speech_write, 1);
++	state_save_register_UINT16("gauntlet", 0, "sound_reset_val", &sound_reset_val, 1);
+ 
+ 	atarigen_eeprom_reset();
+ 	atarigen_slapstic_reset();
+--- a/src/vidhrdw/gauntlet_vidhrdw.c
++++ b/src/vidhrdw/gauntlet_vidhrdw.c
+@@ -5,6 +5,7 @@
+ ****************************************************************************/
+ 
+ #include "driver.h"
++#include "state.h"
+ #include "machine/atarigen.h"
+ #include "gauntlet.h"
+ 
+@@ -29,6 +30,8 @@
+ static UINT8 playfield_tile_bank;
+ static UINT8 playfield_color_bank;
+ 
++static void gauntlet_postload(void);
++
+ 
+ 
+ /*************************************
+@@ -127,10 +130,23 @@
+ 
+ 	/* set up the base color for the playfield */
+ 	playfield_color_bank = vindctr2_screen_refresh ? 0 : 1;
++
++	/* hanbang 10/21: the scroll registers live in saved RAM; the tile bank and tilemap scroll
++	   derived from them are rebuilt after a load */
++	state_save_register_UINT8("gauntlet_video", 0, "playfield_tile_bank", &playfield_tile_bank, 1);
++	state_save_register_func_postload(gauntlet_postload);
+ 	return 0;
+ }
+ 
+ 
++static void gauntlet_postload(void)
++{
++	tilemap_set_scrollx(atarigen_playfield_tilemap, 0, *atarigen_xscroll);
++	tilemap_set_scrolly(atarigen_playfield_tilemap, 0, *atarigen_yscroll >> 7);
++	tilemap_mark_all_tiles_dirty(atarigen_playfield_tilemap);
++}
++
++
+ 
+ /*************************************
+  *
+--- a/src/drivers/atarisy1.c
++++ b/src/drivers/atarisy1.c
+@@ -117,6 +117,7 @@
+ 
+ 
+ #include "driver.h"
++#include "state.h"
+ #include "machine/atarigen.h"
+ #include "atarisy1.h"
+ 
+@@ -140,6 +141,8 @@
+ static UINT8 m6522_dra, m6522_drb;
+ static UINT8 m6522_regs[16];
+ 
++static UINT8 trakball_cur[2][2];	/* hanbang 10/21: was a static inside trakball_r; moved out so it can be saved */
++
+ 
+ 
+ /*************************************
+@@ -190,6 +193,18 @@
+ 	m6522_ddra = m6522_ddrb = 0xff;
+ 	m6522_dra = m6522_drb = 0xff;
+ 	memset(m6522_regs, 0xff, sizeof(m6522_regs));
++
++	/* hanbang 10/21: joystick/trackball/6522 state for save states */
++	timer_save_register("atarisy1", 0, "joystick_timer", joystick_timer);
++	state_save_register_UINT8("atarisy1", 0, "joystick_int", &joystick_int, 1);
++	state_save_register_UINT8("atarisy1", 0, "joystick_int_enable", &joystick_int_enable, 1);
++	state_save_register_UINT8("atarisy1", 0, "joystick_value", &joystick_value, 1);
++	state_save_register_UINT8("atarisy1", 0, "m6522_ddra", &m6522_ddra, 1);
++	state_save_register_UINT8("atarisy1", 0, "m6522_ddrb", &m6522_ddrb, 1);
++	state_save_register_UINT8("atarisy1", 0, "m6522_dra", &m6522_dra, 1);
++	state_save_register_UINT8("atarisy1", 0, "m6522_drb", &m6522_drb, 1);
++	state_save_register_UINT8("atarisy1", 0, "m6522_regs", m6522_regs, 16);
++	state_save_register_UINT8("atarisy1", 0, "trakball_cur", &trakball_cur[0][0], 4);
+ }
+ 
+ 
+@@ -257,7 +272,7 @@
+ 	/* Marble Madness trackball type -- rotated 45 degrees! */
+ 	if (trackball_type == 1)
+ 	{
+-		static UINT8 cur[2][2];
++		UINT8 (*cur)[2] = trakball_cur;
+ 		int player = (offset >> 1) & 1;
+ 		int which = offset & 1;
+ 
+--- a/src/vidhrdw/atarisy1_vidhrdw.c
++++ b/src/vidhrdw/atarisy1_vidhrdw.c
+@@ -5,6 +5,7 @@
+ ****************************************************************************/
+ 
+ #include "driver.h"
++#include "state.h"
+ #include "machine/atarigen.h"
+ #include "atarisy1.h"
+ 
+@@ -54,6 +55,7 @@
+ static UINT8 playfield_tile_bank;
+ static data16_t playfield_priority_pens;
+ static void *yscroll_reset_timer;
++static int playfield_yscroll_applied;	/* hanbang 10/21: last value given to tilemap_set_scrolly, for save states */
+ 
+ /* INT3 tracking */
+ static int next_timer_scanline;
+@@ -90,6 +92,7 @@
+ static void int3_callback(int scanline);
+ static void int3off_callback(int param);
+ static void reset_yscroll_callback(int param);
++static void atarisy1_video_postload(void);
+ 
+ 
+ 
+@@ -210,10 +213,29 @@
+ 	scanline_timer = timer_alloc(int3_callback);
+ 	int3off_timer = timer_alloc(int3off_callback);
+ 	yscroll_reset_timer = timer_alloc(reset_yscroll_callback);
++
++	/* hanbang 10/21: video state that is not in RAM; tilemap settings are rebuilt after a load */
++	playfield_yscroll_applied = 0;
++	state_save_register_UINT8("atarisy1_video", 0, "playfield_tile_bank", &playfield_tile_bank, 1);
++	state_save_register_UINT16("atarisy1_video", 0, "playfield_priority_pens", &playfield_priority_pens, 1);
++	state_save_register_int("atarisy1_video", 0, "playfield_yscroll_applied", &playfield_yscroll_applied);
++	state_save_register_int("atarisy1_video", 0, "next_timer_scanline", &next_timer_scanline);
++	timer_save_register("atarisy1_video", 0, "scanline_timer", scanline_timer);
++	timer_save_register("atarisy1_video", 0, "int3off_timer", int3off_timer);
++	timer_save_register("atarisy1_video", 0, "yscroll_reset_timer", yscroll_reset_timer);
++	state_save_register_func_postload(atarisy1_video_postload);
+ 	return 0;
+ }
+ 
+ 
++static void atarisy1_video_postload(void)
++{
++	tilemap_set_scrollx(atarigen_playfield_tilemap, 0, *atarigen_xscroll);
++	tilemap_set_scrolly(atarigen_playfield_tilemap, 0, playfield_yscroll_applied);
++	tilemap_mark_all_tiles_dirty(atarigen_playfield_tilemap);
++}
++
++
+ 
+ /*************************************
+  *
+@@ -313,6 +335,7 @@
+ static void reset_yscroll_callback(int newscroll)
+ {
+ 	tilemap_set_scrolly(atarigen_playfield_tilemap, 0, newscroll);
++	playfield_yscroll_applied = newscroll;
+ }
+ 
+ 
+@@ -333,6 +356,7 @@
+ 	if (scanline <= Machine->visible_area.max_y)
+ 		adjusted_scroll -= (scanline + 1);
+ 	tilemap_set_scrolly(atarigen_playfield_tilemap, 0, adjusted_scroll);
++	playfield_yscroll_applied = adjusted_scroll;
+ 
+ 	/* but since we've adjusted it, we must reset it to the normal value
+ 	   once we hit scanline 0 again */

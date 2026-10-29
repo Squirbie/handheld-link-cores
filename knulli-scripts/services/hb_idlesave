@@ -1,0 +1,26 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# KNULLI service: saves a state and sleeps after a long idle time in game (runs /userdata/system/claude/hb_idlesave.py).
+# Works only while KNULLI power saving (sleep / power off) is enabled. Details at the top of hb_idlesave.py.
+# Enable: add "hb_idlesave" to system.services in /userdata/system/knulli.conf (S99userservices starts it at boot).
+# Disable: remove that word and reboot. Install this file as /userdata/system/services/hb_idlesave
+P=/var/run/hb_idlesave.pid
+PY=/userdata/system/claude/hb_idlesave.py
+
+case "$1" in
+  start|"")
+    if [ -f "$P" ] && kill -0 "$(cat "$P")" 2>/dev/null; then
+      exit 0
+    fi
+    [ -f "$PY" ] || exit 0
+    python3 "$PY" >/dev/null 2>&1 < /dev/null &
+    echo $! > "$P"
+    ;;
+  stop)
+    if [ -f "$P" ]; then
+      kill "$(cat "$P")" 2>/dev/null
+      rm -f "$P"
+    fi
+    ;;
+esac
+exit 0

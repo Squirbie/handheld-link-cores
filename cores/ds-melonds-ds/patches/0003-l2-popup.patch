@@ -1,0 +1,134 @@
+diff --git a/src/libretro/input/input.hpp b/src/libretro/input/input.hpp
+index c37e7a6..0a731c7 100644
+--- a/src/libretro/input/input.hpp
++++ b/src/libretro/input/input.hpp
+@@ -69,6 +69,7 @@ namespace MelonDsDs {
+         /// (such as on the error screen).
+         void Apply(ScreenLayoutData& layout) const noexcept;
+         [[nodiscard]] bool CursorVisible() const noexcept { return _cursor.CursorVisible(); }
++        [[nodiscard]] bool PopupHeld() const noexcept { return _joypad.PopupHeld(); }
+         [[nodiscard]] bool IsTouching() const noexcept { return _cursor.IsTouching(); }
+         [[nodiscard]] bool TouchReleased() const noexcept {
+             return _pointer.CursorReleased() || _joypad.TouchReleased();
+diff --git a/src/libretro/input/joypad.hpp b/src/libretro/input/joypad.hpp
+index 6a571be..3043cbc 100644
+--- a/src/libretro/input/joypad.hpp
++++ b/src/libretro/input/joypad.hpp
+@@ -56,6 +56,8 @@ namespace MelonDsDs {
+ 
+         [[nodiscard]] retro_perf_tick_t LastPointerUpdate() const noexcept { return _lastPointerUpdate; }
+         [[nodiscard]] bool CycleLayoutPressed() const noexcept { return _cycleLayoutButton && !_previousCycleLayoutButton; }
++        // hanbang: L2 held = show the other screen as a translucent pop-up (single-screen layouts only)
++        [[nodiscard]] bool PopupHeld() const noexcept { return _joystickSpeedupCursorButton; }
+         [[nodiscard]] bool MicButtonDown() const noexcept { return _micButton; }
+         [[nodiscard]] bool MicButtonPressed() const noexcept { return _micButton && !_previousMicButton; }
+         [[nodiscard]] bool MicButtonReleased() const noexcept { return !_micButton && _previousMicButton; }
+diff --git a/src/libretro/render/software.cpp b/src/libretro/render/software.cpp
+index 0884b70..1306895 100644
+--- a/src/libretro/render/software.cpp
++++ b/src/libretro/render/software.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "software.hpp"
+ 
++#include <algorithm>
+ #include <cmath>
+ 
+ #include <retro_assert.h>
+@@ -89,6 +90,23 @@ void MelonDsDs::SoftwareRenderState::Render(
+         screenLayout
+     );
+ 
++    {
++        // hanbang (10/9): while L2 is held in a one-screen layout (top only / bottom only), the other screen slides up from the bottom
++        // as a translucent pop-up (75% size, rounded corners), like the Android 'pop-up screen' builds. In 'top only' the touch cursor
++        // is drawn inside the pop-up so the bottom screen can be aimed at with the right stick.
++        constexpr int POPUP_ANIM = 9;
++        ScreenLayout layout = screenLayout.Layout();
++        bool single = layout == ScreenLayout::TopOnly || layout == ScreenLayout::BottomOnly;
++        if (single && inputState.PopupHeld()) popupFrames = std::min(popupFrames + 1, POPUP_ANIM);
++        else popupFrames = std::max(popupFrames - 1, 0);
++        if (single && popupFrames > 0) {
++            bool topMain = layout == ScreenLayout::TopOnly;
++            DrawPopup(topMain ? bottomScreenBuffer : topScreenBuffer, popupFrames / static_cast<float>(POPUP_ANIM),
++                      topMain && !nds.IsLidClosed() && inputState.CursorVisible(),
++                      inputState.ConsoleTouchPosition(), config.CursorSize());
++        }
++    }
++
+     if (!nds.IsLidClosed() && inputState.CursorVisible()) {
+         DrawCursor(inputState, config, screenLayout);
+     }
+@@ -217,6 +235,58 @@ void MelonDsDs::SoftwareRenderState::DrawCursor(const InputState& input, const C
+     }
+ }
+ 
++void MelonDsDs::SoftwareRenderState::DrawPopup(const uint32_t* src, float t, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept {
++    ZoneScopedN(TracyFunction);
++    const int W = static_cast<int>(buffer.Width()), H = static_cast<int>(buffer.Height());
++    constexpr int SW = NDS_SCREEN_WIDTH, SH = NDS_SCREEN_HEIGHT;
++    if (W < SW || H < SH) return;
++    const int bw = W * 3 / 4, bh = H * 3 / 4;          // 75% of the screen, 4:3 kept
++    const int x0 = (W - bw) / 2;
++    const int yOpen = H - bh - 4;                       // 4px above the bottom edge when fully open
++    const float e = 1.0f - (1.0f - t) * (1.0f - t);     // ease-out slide
++    const int y0 = H + static_cast<int>((yOpen - H) * e);
++    constexpr unsigned A = 218;                         // ~85% opaque
++    constexpr int R = 6;                                // corner radius
++    for (int oy = 0; oy < bh; oy++) {
++        const int dy = y0 + oy;
++        if (dy < 0 || dy >= H) continue;
++        int syf = static_cast<int>((2LL * oy + 1) * SH * 65536 / (2 * bh)) - 32768;
++        if (syf < 0) syf = 0;
++        const int sy = syf >> 16, fy = (syf >> 8) & 0xFF, sy1 = std::min(sy + 1, SH - 1);
++        const uint32_t* r0 = src + sy * SW;
++        const uint32_t* r1 = src + sy1 * SW;
++        uint32_t* d = buffer[static_cast<unsigned>(dy)] + x0;
++        const int cy = oy < R ? R - oy : (oy >= bh - R ? oy - (bh - R - 1) : 0);
++        for (int ox = 0; ox < bw; ox++) {
++            const int cx = ox < R ? R - ox : (ox >= bw - R ? ox - (bw - R - 1) : 0);
++            if (cx && cy && cx * cx + cy * cy > R * R) continue;
++            int sxf = static_cast<int>((2LL * ox + 1) * SW * 65536 / (2 * bw)) - 32768;
++            if (sxf < 0) sxf = 0;
++            const int sx = sxf >> 16, fx = (sxf >> 8) & 0xFF, sx1 = std::min(sx + 1, SW - 1);
++            const uint32_t p00 = r0[sx], p01 = r0[sx1], p10 = r1[sx], p11 = r1[sx1], bg = d[ox];
++            uint32_t res = 0xFF000000;
++            for (int s = 0; s < 24; s += 8) {
++                const int top = static_cast<int>((p00 >> s) & 0xFF) * (256 - fx) + static_cast<int>((p01 >> s) & 0xFF) * fx;
++                const int bot = static_cast<int>((p10 >> s) & 0xFF) * (256 - fx) + static_cast<int>((p11 >> s) & 0xFF) * fx;
++                const unsigned c = static_cast<unsigned>((top * (256 - fy) + bot * fy) >> 16);
++                const unsigned b = (bg >> s) & 0xFF;
++                res |= ((c * A + b * (256 - A)) >> 8) << s;
++            }
++            d[ox] = res;
++        }
++    }
++    if (cursor) {
++        const float r = std::max(1.0f, cursorRadius * 0.75f);
++        const float cxf = x0 + (touch.x + 0.5f) * bw / SW, cyf = y0 + (touch.y + 0.5f) * bh / SH;
++        const int xa = std::max(0, static_cast<int>(std::floor(cxf - r))), xb = std::min(W, static_cast<int>(std::ceil(cxf + r)));
++        const int ya = std::max(0, static_cast<int>(std::floor(cyf - r))), yb = std::min(H, static_cast<int>(std::ceil(cyf + r)));
++        for (int y = ya; y < yb; y++) {
++            uint32_t* row = buffer[static_cast<unsigned>(y)];
++            for (int x = xa; x < xb; x++) row[x] = (0xFFFFFF - row[x]) | 0xFF000000;
++        }
++    }
++}
++
+ void MelonDsDs::SoftwareRenderState::CombineScreens(
+     std::span<const uint32_t, NDS_SCREEN_AREA<size_t>> topBuffer,
+     std::span<const uint32_t, NDS_SCREEN_AREA<size_t>> bottomBuffer,
+diff --git a/src/libretro/render/software.hpp b/src/libretro/render/software.hpp
+index c08c753..5806284 100644
+--- a/src/libretro/render/software.hpp
++++ b/src/libretro/render/software.hpp
+@@ -62,6 +62,9 @@ namespace MelonDsDs {
+         void PrepareBuffers(const CoreConfig& config, const ScreenLayoutData& screenLayout) noexcept;
+         void CopyScreen(const uint32_t* src, glm::uvec2 destTranslation, ScreenLayout layout) noexcept;
+         void DrawCursor(const InputState& input, const CoreConfig& config, const ScreenLayoutData& screenLayout) noexcept;
++        // hanbang: translucent pop-up of the other screen while L2 is held
++        void DrawPopup(const uint32_t* src, float t, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept;
++        int popupFrames = 0;
+         void CombineScreens(
+             std::span<const uint32_t, NDS_SCREEN_AREA<size_t>> topBuffer,
+             std::span<const uint32_t, NDS_SCREEN_AREA<size_t>> bottomBuffer,

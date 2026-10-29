@@ -1,0 +1,137 @@
+Subject: GBA SIO: shared clocks survive the int32 cycle wrap (lockstep part)
+Series-Step: 2/19 (mgba_dual 1.6-os4)
+Origin: tangobattle/mgba 7dc7c64a176bfcf4abfefe9aefe5e413246da771 (2026-07-18), MPL-2.0; carried unchanged in the hb_dual branch, original authors are credited there; lockstep.c hunks only
+요약: 약 128초 뒤 시계가 int32 를 넘어가도 연결이 이어지게 함(lockstep.c 부분만, tangobattle/mgba).
+
+Cherry-picked from tangobattle/mgba 7dc7c64a176bfcf4abfefe9aefe5e413246da771,
+lockstep.c hunks only (the wireless driver is not in this tree).
+Route every cross-core cycle comparison through _cycleDiff so the shared
+clock keeps advancing after mTimingCurrentTime crosses 2^31 (~128 s).
+
+---
+diff --git a/src/gba/sio/lockstep.c b/src/gba/sio/lockstep.c
+index 92bec46b0ae5..55c9636f80da 100644
+--- a/src/gba/sio/lockstep.c
++++ b/src/gba/sio/lockstep.c
+@@ -115,6 +115,18 @@ static void _hardSync(struct GBASIOLockstepCoordinator*, struct GBASIOLockstepPl
+ 
+ static void _lockstepEvent(struct mTiming*, void* context, uint32_t cyclesLate);
+ 
++// Difference between two cycle-counter values, valid across the int32
++// wrap: the counters (mTimingCurrentTime and everything derived from
++// it) advance mod 2^32 and cross the sign boundary ~128 emulated
++// seconds after reset. Naive `a - b >= 0` is signed-overflow UB there —
++// and compilers fold it to a direct `a >= b`, which then fails for an
++// entire half-period, freezing the shared clock. Unsigned subtraction
++// reinterpreted as signed is the same windowed-distance idiom mTiming
++// itself uses.
++static int32_t _cycleDiff(int32_t later, int32_t earlier) {
++	return (int32_t) ((uint32_t) later - (uint32_t) earlier);
++}
++
+ static void _verifyAwake(struct GBASIOLockstepCoordinator* coordinator) {
+ #ifdef NDEBUG
+ 	UNUSED(coordinator);
+@@ -222,7 +234,7 @@ static void GBASIOLockstepDriverReset(struct GBASIODriver* driver) {
+ 			}
+ 		}
+ 		_reconfigPlayers(coordinator);
+-		player->cycleOffset = mTimingCurrentTime(&driver->p->p->timing) - coordinator->cycle;
++		player->cycleOffset = _cycleDiff(mTimingCurrentTime(&driver->p->p->timing), coordinator->cycle);
+ 		if (player->playerId != 0) {
+ 			struct GBASIOLockstepEvent event = {
+ 				.type = SIO_EV_ATTACH,
+@@ -234,7 +246,7 @@ static void GBASIOLockstepDriverReset(struct GBASIODriver* driver) {
+ 	} else {
+ 		MutexLock(&coordinator->mutex);
+ 		player = TableLookup(&coordinator->players, lockstep->lockstepId);
+-		player->cycleOffset = mTimingCurrentTime(&driver->p->p->timing) - coordinator->cycle;
++		player->cycleOffset = _cycleDiff(mTimingCurrentTime(&driver->p->p->timing), coordinator->cycle);
+ 	}
+ 
+ 	if (coordinator->transferActive) {
+@@ -570,7 +582,7 @@ static bool GBASIOLockstepDriverStart(struct GBASIODriver* driver) {
+ 	struct GBASIOLockstepEvent event = {
+ 		.type = SIO_EV_TRANSFER_START,
+ 		.timestamp = timestamp,
+-		.finishCycle = timestamp + GBASIOTransferCycles(player->mode, player->driver->d.p->siocnt, coordinator->nAttached - 1),
++		.finishCycle = (int32_t) ((uint32_t) timestamp + (uint32_t) GBASIOTransferCycles(player->mode, player->driver->d.p->siocnt, coordinator->nAttached - 1)),
+ 	};
+ 	_enqueueEvent(coordinator, &event, TARGET_SECONDARY);
+ 	GBASIOLockstepCoordinatorWaitOnPlayers(coordinator, player);
+@@ -689,7 +701,7 @@ void GBASIOLockstepCoordinatorDetach(struct GBASIOLockstepCoordinator* coordinat
+ }
+ 
+ int32_t _untilNextSync(struct GBASIOLockstepCoordinator* coordinator, struct GBASIOLockstepPlayer* player) {
+-	int32_t cycle = coordinator->cycle - GBASIOLockstepTime(player);
++	int32_t cycle = _cycleDiff(coordinator->cycle, GBASIOLockstepTime(player));
+ 	if (player->playerId == 0) {
+ 		if (coordinator->nAttached < 2) {
+ 			cycle += UNLOCKED_INTERVAL;
+@@ -702,8 +714,8 @@ int32_t _untilNextSync(struct GBASIOLockstepCoordinator* coordinator, struct GBA
+ 
+ void _advanceCycle(struct GBASIOLockstepCoordinator* coordinator, struct GBASIOLockstepPlayer* player) {
+ 	int32_t newCycle = GBASIOLockstepTime(player);
+-	mASSERT_DEBUG(newCycle - coordinator->cycle >= 0);
+-	coordinator->nextHardSync -= newCycle - coordinator->cycle;
++	mASSERT_DEBUG(_cycleDiff(newCycle, coordinator->cycle) >= 0);
++	coordinator->nextHardSync -= _cycleDiff(newCycle, coordinator->cycle);
+ 	coordinator->cycle = newCycle;
+ }
+ 
+@@ -894,7 +906,7 @@ void _enqueueEvent(struct GBASIOLockstepCoordinator* coordinator, const struct G
+ 		struct GBASIOLockstepEvent** previous = &player->queue;
+ 		struct GBASIOLockstepEvent* next = player->queue;
+ 		while (next) {
+-			int32_t until = newEvent->timestamp - next->timestamp;
++			int32_t until = _cycleDiff(newEvent->timestamp, next->timestamp);
+ 			if (until < 0) {
+ 				break;
+ 			}
+@@ -920,7 +932,7 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 		                      player->queue->playerId, player->queue->timestamp);
+ 		wasDetach = true;
+ 	}
+-	if (player->playerId == 0 && GBASIOLockstepTime(player) - coordinator->cycle >= 0) {
++	if (player->playerId == 0 && _cycleDiff(GBASIOLockstepTime(player), coordinator->cycle) >= 0) {
+ 		// We are the clock owner; advance the shared clock. However, if we just became
+ 		// the clock owner (by the previous one disconnecting) we might be slightly
+ 		// behind the shared clock. We should wait a bit if needed in that case.
+@@ -942,7 +954,7 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 		if (!event) {
+ 			break;
+ 		}
+-		if (event->timestamp > GBASIOLockstepTime(player)) {
++		if (_cycleDiff(event->timestamp, GBASIOLockstepTime(player)) > 0) {
+ 			break;
+ 		}
+ 		player->queue = event->next;
+@@ -982,7 +994,7 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 				break;
+ 			}
+ 			_setData(coordinator, player->playerId, sio);
+-			nextEvent = event->finishCycle - GBASIOLockstepTime(player) - cyclesLate;
++			nextEvent = _cycleDiff(event->finishCycle, GBASIOLockstepTime(player)) - cyclesLate;
+ 			player->driver->d.p->siocnt |= 0x80;
+ 			mTimingDeschedule(&sio->p->timing, &sio->completeEvent);
+ 			mTimingSchedule(&sio->p->timing, &sio->completeEvent, nextEvent);
+@@ -1014,8 +1026,8 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 		event->next = player->freeList;
+ 		player->freeList = event;
+ 	}
+-	if (player->queue && player->queue->timestamp - GBASIOLockstepTime(player) < nextEvent) {
+-		nextEvent = player->queue->timestamp - GBASIOLockstepTime(player);
++	if (player->queue && _cycleDiff(player->queue->timestamp, GBASIOLockstepTime(player)) < nextEvent) {
++		nextEvent = _cycleDiff(player->queue->timestamp, GBASIOLockstepTime(player));
+ 	}
+ 
+ 	if (player->playerId != 0 && nextEvent <= LOCKSTEP_INTERVAL) {
+@@ -1063,7 +1075,7 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ }
+ 
+ int32_t GBASIOLockstepTime(struct GBASIOLockstepPlayer* player) {
+-	return mTimingCurrentTime(&player->driver->d.p->p->timing) - player->cycleOffset;
++	return _cycleDiff(mTimingCurrentTime(&player->driver->d.p->p->timing), player->cycleOffset);
+ }
+ 
+ void GBASIOLockstepCoordinatorWaitOnPlayers(struct GBASIOLockstepCoordinator* coordinator, struct GBASIOLockstepPlayer* player) {

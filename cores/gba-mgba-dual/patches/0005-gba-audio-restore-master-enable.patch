@@ -1,0 +1,36 @@
+Subject: GBA Audio: restore the master-enable field on load
+Series-Step: 5/19 (mgba_dual 1.6-os4)
+Origin: tangobattle/mgba 89e7fd7ff21e369f325fba9ef8b486510a1eebc9 (2026-07-20), MPL-2.0; carried unchanged in the hb_dual branch, original authors are credited there
+요약: 소리 켜짐 값을 불러올 때 복원함(tangobattle/mgba).
+
+Closes the last hole a field-by-field audit of the audio state surface
+found: SOUNDCNT_X raw-loads on deserialize (no write replay), and its
+decoded master-enable field was never restored — stale only when a
+game toggles the master enable inside a rollback window, but a hole
+all the same. Every other field now audits as serialized, recomputed
+from serialized state, io-replay-derived from readable bits, or dead
+on the GBA path (window is DMG-only: GBA wave phase lives in the
+serialized wavedata rotation; the GB-side sampling path is unreachable
+with psg.p NULL).
+
+(cherry picked from commit 89e7fd7ff21e369f325fba9ef8b486510a1eebc9)
+
+---
+diff --git a/src/gba/audio.c b/src/gba/audio.c
+index 064a6577dcf7..a0e668058c52 100644
+--- a/src/gba/audio.c
++++ b/src/gba/audio.c
+@@ -499,6 +499,13 @@ void GBAAudioSerialize(const struct GBAAudio* audio, struct GBASerializedState*
+ void GBAAudioDeserialize(struct GBAAudio* audio, const struct GBASerializedState* state) {
+ 	GBAudioPSGDeserialize(&audio->psg, &state->audio.psg, &state->audio.flags);
+ 
++	// SOUNDCNT_X raw-loads (no write replay), so restore its decoded
++	// master-enable field explicitly; everything the write handler
++	// would have derived beyond it is serialized elsewhere.
++	uint16_t soundcntX;
++	LOAD_16(soundcntX, GBA_REG_SOUNDCNT_X, state->io);
++	audio->enable = !!(soundcntX & 0x80);
++
+ 	LOAD_32(audio->chA.internalSample, 0, &state->audio.internalA);
+ 	LOAD_32(audio->chB.internalSample, 0, &state->audio.internalB);
+ 	memcpy(audio->chA.samples, state->samples.chA, sizeof(audio->chA.samples));

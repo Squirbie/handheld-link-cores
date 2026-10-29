@@ -1,0 +1,80 @@
+Subject: Libretro dual: 2P save survives file systems without atomic replace
+Series-Step: 9/19 (mgba_dual 1.6-os4)
+Origin: hanbang (this project)
+요약: rename 으로 덮어쓸 수 없는 파일 시스템(exFAT FUSE)에서는 제자리에 쓰고 fsync 함.
+
+If rename() cannot replace the old .p2.srm (some FUSE file systems),
+rewrite it in place; fsync the final file as well, which is what commits
+directory entries and the cluster bitmap on exFAT through FUSE.
+
+---
+diff --git a/src/platform/libretro/dual/libretro_dual.c b/src/platform/libretro/dual/libretro_dual.c
+index b73705b30248..b972f50124db 100644
+--- a/src/platform/libretro/dual/libretro_dual.c
++++ b/src/platform/libretro/dual/libretro_dual.c
+@@ -386,6 +386,34 @@ static void _loadP2Save(void) {
+ 	memcpy(p2SaveWritten, players[1].save, DUAL_SAVE_SIZE);
+ }
+ 
++static bool _writeAll(const char* path, const uint8_t* data, size_t size) {
++	FILE* f = fopen(path, "wb");
++	if (!f) {
++		return false;
++	}
++	bool ok = fwrite(data, 1, size, f) == size;
++	ok = fflush(f) == 0 && ok;
++#ifndef _WIN32
++	ok = fsync(fileno(f)) == 0 && ok;
++#endif
++	ok = fclose(f) == 0 && ok;
++	return ok;
++}
++
++/* /userdata on the handhelds is exFAT through FUSE, where an fsync is what
++ * commits directory entries and the cluster bitmap: sync the final name too */
++static void _syncPath(const char* path) {
++#ifndef _WIN32
++	int fd = open(path, O_RDONLY);
++	if (fd >= 0) {
++		fsync(fd);
++		close(fd);
++	}
++#else
++	UNUSED(path);
++#endif
++}
++
+ static void _writeP2Save(bool force) {
+ 	if (screenPlayer == 1 || !p2SavePath[0]) {
+ 		/* 2P (guest) mode: the 2P save belongs to the host device */
+@@ -405,22 +433,19 @@ static void _writeP2Save(bool force) {
+ 	}
+ 	char tmpPath[PATH_MAX + 8];
+ 	snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", p2SavePath);
+-	FILE* f = fopen(tmpPath, "wb");
+-	if (!f) {
+-		_log(RETRO_LOG_ERROR, "cannot write 2P save: %s", tmpPath);
+-		return;
++	bool ok = _writeAll(tmpPath, players[1].save, size);
++	if (ok && rename(tmpPath, p2SavePath) != 0) {
++		/* Some FUSE file systems refuse to rename over an existing file:
++		 * rewrite the save in place instead */
++		ok = _writeAll(p2SavePath, players[1].save, size);
++		remove(tmpPath);
+ 	}
+-	bool ok = fwrite(players[1].save, 1, size, f) == size;
+-	ok = fflush(f) == 0 && ok;
+-#ifndef _WIN32
+-	ok = fsync(fileno(f)) == 0 && ok;
+-#endif
+-	ok = fclose(f) == 0 && ok;
+-	if (!ok || rename(tmpPath, p2SavePath) != 0) {
++	if (!ok) {
+ 		_log(RETRO_LOG_ERROR, "2P save write failed: %s", p2SavePath);
+ 		remove(tmpPath);
+ 		return;
+ 	}
++	_syncPath(p2SavePath);
+ 	memcpy(p2SaveWritten, players[1].save, size);
+ 	p2SaveWrittenSize = size;
+ 	_log(RETRO_LOG_INFO, "2P save written (%u bytes): %s", (unsigned) size, p2SavePath);

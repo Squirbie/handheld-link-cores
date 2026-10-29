@@ -1,0 +1,419 @@
+Subject: Gambatte: Game Boy Color infrared port (RP, FF56) over the same netplay room (v5ir)
+Series-Step: 2/5 (gambatte link v5irh3)
+Origin: hanbang (this project); record name hanbang_gb_ir_v5ir_from_v4bw.diff
+요약: 게임보이 컬러 적외선 포트(FF56)를 같은 넷플레이 방으로 이음 — 포켓몬 금·은·크리스탈 이상한 소포, 핀볼 점수 보내기, 카드 GB 카드 뿅!.
+
+While a game keeps its IR port on, each side sends 20-byte 'I' reports (its Game Boy time in 4194304 Hz
+units, LED on/off, port on/off, "reading" flag). When both ports are on and both sides read RP, the two meet once at a
+barrier (the host decides which two stops belong together) and from then the two Game Boy times are tied. A Game Boy
+reading RP at time t sees the other LED as it was at t - 4096 units (0.98 ms each way); if the other side's reports do not
+reach that far yet it waits there with its game paused (at most 3 s). A long pulse (>= 256 units) stays visible 128 units
+after it ends (the Mystery Gift hello). A port that is on but not read for two frames counts as "not listening", so a
+menu that leaves the port on (Pokemon Pinball after a send) does not freeze the other side. The pad is re-read during
+long waits so a short press is not lost. Cores without this patch ignore the 20-byte packets, so a half-updated pair only
+loses the infrared feature (no freeze).
+
+Hooks: FF56 read/write in Memory (CGB only), SerialIO::irWrite / irRead / irTick, checkSerial calls irTick.
+
+---
+diff --git a/libgambatte/libretro/hb_netpacket_serial.h b/libgambatte/libretro/hb_netpacket_serial.h
+index 6bb818dcbe53..de00377e2484 100644
+--- a/libgambatte/libretro/hb_netpacket_serial.h
++++ b/libgambatte/libretro/hb_netpacket_serial.h
+@@ -124,12 +124,33 @@ struct retro_netpacket_callback
+ #define HB_NP_EV_SOLO 2
+ #define HB_NP_EV_PEER_JOIN 3
+ 
++/* Hanbang v5ir (2026-10-26): Game Boy Color infrared (RP, FF56) over the same netplay room.
++ * Each Game Boy keeps running its own game; while a game has its IR port on, each side sends
++ * reports (its own time in 4194304 Hz units, LED on/off, port on/off). When both ports are on,
++ * the two meet once (barrier: each stops at its next RP read until the other one's stop is
++ * known) and from then the two Game Boy times are tied. A Game Boy reading RP at time t sees the
++ * other LED as it was at t - HB_IR_LAG, and if the other side's reports do not reach that far
++ * yet, it waits there with its game paused (conservative lockstep, only while both ports are on).
++ * The lag is like a longer distance between the two: Pokemon Gold/Silver/Crystal Mystery Gift
++ * waits 256 timer ticks (11.7 ms) for each answer and measures bits by the time between edges,
++ * so a fixed 2 ms delay each way is still well inside it. Packets are 20 bytes ('I'), so cores
++ * without this ignore them (old cores never see light, as before). */
++#define HB_IR_LEN 20
++#define HB_IR_LAG_DEF 4096UL     /* units of 1/4194304 s: 0.98 ms seen-delay each way (Mystery Gift runs at
++                                  * double speed: 256 ticks = 16384 units for an answer, 3904 of them its own pause) */
++#define HB_IR_HOLD_DEF 128UL     /* units: a long pulse stays seen this long after it ends */
++#define HB_IR_HOLD_MIN 256UL     /* units: pulses at least this long linger (Mystery Gift hello: 320) */
++#define HB_IR_IDLE 140448UL      /* units (two frames): a port not read this long counts as not listening */
++#define HB_IR_WAIT_MS 3000UL     /* longest a Game Boy stays paused for the other's IR report */
++#define HB_IR_BARRIER_MS 1500UL  /* longest it waits at the meeting point */
++#define HB_IR_Q 16384            /* reports kept (power of two) */
++
+ class NetpacketSerial : public gambatte::SerialIO
+ {
+ public:
+    NetpacketSerial() : send_fn_(NULL), poll_fn_(NULL), peer_(-1), is_host_(false),
+       seq_(0), head_(0), tail_(0), last_poll_ms_(0), clock_(0), last_xfer_clock_(0),
+-      expect_(0), held_seq_(0x10000), hist_n_(0), after_send_(false), trace_(NULL), peer_clock_(0), sent_clock_(0), peer_seen_(false), sent_progress_(false), epoch_(0), epoch_set_(false), timing_(false), fresh_(true), boot_pending_(false), link_ready_(false), peer_boot_(false), generation_(0), peer_generation_(0), used_peer_generation_(0), peer_ack_(0), boot_reset_(false), peer_boot_reset_(false), boot_deadline_(0), boot_tx_ms_(0), runs_(0), auto_cold_(false), state_loaded_(false), event_(0), progressed_(false), ever_linked_(false), armed_clock_(0), late_(0), unarmed_from_(0), unarmed_seq_(0x10000), turn_seen_(false) {}
++      expect_(0), held_seq_(0x10000), hist_n_(0), after_send_(false), trace_(NULL), peer_clock_(0), sent_clock_(0), peer_seen_(false), sent_progress_(false), epoch_(0), epoch_set_(false), timing_(false), fresh_(true), boot_pending_(false), link_ready_(false), peer_boot_(false), generation_(0), peer_generation_(0), used_peer_generation_(0), peer_ack_(0), boot_reset_(false), peer_boot_reset_(false), boot_deadline_(0), boot_tx_ms_(0), runs_(0), auto_cold_(false), state_loaded_(false), event_(0), progressed_(false), ever_linked_(false), armed_clock_(0), late_(0), unarmed_from_(0), unarmed_seq_(0x10000), turn_seen_(false) { irReset(); ir_lag_=HB_IR_LAG_DEF; ir_hold_=HB_IR_HOLD_DEF; ir_rdall_=false; ir_refresh_=NULL; ir_refresh_ms_=0; }
+ 
+    /* v4bv: automatic cold start is confined to the untouched startup window.
+     * Input delivered to a running game, a loaded state, or an established
+@@ -232,6 +253,10 @@ public:
+          if (trace_)
+             setvbuf(trace_, NULL, _IOLBF, 0);
+       }
++      irReset();
++      { const char *lag=getenv("HB_IR_LAG"); ir_lag_ = lag && atol(lag) > 0 ? (unsigned long)atol(lag) : HB_IR_LAG_DEF; }
++      { const char *h=getenv("HB_IR_HOLD"); ir_hold_ = h ? (unsigned long)atol(h) : HB_IR_HOLD_DEF; }
++      ir_rdall_ = getenv("HB_IR_RDALL") != NULL;
+       generation_=1; peer_generation_=used_peer_generation_=peer_ack_=0;
+       peer_boot_=false; link_ready_=false; boot_reset_=peer_boot_reset_=false;
+       boot_pending_=timeline() && !state_loaded_ && !progressed_ && (fresh_ || canAutoCold());
+@@ -243,6 +268,7 @@ public:
+    void stop()
+    {
+       tr("stop", 0, 0, 0);
++      irReset();
+       send_fn_ = NULL; poll_fn_ = NULL; peer_ = -1; clear();
+       boot_pending_=link_ready_=peer_boot_=false; auto_cold_=false;
+       if (trace_) { fclose(trace_); trace_ = NULL; }
+@@ -253,18 +279,22 @@ public:
+       if (!is_host_ || peer_ >= 0)
+          return false;                  /* the cable has two ends */
+       peer_ = client_id;
+-      clear();
++      clear(); irReset();
+       peer_generation_=used_peer_generation_=peer_ack_=0; peer_boot_=false; link_ready_=false;
+       debugState("transport-connected");
+       return true;
+    }
+    void disconnected(uint16_t client_id)
+    {
+-      if (peer_ == (int)client_id) { peer_ = -1; clear(); link_ready_=peer_boot_=false; debugState("transport-disconnected"); }
++      if (peer_ == (int)client_id) { peer_ = -1; clear(); irReset(); link_ready_=peer_boot_=false; debugState("transport-disconnected"); }
+    }
+    void receive(const void* buf, size_t len, uint16_t client_id)
+    {
+       const unsigned char* p = (const unsigned char*)buf;
++      if (len == HB_IR_LEN && p[0] == 'I') {   /* v5ir */
++         if (peer_ >= 0 && (int)client_id == peer_) irReceive(p);
++         return;
++      }
+       if (peer_ < 0 || (int)client_id != peer_ || len != (timeline() ? HB_NP_UNIT_LEN : 17))
+          return;
+       unsigned seq = p[1] | (p[2] << 8);
+@@ -726,6 +756,239 @@ private:
+    unsigned unarmed_seq_;          /* v4bw: that byte (0x10000 = none) */
+    bool turn_seen_;                /* v4bw: the other side answered our last byte with a byte of its own */
+ 
++
++public:
++   /* ===== v5ir: infrared (see HB_IR_LEN) ===== */
++   virtual void irWrite(unsigned long abs, bool ds, unsigned char val)
++   {
++      uint64_t t = irTime(abs, ds);
++      bool act = (val & 0xC0) == 0xC0 || (val & 1);
++      unsigned char led = val & 1;
++      bool changed = act != ir_act_ || led != ir_led_;
++      ir_act_ = act; ir_led_ = led;
++      if (!act) ir_reading_ = false;
++      if (!irLinked()) return;
++      if (!act) {
++         if (changed) { irReport(t, 0); irEnd("self-off"); ir_ps_ok_ = false; }
++         return;
++      }
++      if (changed) tr("ir-tx", led, act, (unsigned)t);
++      if (changed || t - ir_last_rep_ >= ir_lag_ / 4) irReport(t, 0);
++   }
++   virtual bool irRead(unsigned long abs, bool ds)
++   {
++      uint64_t t = irTime(abs, ds);
++      if (!irLinked() || !ir_act_) return false;
++      ir_last_rd_any_ = t;
++      if (!ir_reading_) { ir_reading_ = true; irReport(t, 0); }   /* tell the other side we listen now */
++      else if (!ir_act_sent_) irReport(t, 0);   /* port was turned on before the room linked */
++      if (ir_map_ != 2) {
++         /* meet only a Game Boy that listens too: a port left on in a menu (Pokemon Pinball after a
++          * send) must not freeze this one at the meeting point */
++         if (!ir_pact_ || !ir_pread_) return false;
++         if (!irBarrier(t)) return false;
++      }
++      uint64_t need = t > ir_lag_ ? t - ir_lag_ : 0;
++      irApply(need);
++      if (ir_map_ != 2) return false;
++      if (irFrontier() < (int64_t)need) {
++         irReport(t, 0);                 /* tell the other side where this one waits */
++         ++ir_waits_;
++         unsigned long w0 = now_ms();
++         unsigned long deadline = now_ms() + HB_IR_WAIT_MS;
++         for (;;) {
++            poll_fn_();
++            irApply(need);
++            if (ir_map_ != 2) return false;
++            if (irFrontier() >= (int64_t)need) { if (now_ms() - w0 >= 20) tr("ir-waited", (unsigned)(now_ms() - w0), 0, (unsigned)t); break; }
++            if (!irLinked()) { irEnd("left"); return false; }
++            if (now_ms() > deadline) { irEnd("wait-timeout"); return false; }
++            irRefresh();
++            sleep_us(100);
++         }
++      }
++      /* the receiver keeps seeing a pulse for a short while after it ends (HB_IR_HOLD): the
++       * Mystery Gift role loop polls RP every 260 units and then waits a timer tick, so a
++       * 320-unit hello pulse caught late was gone by its next read and the hello was missed */
++      bool seen = ir_seen_led_ || (ir_off_valid_ && (int64_t)need >= ir_off_at_ && (int64_t)need - ir_off_at_ < (int64_t)ir_hold_);
++      if (seen != ir_last_ret_ || t - ir_last_rd_ > 4096 || ir_rdall_) { tr(seen ? "ir-rd-light" : "ir-rd-dark", 0, 0, (unsigned)t); }
++      ir_last_ret_ = seen; ir_last_rd_ = t;
++      return seen;
++   }
++   virtual void irTick(unsigned long abs, bool ds)
++   {
++      uint64_t t = irTime(abs, ds);
++      if (ir_reading_ && t - ir_last_rd_any_ > HB_IR_IDLE) {
++         ir_reading_ = false;
++         if (irLinked() && ir_act_) irReport(t, 0);
++      }
++      if (ir_map_ == 2 && ir_act_ && irLinked() && t - ir_last_rep_ >= ir_lag_ / 2)
++         irReport(t, 0);
++   }
++   unsigned long irWaits() const { return ir_waits_; }
++   /* a long wait spans many frames: re-read the pad meanwhile so a short press is not lost */
++   void setIrRefresh(void (*fn)(void)) { ir_refresh_ = fn; }
++   bool irSession() const { return ir_map_ == 2; }
++
++private:
++   struct IrEv { uint64_t rt; unsigned char act, led; };
++   bool irLinked() const { return send_fn_ != NULL && peer_ >= 0; }
++   void irReset()
++   {
++      ir_abs_set_ = false; ir_abs_ = 0; ir_ds_ = false; ir_rt_ = 0;
++      ir_act_ = false; ir_led_ = 0; ir_act_sent_ = false; ir_last_rep_ = 0;
++      ir_pact_ = false; ir_prt_ = 0; ir_prt_seen_ = false; ir_pled_ = 0;
++      ir_qh_ = ir_qt_ = 0; ir_map_ = 0; ir_off_ = 0; ir_seen_led_ = false;
++      ir_my_s_ = 0; ir_my_bs_ = 0; ir_bs_ = 0; ir_ps_ok_ = false; ir_ps_rt_ = 0; ir_ps_bs_ = 0;
++      ir_map_pbs_ = 0; ir_t_bs_ = 0; ir_t_ok_ = false; ir_t_rt_ = 0;
++      ir_off_valid_ = false; ir_off_at_ = ir_on_at_ = 0; ir_last_ret_ = false; ir_reading_ = ir_pread_ = false; ir_last_rd_any_ = 0; ir_last_rd_ = 0; ir_backoff_ms_ = 0; ir_waits_ = 0;
++   }
++   uint64_t irTime(unsigned long abs, bool ds)
++   {
++      if (!ir_abs_set_) { ir_abs_set_ = true; ir_abs_ = abs; ir_ds_ = ds; return ir_rt_; }
++      if (abs >= ir_abs_)
++         ir_rt_ += (uint64_t)(abs - ir_abs_) >> (ir_ds_ ? 1 : 0);
++      else if (ir_map_ != 0)
++         irEnd("rewind");               /* a state was loaded: the tie no longer holds */
++      ir_abs_ = abs; ir_ds_ = ds;
++      return ir_rt_;
++   }
++   int64_t irFrontier() const { return (int64_t)ir_prt_ + ir_off_; }
++   void irReport(uint64_t t, unsigned char flags, uint32_t bs = 0, uint32_t ack = 0)
++   {
++      unsigned char p[HB_IR_LEN];
++      p[0] = 'I'; p[1] = flags; p[2] = (ir_act_ ? 1 : 0) | (ir_act_ && ir_reading_ ? 2 : 0); p[3] = ir_led_;
++      for (unsigned i = 0; i < 4; ++i) { p[4+i] = (unsigned char)(bs >> (8*i)); p[8+i] = (unsigned char)(ack >> (8*i)); }
++      for (unsigned i = 0; i < 8; ++i) p[12+i] = (unsigned char)(t >> (8*i));
++      if (!(flags & 2)) {
++         ir_last_rep_ = t;
++         if (ir_act_) ir_act_sent_ = true;
++      }
++      send_fn_(RETRO_NETPACKET_RELIABLE | RETRO_NETPACKET_FLUSH_HINT, p, sizeof(p), (uint16_t)peer_);
++   }
++   void irFold(uint64_t upto)
++   {
++      while (ir_qh_ != ir_qt_ && ir_q_[ir_qh_].rt <= upto) {
++         ir_seen_led_ = ir_q_[ir_qh_].act && ir_q_[ir_qh_].led;
++         ir_qh_ = (ir_qh_ + 1) & (HB_IR_Q - 1);
++      }
++   }
++   void irReceive(const unsigned char *p)
++   {
++      uint32_t bs = 0, ack = 0; uint64_t rt = 0;
++      for (unsigned i = 0; i < 4; ++i) { bs |= (uint32_t)p[4+i] << (8*i); ack |= (uint32_t)p[8+i] << (8*i); }
++      for (unsigned i = 0; i < 8; ++i) rt |= (uint64_t)p[12+i] << (8*i);
++      if (p[1] & 2) {                     /* (client) the host tied its stop to one of ours */
++         if (is_host_ || ack != ir_my_bs_ || ack == 0) return;
++         if (ir_map_ == 1) { ir_t_ok_ = true; ir_t_bs_ = bs; ir_t_rt_ = rt; }
++         else if (ir_map_ == 2 && bs != ir_map_pbs_) irEnd("host-retie");
++         return;
++      }
++      if (ir_prt_seen_ && rt < ir_prt_) {   /* the other side's time went back (state load, restart) */
++         irEnd("peer-rewind"); ir_ps_ok_ = false;
++      }
++      ir_prt_ = rt; ir_prt_seen_ = true; ir_pact_ = (p[2] & 1) != 0; ir_pread_ = (p[2] & 2) != 0; ir_pled_ = p[3] & 1;
++      unsigned next = (ir_qt_ + 1) & (HB_IR_Q - 1);
++      if (next == ir_qh_)                 /* full: should not happen; keep the newest state */
++         ir_qh_ = (ir_qh_ + 1) & (HB_IR_Q - 1);
++      ir_q_[ir_qt_].rt = rt; ir_q_[ir_qt_].act = (p[2] & 1) != 0; ir_q_[ir_qt_].led = p[3] & 1;
++      ir_qt_ = next;
++      if (p[1] & 1) {                     /* the other side stopped at its meeting point */
++         ir_ps_ok_ = true; ir_ps_rt_ = rt; ir_ps_bs_ = bs;
++         if (is_host_ && ir_map_ == 2 && bs != ir_map_pbs_) {
++            /* host: the client stopped again (it had not seen our tie in time): tie our stop to this one */
++            irFold(rt);
++            ir_off_ = (int64_t)ir_my_s_ - (int64_t)rt; ir_map_pbs_ = bs;
++            irReport(ir_my_s_, 2, ir_my_bs_, bs);
++            tr("ir-retie", ir_my_bs_, 0, bs);
++         }
++      }
++      if (!ir_pact_) { ir_ps_ok_ = false; ir_pread_ = false; }
++      if (ir_map_ == 0) {                 /* not tied: only the newest state (and what follows a stop) matters */
++         while (((ir_qh_ + 1) & (HB_IR_Q - 1)) != ir_qt_ && (!ir_ps_ok_ || ir_q_[ir_qh_].rt < ir_ps_rt_)) {
++            ir_seen_led_ = ir_q_[ir_qh_].act && ir_q_[ir_qh_].led;
++            ir_qh_ = (ir_qh_ + 1) & (HB_IR_Q - 1);
++         }
++      }
++   }
++   void irApply(uint64_t need)
++   {
++      while (ir_map_ == 2 && ir_qh_ != ir_qt_ && (int64_t)ir_q_[ir_qh_].rt + ir_off_ <= (int64_t)need) {
++         IrEv &e = ir_q_[ir_qh_];
++         ir_qh_ = (ir_qh_ + 1) & (HB_IR_Q - 1);
++         if ((e.act && e.led) != ir_seen_led_) tr("ir-see", e.act && e.led, 0, (unsigned)(e.rt + ir_off_));
++         if (!ir_seen_led_ && e.act && e.led) ir_on_at_ = (int64_t)e.rt + ir_off_;
++         if (ir_seen_led_ && !(e.act && e.led)) {
++            /* only a long pulse lingers (Pokemon Pinball's pulses are 32-224 units with gaps as short) */
++            ir_off_at_ = (int64_t)e.rt + ir_off_;
++            ir_off_valid_ = ir_off_at_ - ir_on_at_ >= (int64_t)HB_IR_HOLD_MIN;
++         }
++         ir_seen_led_ = e.act && e.led;
++         if (!e.act) { irEnd("peer-off"); return; }
++      }
++   }
++   /* Meeting point. The host decides which two stops belong together: it ties its stop to the
++    * client's latest stop and tells the client (flag 2); the client ties only to that answer while
++    * it is still stopped, so both always use the same pair even when the two stop at once. */
++   bool irBarrier(uint64_t t)
++   {
++      unsigned long n = now_ms();
++      if (ir_backoff_ms_ && n < ir_backoff_ms_) return false;
++      if (ir_map_ == 0) {
++         ir_map_ = 1; ir_my_s_ = t; ir_my_bs_ = ++ir_bs_; ir_t_ok_ = false;
++         irReport(t, 1, ir_my_bs_, 0);
++         tr("ir-stop", ir_my_bs_, 0, 0);
++      }
++      unsigned long deadline = n + HB_IR_BARRIER_MS;
++      for (;;) {
++         if (is_host_ && ir_ps_ok_ && ir_pact_) {
++            ir_off_ = (int64_t)ir_my_s_ - (int64_t)ir_ps_rt_;
++            ir_map_ = 2; ir_map_pbs_ = ir_ps_bs_; ir_backoff_ms_ = 0;
++            irFold(ir_ps_rt_);
++            irReport(ir_my_s_, 2, ir_my_bs_, ir_ps_bs_);
++            tr("ir-tied", ir_my_bs_, 0, ir_map_pbs_);
++            return true;
++         }
++         if (!is_host_ && ir_t_ok_) {
++            ir_off_ = (int64_t)ir_my_s_ - (int64_t)ir_t_rt_;
++            ir_map_ = 2; ir_map_pbs_ = ir_t_bs_; ir_backoff_ms_ = 0; ir_t_ok_ = false;
++            irFold(ir_t_rt_);
++            tr("ir-tied", ir_my_bs_, 0, ir_map_pbs_);
++            return true;
++         }
++         if (!ir_pact_ || !irLinked()) { ir_map_ = 0; tr("ir-stop-off", ir_my_bs_, 0, 0); return false; }
++         if (now_ms() > deadline) { ir_map_ = 0; ir_backoff_ms_ = now_ms() + 300; tr("ir-stop-timeout", ir_my_bs_, 0, 0); return false; }
++         poll_fn_();
++         irRefresh();
++         sleep_us(100);
++      }
++   }
++   void irRefresh()
++   {
++      unsigned long n = now_ms();
++      if (ir_refresh_ && n - ir_refresh_ms_ >= 16) { ir_refresh_ms_ = n; ir_refresh_(); }
++   }
++   void irEnd(const char *why)
++   {
++      if (ir_map_ != 0) tr(why, ir_my_bs_, 0, ir_map_pbs_);
++      ir_map_ = 0; ir_off_ = 0; ir_seen_led_ = false; ir_off_valid_ = false;
++      ir_qh_ = ir_qt_;                    /* drop what is queued */
++   }
++
++   bool ir_abs_set_, ir_ds_, ir_act_, ir_act_sent_, ir_pact_, ir_prt_seen_, ir_seen_led_, ir_ps_ok_;
++   unsigned char ir_led_, ir_pled_;
++   unsigned long ir_abs_, ir_lag_, ir_backoff_ms_, ir_waits_;
++   uint64_t ir_rt_, ir_last_rep_, ir_prt_, ir_my_s_, ir_ps_rt_;
++   int64_t ir_off_;
++   int ir_map_;                          /* 0 = not tied, 1 = waiting at our stop, 2 = tied */
++   uint32_t ir_my_bs_, ir_bs_, ir_ps_bs_, ir_map_pbs_, ir_t_bs_;
++   bool ir_t_ok_;
++   uint64_t ir_t_rt_;
++   bool ir_rdall_, ir_off_valid_, ir_last_ret_, ir_reading_, ir_pread_; uint64_t ir_last_rd_any_; int64_t ir_off_at_, ir_on_at_; unsigned long ir_hold_; uint64_t ir_last_rd_;
++   void (*ir_refresh_)(void); unsigned long ir_refresh_ms_;
++   IrEv ir_q_[HB_IR_Q];
++   unsigned ir_qh_, ir_qt_;
++
+ };
+ 
+ #endif
+diff --git a/libgambatte/libretro/libretro.cpp b/libgambatte/libretro/libretro.cpp
+index 47c92f5bafcb..da822e3ecb4d 100644
+--- a/libgambatte/libretro/libretro.cpp
++++ b/libgambatte/libretro/libretro.cpp
+@@ -1581,9 +1581,17 @@ static void hb_np_msg(const char *text, unsigned frames)
+    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
+ }
+ 
++static void update_input_state(void);
++static void hb_ir_refresh_input(void)   /* v5ir: pad read again during a long IR wait */
++{
++   input_poll_cb();
++   update_input_state();
++}
++
+ static void RETRO_CALLCONV hb_np_start(uint16_t client_id,
+       retro_netpacket_send_t send_fn, retro_netpacket_poll_receive_t poll_receive_fn)
+ {
++   gb_np_serial.setIrRefresh(hb_ir_refresh_input);
+    gb_np_serial.start(client_id, send_fn, poll_receive_fn);
+    apply_serial_mode();
+    if (gb_np_serial.waitingForBoot()) {
+diff --git a/libgambatte/src/gambatte-memory.cpp b/libgambatte/src/gambatte-memory.cpp
+index 8a4414d1191c..6acf7e13dfb8 100644
+--- a/libgambatte/src/gambatte-memory.cpp
++++ b/libgambatte/src/gambatte-memory.cpp
+@@ -168,6 +168,7 @@ void Memory::startSerialTransfer(unsigned long cc, unsigned char data, bool fast
+ 
+ void Memory::checkSerial(unsigned long const cc) {
+ 	if(serial_io_) serial_io_->service(ccBase_+cc,ioamhram_[0x101],ioamhram_[0x102]);
++	if (serial_io_ && isCgb()) serial_io_->irTick(ccBase_ + cc, isDoubleSpeed());   /* Hanbang v5ir */
+ 	// Periodically checks if serial data is received
+ 	if ((serial_io_ != 0) &&
+ 		 ((ioamhram_[0x102] & 0x80) == 0x80) &&
+@@ -618,6 +619,13 @@ unsigned Memory::nontrivial_ff_read(unsigned const p, unsigned long const cc) {
+ 		return ioamhram_[0x141] | lcd_.getStat(ioamhram_[0x145], cc);
+ 	case 0x44:
+ 		return lcd_.getLyReg(cc);
++#ifdef HAVE_NETWORK
++	case 0x56:   /* Hanbang v5ir: the other Game Boy's LED over netplay (bit 1 = 0 when seen) */
++		if (isCgb() && serial_io_ && (ioamhram_[0x156] & 0xC0) == 0xC0
++				&& serial_io_->irRead(ccBase_ + cc, isDoubleSpeed()))
++			return ioamhram_[0x156] & ~0x02u;
++		break;
++#endif
+ 	case 0x69:
+ 		return lcd_.cgbBgColorRead(ioamhram_[0x168] & 0x3F, cc);
+ 	case 0x6B:
+@@ -1099,8 +1107,12 @@ void Memory::nontrivial_ff_write(unsigned const p, unsigned data, unsigned long
+ 
+ 		return;
+ 	case 0x56:
+-		if (isCgb())
++		if (isCgb()) {
+ 			ioamhram_[0x156] = data | 0x3E;
++#ifdef HAVE_NETWORK
++			if (serial_io_) serial_io_->irWrite(ccBase_ + cc, isDoubleSpeed(), data);   /* Hanbang v5ir */
++#endif
++		}
+ 
+ 		return;
+ 	case 0x68:
+diff --git a/libgambatte/src/serial_io.h b/libgambatte/src/serial_io.h
+index 2e71005cb207..d50075b59a59 100644
+--- a/libgambatte/src/serial_io.h
++++ b/libgambatte/src/serial_io.h
+@@ -36,6 +36,11 @@ class SerialIO
+ 		/* Hanbang v4bw: cycles the byte check() just took was already due (0 = on time):
+ 		 * its transfer is started that much earlier */
+ 		virtual unsigned long lateCycles() { return 0; }
++		/* Hanbang v5ir: Game Boy Color infrared port (FF56). abs = ccBase_ + cc, ds = double speed.
++		 * irRead returns true when the other Game Boy's LED is seen (bit 1 then reads 0). */
++		virtual void irWrite(unsigned long abs, bool ds, unsigned char val) { (void)abs; (void)ds; (void)val; }
++		virtual bool irRead(unsigned long abs, bool ds) { (void)abs; (void)ds; return false; }
++		virtual void irTick(unsigned long abs, bool ds) { (void)abs; (void)ds; }
+ };
+ 
+ }

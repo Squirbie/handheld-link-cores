@@ -1,0 +1,6 @@
+# 게임마다 DSperate 같이하기 설정 — 롬 파일 이름(확장자 뺌)<탭>DSPERATE_MP_*=숫자 · DS_WIFI_SKIP=0 … (두 기기 같은 파일 · hb_dsperate_run.sh af361cbe 가 읽음)
+# Sonic Rush: 10/20 코덱스 dssk E0·E1·E2 안 됨 · E3 됨 2번(54.8/54.8장) → 기다리는 시간을 원래 에뮬 값으로(지평선 · hbmp 끔 포함 = E3 그대로)
+Sonic Rush (K)	DSPERATE_MP_HORIZON=0 DSPERATE_MP_HBMP=0 DSPERATE_MP_TIMEOUT_MS=25 DSPERATE_MP_CLIENT_WAIT_MS=25 DSPERATE_MP_STALE_MS=64
+# Super Mario 64 DS: 10/20 04:4x 줄 뺌 — hblink 판(혼자일 땐 무선 몰아 돌기 안 함)이 흰 화면을 막고, 같이할 땐 두 기기가 같게 켜짐(VS 95% 속도)
+# Sonic Rush Adventure: 10/21 20:40 두 기기 시험(DS 2b d2b_sra) — E3 조합으로 레이스 · 각자 조작 됨(54.9/54.9장)
+Sonic Rush Adventure (K)	DSPERATE_MP_HORIZON=0 DSPERATE_MP_HBMP=0 DSPERATE_MP_TIMEOUT_MS=25 DSPERATE_MP_CLIENT_WAIT_MS=25 DSPERATE_MP_STALE_MS=64

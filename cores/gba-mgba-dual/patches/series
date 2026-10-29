@@ -1,0 +1,20 @@
+# Apply in this order (git apply or patch -p1)
+0001-gba-sio-cooperative-lockstep-savestate-exactness.patch
+0002-gba-sio-lockstep-int32-cycle-wrap.patch
+0003-gba-audio-savestate-mix-roundtrip.patch
+0004-gba-audio-decoded-psg-savestate.patch
+0005-gba-audio-restore-master-enable.patch
+0006-libretro-add-mgba-dual-core.patch
+0007-dual-p2-save-name-inside-archive.patch
+0008-gba-io-restore-rcnt-link-pins-on-load.patch
+0009-dual-p2-save-without-atomic-rename.patch
+0010-gba-sio-clock-selection-and-unprepared-peers.patch
+0011-gba-rollback-vram-contention-and-sio-events.patch
+0012-dual-link-off-single-gba.patch
+0013-dual-screen-file-runtime-selection.patch
+0014-dual-guest-own-save.patch
+0015-dual-ownsave-harden.patch
+0016-gba-sio-link-timing-sd-and-start-bit.patch
+0017-dual-zero-current-samples-in-link-states.patch
+0018-dual-pair-game-different-rom-for-2p.patch
+0019-dual-singlepak-2p-without-cartridge.patch

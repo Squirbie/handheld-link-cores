@@ -1,0 +1,57 @@
+Subject: Gambatte: answer 00, not FF, when the peer is there but not listening (v5irh)
+Series-Step: 3/5 (gambatte link v5irh3)
+Origin: hanbang (this project); record name hanbang_gb_v5irh_from_v5ir.diff
+요약: 듣지 않는 상대에게 보낸 바이트(엇갈림 · 듣지 않음)에 FF 대신 00 으로 답함 — 실제 케이블처럼. 햄스터 파라다이스 햄 레이스가 "케이블 없음"으로 끊기던 것.
+
+A Game Boy that is there but not shifting gives 0 bits on a cable (only a missing Game Boy reads FF). Hamster
+Paradise starts both Game Boys as masters sending FA every frame and drops the race on an FF ("cable not connected"),
+while Monster Capsule GB only looks for $61/$62 here, so 00 does what FF did for it. Applies to the host-first
+resolution of crossed bytes (client side) and to the "not listening" answer.
+
+---
+diff --git a/libgambatte/libretro/hb_netpacket_serial.h b/libgambatte/libretro/hb_netpacket_serial.h
+index de00377e2484..9186a7e416d7 100644
+--- a/libgambatte/libretro/hb_netpacket_serial.h
++++ b/libgambatte/libretro/hb_netpacket_serial.h
+@@ -413,10 +413,15 @@ public:
+                 * the client's byte for when it listens. (v4bv gave each the other's byte, and
+                 * two Game Boys retrying a call on the same beat crossed every time: Monster
+                 * Capsule GB '통신 준비가 되어 있지 않습니다'.) */
++               /* v5irh: 00, not FF: the client had not started yet and a Game Boy whose port
++                * is off gives 0 bits on a cable (SameBoy's link model; FF is only for no Game
++                * Boy at all). Hamster Paradise starts both Game Boys as masters sending FA every
++                * frame and drops the race on an FF ('케이블이 연결되어 있지 않습니다'); Monster
++                * Capsule GB only looks for $61 here, so 00 does what FF did. */
+                if (!is_host_) {
+-                  put('R', u.seq, 0xFF, 128, 0);
++                  put('R', u.seq, 0x00, 128, 0);
+                   u.type = 0;
+-                  tr("crossQ-ff", u.seq, u.data, seq);
++                  tr("crossQ-00", u.seq, u.data, seq);
+                } else if (!crossed) {
+                   crossed = true;
+                   tr("crossQ-keep", u.seq, u.data, seq);
+@@ -626,7 +631,11 @@ private:
+    void drop_used() { while (head_ != tail_ && q_[head_].type != 'Q') head_ = (head_ + 1) & (HB_NP_QUEUE - 1); }
+    /* v4bw: a byte the other Game Boy clocked out while this one is not listening (SC not armed
+     * for an external clock) gets FF back once this side ran HB_NP_UNARMED cycles past when it
+-    * was due (or first seen), as on a cable, instead of holding the sender up to HB_NP_TIMEOUT_MS. */
++    * was due (or first seen), as on a cable, instead of holding the sender up to HB_NP_TIMEOUT_MS.
++    * v5irh: 00 instead of FF: a Game Boy that is there but not shifting gives 0 bits (SameBoy's
++    * link model; only a missing one reads FF, see send()). Hamster Paradise's master took the FF
++    * for '케이블이 연결되어 있지 않습니다' while the other one still waited its random 8 to 39
++    * frames or had just switched back to master. Monster Capsule GB compares with $61/$62 only. */
+    void unarmed(unsigned long cycles, unsigned char sc)
+    {
+       if (!active())
+@@ -648,8 +657,8 @@ private:
+       }
+       if (cycles >= unarmed_from_ && cycles - unarmed_from_ >= HB_NP_UNARMED) {
+          clock_ = cycles;
+-         put('R', u.seq, 0xFF, 128, 0);
+-         tr("unarmedFF", u.seq, u.data, (unsigned)(cycles - unarmed_from_));
++         put('R', u.seq, 0x00, 128, 0);
++         tr("unarmed00", u.seq, u.data, (unsigned)(cycles - unarmed_from_));
+          head_ = (head_ + 1) & (HB_NP_QUEUE - 1);
+          unarmed_seq_ = 0x10000;
+       }

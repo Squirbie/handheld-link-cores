@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# KNULLI service: at boot, runs /userdata/system/claude/hb_dsmac.py once. Only when the card moved to another device
+# (the Wi-Fi MAC changed) does it give the DS firmware that device's own MAC. Details at the top of hb_dsmac.py.
+# Enable: add "hb_dsmac" to system.services in /userdata/system/knulli.conf (S99userservices starts it at boot).
+# Disable: remove that word and reboot. Install this file as /userdata/system/services/hb_dsmac
+case "$1" in
+  start|"")
+    ( python3 /userdata/system/claude/hb_dsmac.py >> /tmp/hb_dsmac.log 2>&1 ) < /dev/null &
+    ;;
+  stop)
+    ;;
+esac
+exit 0

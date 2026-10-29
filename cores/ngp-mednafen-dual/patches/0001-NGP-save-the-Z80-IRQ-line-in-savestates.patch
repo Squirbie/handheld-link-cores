@@ -1,0 +1,37 @@
+From 6d9cdc0324aef68e261cae6d40221da5150eec9b Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Wed, 21 Oct 2026 23:33:15 +0900
+Subject: [PATCH 1/4] NGP: save the Z80 IRQ line in savestates
+
+z80_ops.c iline was not part of the state, so after loading a state the
+Z80 could take a different path (seen as rollback/netplay mismatches in
+SNK vs. Capcom after a few minutes). Add it to the Z80 section.
+
+---
+ mednafen/ngp/Z80_interface.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/mednafen/ngp/Z80_interface.c b/mednafen/ngp/Z80_interface.c
+index a93d23e..120c49a 100644
+--- a/mednafen/ngp/Z80_interface.c
++++ b/mednafen/ngp/Z80_interface.c
+@@ -25,6 +25,7 @@
+ #include "../state.h"
+ 
+ static uint8_t CommByte;
++extern int iline; /* z80_ops.c */
+ static bool Z80Enabled;
+ 
+ int z80_state_action(void *data, int load, int data_only, const char *section_name)
+@@ -56,6 +57,8 @@ int z80_state_action(void *data, int load, int data_only, const char *section_na
+ 
+       { &((z80_tstates)), sizeof((z80_tstates)), 0x80000000, "z80_tstates" },
+       { &((last_z80_tstates)), sizeof((last_z80_tstates)), 0x80000000, "last_z80_tstates" },
++      /* 한방: Z80 IRQ 선(z80_ops.c iline)도 — 없으면 불러온 뒤 Z80 이 다르게 돌아 넷플레이 · 되감기가 어긋남 */
++      { &(iline), sizeof(iline), 0x80000000, "iline" },
+ 
+       { 0, 0, 0, 0 }
+    };
+-- 
+2.39.5
+

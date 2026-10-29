@@ -1,0 +1,159 @@
+Subject: gpSP: RFU: wait and poll less while a peer answers (v3)
+Series-Step: 3/3 (gpsp rfu v3)
+Origin: hanbang (this project); record name rfu_v3.patch (on top of v2)
+요약: 교환 · 배틀 중 프레임이 끊기고 느려지던 것을 줄임 — 기다리는 동안 받기(poll)를 1/8 프레임마다만, 리더 "응답 없음" 기다림 상한 2.8ms, 손님 줄이 2개 이상 밀리면 한 프레임에 2개까지 넘겨 따라잡기.
+
+After v2 the remaining slowness came from the leader being held back by up to 1.2 s and the client queue never draining
+(the leader sends one packet per frame, the client consumed one per frame, so a queue built up by a stall stayed).
+- while waiting, netpacket_poll_receive() is called once per 1/8 frame (RFU_POLL_CYCLES) and once when the wait starts,
+  instead of on every CPU event (about 600 socket reads per frame on a client).
+- the leader's "no response" wait is capped at 1/360 s (RFU_RESP_CAP_CYCLES, or the game's value if shorter).
+- when two or more packets are queued on the client side it hands over up to two per frame (RFU_CLIENT_CATCHUP_Q);
+  no packet is dropped.
+Optional HB_STATS counters (compiled out by default). Wire format and version string unchanged, so v1/v2/stock cores
+still connect.
+
+---
+diff --git a/rfu.c b/rfu.c
+index ea3ebb425dcb..a87fabb37277 100644
+--- a/rfu.c
++++ b/rfu.c
+@@ -70,6 +70,25 @@
+ #define RFU_PEER_Q_MAX               10   // 약 170ms 분량
+ #endif
+ #define RFU_QINFO_TAG        0x51000000   // 넷째 칸 표시('Q'). 0 이면 줄 길이 정보 없음
++// ---- 한방 v3 (10/25): 기다림 줄이기 ----
++// 7) 기다리는 동안 레트로아크 받기(poll)를 CPU 이벤트마다(프레임당 수백 번) 부르지 않고
++//    이 사이클마다 한 번(+기다림 시작 때 한 번)만 부른다. 한 프레임의 에뮬은 실제로 몇 ms 안에
++//    끝나서, 그 안에 새 패킷이 올 일은 거의 없다. 수백 번 부르면 기기 CPU 만 쓴다.
++#ifndef RFU_POLL_CYCLES
++#define RFU_POLL_CYCLES   (16777216 / 60 / 8)   // 1/8 프레임
++#endif
++// 8) 리더가 손님 답이 줄에 없을 때 '응답 없음'으로 넘기기 전 기다리는 에뮬 시간의 상한.
++//    0 이면 게임 값 그대로(v2). 실제 시간으로는 이 기다림 동안 답이 올 수 없으므로(에뮬이 실제보다
++//    수십 배 빨리 돎) 기다린 만큼 게임만 멈춘다.
++#ifndef RFU_RESP_CAP_CYCLES
++#define RFU_RESP_CAP_CYCLES (16777216 / 60 / 6)   // 약 2.8ms (게임 값이 더 짧으면 게임 값)
++#endif
++// 9) 손님 줄이 이만큼 밀려 있으면 한 프레임에 2개까지 넘겨 따라잡는다(0 이면 늘 1개, v2).
++//    v2 는 한 번 밀린 줄이 안 빠져서(들어오는 만큼만 나감) 손님이 늘 몇 프레임 늦었다.
++//    10/25 VM 시험: 깨끗한 연결에서 두 쪽 줄 합 4.5 → 1.2 프레임, 흔들림에서 리더가 붙잡힌 시간 절반.
++#ifndef RFU_CLIENT_CATCHUP_Q
++#define RFU_CLIENT_CATCHUP_Q 2
++#endif
+ 
+ 
+ // Unpacks big endian integers used for signaling
+@@ -202,6 +221,16 @@ static struct {
+ 
+ // 이번 프레임에 손님 게임에 넘긴 리더 패킷 수
+ static u32 rfu_client_events;
++static u32 rfu_poll_acc;     // v3: 지난 받기 뒤 흐른 사이클
++
++#ifdef HB_STATS
++struct hb_rfu_stats_t { u32 waits, wait_cycles, ev_data, ev_noresp, ev_timeout, ev_disc, hold_cycles,
++                        recv_cmds, send_cmds, hq, cq, peerq, state, unacked; };
++struct hb_rfu_stats_t hb_rfu_stats;
++#define HBS(x) do { x; } while (0)
++#else
++#define HBS(x) do { } while (0)
++#endif
+ 
+ typedef struct {
+   u8 valid;
+@@ -501,6 +530,7 @@ static s32 rfu_process_command() {
+ 
+   case RFU_CMD_SEND_DATAW:
+   case RFU_CMD_SEND_DATA:
++    HBS(hb_rfu_stats.send_cmds++);
+     if (!rfu_plen)
+       return 0;
+ 
+@@ -546,6 +576,7 @@ static s32 rfu_process_command() {
+     break;
+ 
+   case RFU_CMD_RECV_DATA:
++    HBS(hb_rfu_stats.recv_cmds++);
+     if (rfu_state == RFU_STATE_HOST) {
+       // Receive data from clients
+       u32 cnt = 0, bufbytes = 0;
+@@ -632,7 +663,9 @@ static s32 rfu_process_command() {
+ static bool rfu_data_avail() {
+   if (rfu_state == RFU_STATE_CLIENT) {
+     // 손님: 이번 프레임 몫(1개)을 아직 안 넘겼을 때만
+-    if (rfu_client.qcount && rfu_client_events < RFU_CLIENT_PER_FRAME)
++    if (rfu_client.qcount && (rfu_client_events < RFU_CLIENT_PER_FRAME ||
++        (RFU_CLIENT_CATCHUP_Q && rfu_client.qcount >= RFU_CLIENT_CATCHUP_Q &&
++         rfu_client_events < RFU_CLIENT_PER_FRAME + 1)))
+       return true;
+   }
+   else if (rfu_state == RFU_STATE_HOST) {
+@@ -741,8 +774,12 @@ u32 rfu_transfer(u32 sent_value) {
+     // and reverse the clock roles (the RFU becomes master).
+     if (rfu_cmd == RFU_CMD_WAIT || rfu_cmd == RFU_CMD_RTX_WAIT || rfu_cmd == RFU_CMD_SEND_DATAW) {
+       rfu_comstate = RFU_COMSTATE_WAITEVENT;
++      HBS(hb_rfu_stats.waits++);
+       rfu_timeout_cycles = MAX(rfu_timeout * (16777216 / 60), RFU_NET_TIMEOUT_CYCLES);
+       rfu_resp_timeout = MAX(rfu_rtx_max * (16777216 / 60 / 6), RFU_RESP_WAIT_CYCLES);
++      if (RFU_RESP_CAP_CYCLES)
++        rfu_resp_timeout = MIN(rfu_resp_timeout, RFU_RESP_CAP_CYCLES);
++      rfu_poll_acc = RFU_POLL_CYCLES;   // 기다림 시작: 바로 한 번 받음
+     } else {
+       rfu_comstate = rfu_plen ? RFU_COMSTATE_RESPDAT : RFU_COMSTATE_WAITCMD;
+     }
+@@ -778,6 +815,9 @@ u32 rfu_transfer(u32 sent_value) {
+ 
+ // Gets called every frame for basic device updates.
+ void rfu_frame_update() {
++  HBS(hb_rfu_stats.hq = rfu_host.clients[0].qcount; hb_rfu_stats.cq = rfu_client.qcount;
++      hb_rfu_stats.peerq = rfu_host.clients[0].peer_q; hb_rfu_stats.state = rfu_state;
++      hb_rfu_stats.unacked = rfu_host.clients[0].sent - rfu_host.clients[0].acked);
+   rfu_client_events = 0;   // 손님: 새 프레임이니 다시 1개 넘길 수 있음
+   // If device is in reset state, do nothing really.
+   if (rfu_comstate != RFU_COMSTATE_RESET) {
+@@ -1011,9 +1051,15 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+ // Account for consumed cycles and return if a serial IRQ should be raised.
+ bool rfu_update(unsigned cycles) {
+   if (rfu_comstate == RFU_COMSTATE_WAITEVENT) {
++    HBS(hb_rfu_stats.wait_cycles += cycles);
++    HBS(if (rfu_state == RFU_STATE_HOST && !rfu_resp_timeout && (rfu_net_backlogged() || rfu_net_wait_peer())) hb_rfu_stats.hold_cycles += cycles);
+     // Force receive packets so that we can perhaps abort the wait
+     // This helps minimize latency (othweise we need to wait a full frame!)
+-    netpacket_poll_receive();
++    rfu_poll_acc += cycles;
++    if (rfu_poll_acc >= RFU_POLL_CYCLES) {
++      rfu_poll_acc = 0;
++      netpacket_poll_receive();
++    }
+ 
+     // Check if we are running our of time to respond.
+     rfu_timeout_cycles -= MIN(cycles, rfu_timeout_cycles);
+@@ -1030,10 +1076,12 @@ bool rfu_update(unsigned cycles) {
+         rfu_plen = 3;
+         rfu_comstate = RFU_COMSTATE_WAITRESP;
+         RFU_DEBUG_LOG("Wait command resp: disconnect\n");
++        HBS(hb_rfu_stats.ev_disc++);
+       }
+       else if ((rfu_state != RFU_STATE_HOST || !rfu_net_wait_peer() || !rfu_timeout_cycles) &&
+                rfu_data_avail()) {
+         // Some event is available!
++        HBS(hb_rfu_stats.ev_data++);
+         // (v2 리더: 느린 손님의 패킷을 기다리는 중이면 다른 손님 패킷이 있어도 아직 안 알림)
+         rfu_buf[0] = 0x99660000 | RFU_CMD_RESP_DATA;
+         rfu_buf[1] = 0x80000000;
+@@ -1054,6 +1102,7 @@ bool rfu_update(unsigned cycles) {
+                 !rfu_timeout_cycles)) {
+         // We "retransmitted" the message N times (not really, but the equivalent
+         // time has elapsed) and we simulate a lack of client response.
++        HBS(hb_rfu_stats.ev_noresp++);
+         // (v2: 와이파이가 크게 밀려 있거나 느린 손님을 기다리면 1.2초까지 더 기다린 뒤 여기로 옴)
+         if (!rfu_timeout_cycles) {
+           // 1.2초 동안 아무 답이 없었음: 손님 줄 길이 정보는 오래된 것이니 지움
+@@ -1070,6 +1119,7 @@ bool rfu_update(unsigned cycles) {
+       }
+       else if (!rfu_timeout_cycles) {
+         // We ran out of time, just return an "error" code
++        HBS(hb_rfu_stats.ev_timeout++);
+         rfu_buf[0] = 0x99660000 | RFU_CMD_RESP_TIMEO;
+         rfu_buf[1] = 0x80000000;
+         rfu_cnt = 0;

@@ -1,0 +1,1697 @@
+From 1f6e5981a54d17da07a62385262290c0deb123e3 Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Wed, 21 Oct 2026 23:33:15 +0900
+Subject: [PATCH 2/4] NGP Dual: link cable for two consoles in one core
+
+- mednafen/ngp/hb_link.c: when hb_link_on, emulate serial channel 0
+  (SC0BUF/SC0CR/SC0MOD/BR0CR, 0xB2 RTS, CTS handshake, INTRX0=0x6FE4,
+  INTTX0=0x6FE8) and implement the BIOS COM calls on the BIOS work RAM
+  rings used by the games own SIO handlers (0x6C80/0x6CC0/0x6D00..06).
+  RTC reads a base time + emulated cycles (in the state) instead of the
+  host clock. Off by default: identical to upstream NeoPop.
+- libretro.c: line-stepping API (hb_ngp_*) and save name/fallback/write
+  control for the second console.
+- dual/: Beetle NeoPop Dual wrapper (two inner copies renamed with
+  objcopy, line-interleaved, fixed-size state, 1P/2P screen option).
+
+---
+ Makefile.common          |   1 +
+ dual/Makefile.dual       |  73 ++++
+ dual/libretro_dual.c     | 726 +++++++++++++++++++++++++++++++++++++++
+ dual/link_dual.T         |   4 +
+ libretro.c               | 143 +++++++-
+ mednafen/ngp/biosHLE.c   |   8 +
+ mednafen/ngp/hb_link.c   | 383 +++++++++++++++++++++
+ mednafen/ngp/hb_link.h   |  53 +++
+ mednafen/ngp/interrupt.c |   6 +
+ mednafen/ngp/mem.c       |  25 ++
+ mednafen/ngp/rtc.c       |  11 +
+ mednafen/ngp/system.c    |  12 +
+ 12 files changed, 1443 insertions(+), 2 deletions(-)
+ create mode 100644 dual/Makefile.dual
+ create mode 100644 dual/libretro_dual.c
+ create mode 100644 dual/link_dual.T
+ create mode 100644 mednafen/ngp/hb_link.c
+ create mode 100644 mednafen/ngp/hb_link.h
+
+diff --git a/Makefile.common b/Makefile.common
+index b61e812..75a3404 100644
+--- a/Makefile.common
++++ b/Makefile.common
+@@ -18,6 +18,7 @@ SOURCES_CXX += \
+ 
+ SOURCES_C += \
+ 	$(CORE_EMU_DIR)/biosHLE.c \
++	$(CORE_EMU_DIR)/hb_link.c \
+ 	$(CORE_EMU_DIR)/bios.c \
+ 	$(CORE_EMU_DIR)/flash.c \
+ 	$(CORE_EMU_DIR)/dma.c \
+diff --git a/dual/Makefile.dual b/dual/Makefile.dual
+new file mode 100644
+index 0000000..4280bc2
+--- /dev/null
++++ b/dual/Makefile.dual
+@@ -0,0 +1,73 @@
++# Beetle NeoPop Dual 빌드(한방 10/21) — VM hbbuild(Debian 12 aarch64, gcc 12)에서:
++#   nice -n 19 make -j1 -f dual/Makefile.dual [GIT_VERSION=" abcd1234"]
++# 결과(build_dual/):
++#   mednafen_ngp_dual_libretro.so  두 대 코어(기기용, retro_* 만 내보냄)
++#   mednafen_ngp_hb_libretro.so    안쪽 코어 한 대짜리(시험용 — 연결 꺼짐 = 원래 NeoPop 동작)
++# 방법: 안쪽 오브젝트를 한 번 컴파일 → ld -r 로 하나 → objcopy 로 전역 이름 전부에 ngpA_/ngpB_ 를 붙인 두 벌
++#       (C++ 이름도 그대로 되므로 #define 앞붙이기보다 단순) → 래퍼와 묶음. libstdc++ · libgcc_s 는 기기 순정 코어처럼 동적(정적이면 GLIBC 2.35~2.36 기호가 딸려 옴).
++CC  ?= gcc
++CXX ?= g++
++B   := build_dual
++ARCH_FLAGS ?= -mcpu=cortex-a53
++GIT_VERSION ?=
++DEFS := -DNDEBUG -DWANT_16BPP -DFRONTEND_SUPPORTS_RGB565 -DLOAD_FROM_MEMORY -DMEDNAFEN_VERSION_NUMERIC=931 \
++        -DSTDC_HEADERS -D__STDC_LIMIT_MACROS -D__LIBRETRO__ -DINLINE=inline '-DGIT_VERSION=" $(strip $(GIT_VERSION))"'
++INCS := -I. -Imednafen -Imednafen/include -Imednafen/intl -Imednafen/hw_sound -Imednafen/hw_cpu -Imednafen/hw_misc -Ilibretro-common/include
++CFLAGS_ALL   := -O2 -fPIC $(ARCH_FLAGS) $(DEFS) $(INCS) -w
++CXXFLAGS_ALL := $(CFLAGS_ALL)
++
++CORE_EMU := mednafen/ngp
++SRC_CXX := $(CORE_EMU)/sound.cpp $(CORE_EMU)/T6W28_Apu.cpp mednafen/sound/Blip_Buffer.cpp mednafen/mempatcher.cpp mednafen/sound/Stereo_Buffer.cpp
++SRC_C := $(CORE_EMU)/biosHLE.c $(CORE_EMU)/hb_link.c $(CORE_EMU)/bios.c $(CORE_EMU)/flash.c $(CORE_EMU)/dma.c $(CORE_EMU)/gfx.c \
++  $(CORE_EMU)/interrupt.c $(CORE_EMU)/mem.c $(CORE_EMU)/rom.c $(CORE_EMU)/system.c \
++  $(CORE_EMU)/TLCS-900h/TLCS900h_interpret.c $(CORE_EMU)/TLCS-900h/TLCS900h_interpret_dst.c \
++  $(CORE_EMU)/TLCS-900h/TLCS900h_interpret_reg.c $(CORE_EMU)/TLCS-900h/TLCS900h_interpret_single.c \
++  $(CORE_EMU)/TLCS-900h/TLCS900h_interpret_src.c $(CORE_EMU)/TLCS-900h/TLCS900h_registers.c \
++  mednafen/hw_cpu/z80-fuse/z80_ops.c mednafen/hw_cpu/z80-fuse/z80.c $(CORE_EMU)/rtc.c $(CORE_EMU)/Z80_interface.c \
++  mednafen/state.c libretro.c \
++  libretro-common/streams/file_stream.c libretro-common/compat/fopen_utf8.c libretro-common/compat/compat_strl.c \
++  libretro-common/compat/compat_snprintf.c libretro-common/encodings/encoding_utf.c libretro-common/vfs/vfs_implementation.c \
++  libretro-common/file/file_path.c libretro-common/time/rtime.c libretro-common/string/stdstring.c \
++  libretro-common/compat/compat_posix_string.c mednafen/settings.c
++
++# 시험용: 원래 소스(139fe34)로 같은 옵션 한 대짜리를 만들 때 EXCLUDE=mednafen/ngp/hb_link.c
++EXCLUDE ?=
++SRC_C := $(filter-out $(EXCLUDE),$(SRC_C))
++
++OBJ := $(patsubst %.c,$(B)/o/%.o,$(SRC_C)) $(patsubst %.cpp,$(B)/o/%.o,$(SRC_CXX))
++
++all: $(B)/mednafen_ngp_dual_libretro.so $(B)/mednafen_ngp_hb_libretro.so
++
++$(B)/o/%.o: %.c
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS_ALL) -c -o $@ $<
++
++$(B)/o/%.o: %.cpp
++	@mkdir -p $(dir $@)
++	$(CXX) $(CXXFLAGS_ALL) -c -o $@ $<
++
++$(B)/inner_all.o: $(OBJ) dual/Makefile.dual
++	ld -r --force-group-allocation -o $@ $(OBJ)
++
++# 안쪽 전역 이름(약한 이름 · C++ 템플릿 포함) 전부에 ngpA_/ngpB_ 를 붙임 — COMDAT 묶음 이름도 바뀌어
++# 두 벌이 서로 합쳐지지 않음. 최종 .so 는 판 스크립트로 retro_* 만 밖에 보임.
++$(B)/inner_%.o: $(B)/inner_all.o dual/Makefile.dual
++	nm -g --defined-only $< | awk 'NF==3 {print $$3}' | sort -u | awk '{print $$1" ngp$*_"$$1}' > $(B)/rename_$*.txt
++	objcopy --redefine-syms=$(B)/rename_$*.txt $< $@
++
++$(B)/dual_wrapper.o: dual/libretro_dual.c mednafen/ngp/hb_link.h
++	@mkdir -p $(B)
++	$(CC) $(CFLAGS_ALL) -c -o $@ $<
++
++$(B)/mednafen_ngp_dual_libretro.so: $(B)/dual_wrapper.o $(B)/inner_A.o $(B)/inner_B.o
++	$(CXX) -shared -o $@ $^ -Wl,--version-script=dual/link_dual.T -Wl,--no-undefined -lm
++	strip --strip-unneeded $@
++
++$(B)/mednafen_ngp_hb_libretro.so: $(OBJ)
++	$(CXX) -shared -o $@ $(OBJ) -Wl,--version-script=link.T -Wl,--no-undefined -lm
++	strip --strip-unneeded $@
++
++clean:
++	rm -rf $(B)
++
++.PHONY: all clean
+diff --git a/dual/libretro_dual.c b/dual/libretro_dual.c
+new file mode 100644
+index 0000000..e35f347
+--- /dev/null
++++ b/dual/libretro_dual.c
+@@ -0,0 +1,726 @@
++/* Beetle NeoPop Dual — 네오지오 포켓(컬러) 두 대를 한 코어로, 통신 케이블로 이음 (한방 10/21)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * 구조(원더스완 Dual 과 같음):
++ *  - 안쪽 코어(beetle-ngp 139fe34 + hb_link)를 두 번 넣음. 빌드가 안쪽 이름을 ngpA_ / ngpB_ 로 바꿔(objcopy) 전역 변수가 따로인 두 대.
++ *  - 한 장 안에서 두 기계를 '가로 줄 하나씩' 번갈아 돌리고, 줄마다 다 보낸 직렬 바이트를 상대 받기로, 상대 RTS 를 내 CTS 로 넘김.
++ *  - 0번 패드 = 1P 기계(방장), 1번 패드 = 2P 기계(손님). 보이는 화면 · 소리 = ngp_dual_screen(에뮬에는 영향 없음).
++ *  - ngp_dual_link = off 면 2P 기계를 아예 안 돌리고, 1P 는 원래 NeoPop 과 같은 동작(직렬 흉내 꺼짐) = 원래 코어와 같은 그림 · 소리.
++ *  - 세이브: 1P = <세이브 폴더>/<롬 이름>.flash(원래와 같음), 2P = <롬 이름>.p2.flash(없으면 1P 세이브를 읽어 시작).
++ *    화면이 2P(손님 기기)면 두 세이브 모두 쓰지 않음(손님 기기의 1P 기계엔 방장 세이브가 들어 있어서).
++ *  - 상태 = 머리 48 + 기계마다 고정 칸(192KiB, 플래시 세이브 포함 — 크기가 바뀌지 않게 남는 칸은 0).
++ *  - 2P 카트리지: ngp_dual_p2_rom = same(같은 롬) | partner(/tmp/hb_ngp_dual_p2.ngc — 카드 파이터즈 SNK ↔ 캡콤판처럼 다른 판).
++ *    시험용 환경 변수 NGP_DUAL_P2_ROM=<파일> 이 있으면 그 파일.
++ *  - 시험용: NGP_DUAL_TRACE=<파일>(60장마다 넘긴 바이트 · 밖에서 온 상태).
++ */
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include "libretro.h"
++#include "../mednafen/ngp/hb_link.h"
++
++#ifndef GIT_VERSION
++#define GIT_VERSION ""
++#endif
++#define DUAL_VERSION "1.0-hb" GIT_VERSION
++
++#define DUAL_MEMORY_RAM   0x5700  /* +0 1P · +1 2P: RAM 16KiB(0x4000~0x7FFF) */
++#define DUAL_MEMORY_FRAME 0x5720  /* +0 1P · +1 2P: 화면 160×152 RGB565 */
++#define DUAL_MEMORY_STATS 0x5730
++
++#define FB_W 160
++#define FB_H 152
++#define SLOT_SIZE (192 * 1024)
++#define STATE_MAGIC "HBNGPDU1"
++#define STATE_HEADER 48
++#define P2_TMP_ROM "/tmp/hb_ngp_dual_p2.ngc"
++
++#define DECL(P) \
++   void P##retro_set_environment(retro_environment_t); \
++   void P##retro_init(void); \
++   void P##retro_deinit(void); \
++   bool P##retro_load_game(const struct retro_game_info *); \
++   void P##retro_unload_game(void); \
++   void P##retro_reset(void); \
++   void P##hb_ngp_save_config(const char *, const char *, const char *, int); \
++   void P##hb_ngp_set_flash_write(int); \
++   void P##hb_ngp_set_link(int); \
++   void P##hb_ngp_set_cts(int); \
++   void P##hb_ngp_set_rtc_base(int64_t); \
++   void P##hb_ngp_frame_begin(uint8_t); \
++   int P##hb_ngp_run_line(void); \
++   int P##hb_ngp_frame_end(int16_t *, int); \
++   const uint16_t *P##hb_ngp_framebuffer(void); \
++   uint8_t *P##hb_ngp_ram(void); \
++   const struct hb_link_stats *P##hb_ngp_link_stats(void); \
++   size_t P##hb_ngp_serialize(uint8_t *, size_t); \
++   int P##hb_ngp_unserialize(const uint8_t *, size_t); \
++   int P##hb_sio_take(uint8_t *); \
++   void P##hb_sio_receive(uint8_t); \
++   uint8_t P##hb_sio_rts(void);
++DECL(ngpA_)
++DECL(ngpB_)
++
++struct Inner
++{
++   void (*set_environment)(retro_environment_t);
++   void (*init)(void);
++   void (*deinit)(void);
++   bool (*load_game)(const struct retro_game_info *);
++   void (*unload_game)(void);
++   void (*reset)(void);
++   void (*save_config)(const char *, const char *, const char *, int);
++   void (*set_flash_write)(int);
++   void (*set_link)(int);
++   void (*set_cts)(int);
++   void (*set_rtc_base)(int64_t);
++   void (*frame_begin)(uint8_t);
++   int (*run_line)(void);
++   int (*frame_end)(int16_t *, int);
++   const uint16_t *(*framebuffer)(void);
++   uint8_t *(*ram)(void);
++   const struct hb_link_stats *(*link_stats)(void);
++   size_t (*serialize)(uint8_t *, size_t);
++   int (*unserialize)(const uint8_t *, size_t);
++   int (*take)(uint8_t *);
++   void (*receive)(uint8_t);
++   uint8_t (*rts)(void);
++};
++
++#define TAB(P) { P##retro_set_environment, P##retro_init, P##retro_deinit, P##retro_load_game, P##retro_unload_game, \
++   P##retro_reset, P##hb_ngp_save_config, P##hb_ngp_set_flash_write, P##hb_ngp_set_link, P##hb_ngp_set_cts, P##hb_ngp_set_rtc_base, \
++   P##hb_ngp_frame_begin, P##hb_ngp_run_line, P##hb_ngp_frame_end, P##hb_ngp_framebuffer, P##hb_ngp_ram, \
++   P##hb_ngp_link_stats, P##hb_ngp_serialize, P##hb_ngp_unserialize, P##hb_sio_take, P##hb_sio_receive, P##hb_sio_rts }
++
++static const struct Inner inner[2] = { TAB(ngpA_), TAB(ngpB_) };
++
++struct DualStats
++{
++   uint32_t magic, version, frames, linkOn, screen;
++   uint32_t bytes[2];           /* 1P→2P · 2P→1P 넘긴 바이트 */
++   uint32_t maxQueue, drops;    /* 한 줄에 넘긴 최대 바이트 · (안 씀) */
++   uint32_t outsideLoads;       /* 불러온 상태 수 */
++   uint32_t p2Loaded, p2Writes; /* 2P 롬이 다른 판 · 끝낼 때 2P 세이브 쓰기 허용 */
++   struct hb_link_stats m[2];
++};
++
++static retro_environment_t environCallback;
++static retro_video_refresh_t videoCallback;
++static retro_audio_sample_batch_t audioBatchCallback;
++static retro_input_poll_t inputPollCallback;
++static retro_input_state_t inputStateCallback;
++static retro_log_printf_t logCallback;
++static bool useBitmasks;
++
++static int linkOn = 1;           /* 켤 때 정함 */
++static int screen;               /* 0 = 1P, 1 = 2P */
++static const char *language = "english";
++static int p2Partner;            /* 2P 기계가 다른 롬 */
++static void *p2RomData;
++static size_t p2RomSize;
++static char p2RomPath[1024];
++static bool loaded;
++static struct DualStats stats;
++static int16_t soundBuf[2][0x10000];
++static FILE *traceFile;
++
++static void logf_(enum retro_log_level level, const char *fmt, ...)
++{
++   char buf[1024];
++   va_list ap;
++   va_start(ap, fmt);
++   vsnprintf(buf, sizeof(buf), fmt, ap);
++   va_end(ap);
++   if (logCallback)
++      logCallback(level, "[NGP Dual] %s\n", buf);
++   if (traceFile)
++   {
++      fprintf(traceFile, "f=%u %s\n", stats.frames, buf);
++      fflush(traceFile);
++   }
++}
++
++/* 안쪽 코어가 부르는 환경 함수: 옵션 · 입력 설명 · 화면 정보는 래퍼가 맡고, 나머지는 프런트엔드로 */
++static bool innerEnvironment(int m, unsigned cmd, void *data)
++{
++   switch (cmd)
++   {
++      case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION:
++         *(unsigned *)data = 0;
++         return true;
++      case RETRO_ENVIRONMENT_SET_VARIABLES:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
++      case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK:
++      case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
++      case RETRO_ENVIRONMENT_SET_CONTENT_INFO_OVERRIDE:
++      case RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL:
++      case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
++      case RETRO_ENVIRONMENT_SET_GEOMETRY:
++         return true;
++      case RETRO_ENVIRONMENT_GET_VARIABLE:
++      {
++         struct retro_variable *var = (struct retro_variable *)data;
++         if (var && var->key && !strcmp(var->key, "ngp_language"))
++         {
++            var->value = language;   /* 두 기기가 같아야 해서 래퍼가 고정 */
++            return true;
++         }
++         if (var)
++            var->value = NULL;
++         return false;
++      }
++      case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
++         *(bool *)data = false;
++         return true;
++      case RETRO_ENVIRONMENT_GET_GAME_INFO_EXT:
++         if (m == 1 && p2Partner)
++            return false;            /* 2P 가 다른 롬이면 경로 · 데이터로 넘김 */
++         return environCallback ? environCallback(cmd, data) : false;
++      default:
++         return environCallback ? environCallback(cmd, data) : false;
++   }
++}
++
++static bool envA(unsigned cmd, void *data) { return innerEnvironment(0, cmd, data); }
++static bool envB(unsigned cmd, void *data) { return innerEnvironment(1, cmd, data); }
++
++static const char *getVar(const char *key)
++{
++   struct retro_variable var;
++   var.key = key;
++   var.value = NULL;
++   if (environCallback && environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
++      return var.value;
++   return NULL;
++}
++
++static void readScreenOption(void)
++{
++   const char *v = getVar("ngp_dual_screen");
++   int s = (v && !strcmp(v, "2P")) ? 1 : 0;
++   if (s != screen)
++      logf_(RETRO_LOG_INFO, "화면 %dP", s + 1);
++   screen = s;
++   stats.screen = (uint32_t)screen;
++}
++
++static uint8_t readPad(unsigned port)
++{
++   static const unsigned map[7] = {
++      RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_ID_JOYPAD_DOWN, RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_RIGHT,
++      RETRO_DEVICE_ID_JOYPAD_B, RETRO_DEVICE_ID_JOYPAD_A, RETRO_DEVICE_ID_JOYPAD_START,
++   };
++   int16_t ret = 0;
++   uint8_t out = 0;
++   unsigned i;
++   if (useBitmasks)
++      ret = inputStateCallback(port, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
++   else
++      for (i = 0; i <= RETRO_DEVICE_ID_JOYPAD_R3; i++)
++         if (inputStateCallback(port, RETRO_DEVICE_JOYPAD, 0, i))
++            ret |= (int16_t)(1 << i);
++   for (i = 0; i < 7; i++)
++      if (ret & (1 << map[i]))
++         out |= (uint8_t)(1 << i);
++   return out;
++}
++
++static void *readWholeFile(const char *path, size_t *size)
++{
++   FILE *f = fopen(path, "rb");
++   long n;
++   void *buf;
++   if (!f)
++      return NULL;
++   if (fseek(f, 0, SEEK_END) || (n = ftell(f)) <= 0 || fseek(f, 0, SEEK_SET))
++   {
++      fclose(f);
++      return NULL;
++   }
++   buf = malloc((size_t)n);
++   if (buf && fread(buf, 1, (size_t)n, f) != (size_t)n)
++   {
++      free(buf);
++      buf = NULL;
++   }
++   fclose(f);
++   if (buf)
++      *size = (size_t)n;
++   return buf;
++}
++
++/* 세이브 폴더 · 롬 이름(확장자 뺌) — 안쪽 코어와 같은 규칙(GAME_INFO_EXT 이름, 없으면 경로) */
++static void contentBase(const struct retro_game_info *info, char *base, size_t len)
++{
++   struct retro_game_info_ext *ext = NULL;
++   const char *p = NULL, *slash, *dot;
++   base[0] = '\0';
++   if (environCallback && environCallback(RETRO_ENVIRONMENT_GET_GAME_INFO_EXT, &ext) && ext && ext->name)
++   {
++      snprintf(base, len, "%s", ext->name);
++      return;
++   }
++   p = info ? info->path : NULL;
++   if (!p)
++      return;
++   slash = strrchr(p, '/');
++   if (!slash)
++      slash = strrchr(p, '\\');
++   snprintf(base, len, "%s", slash ? slash + 1 : p);
++   dot = strrchr(base, '.');
++   if (dot)
++      base[dot - base] = '\0';
++}
++
++/* ---- libretro API ---- */
++
++unsigned retro_api_version(void)
++{
++   return RETRO_API_VERSION;
++}
++
++void retro_set_environment(retro_environment_t env)
++{
++   /* 메뉴 글씨: 기기 레트로아크 글꼴에 한글이 없을 수 있어 영어(원더스완 Dual 과 같음) */
++   static const struct retro_variable vars[] = {
++      { "ngp_dual_screen", "Screen and sound (host/solo = 1P, guest = 2P); 1P|2P" },
++      { "ngp_dual_link", "2P console on the link cable (off = solo, one console; restart); on|off" },
++      { "ngp_dual_language", "Language (both consoles; restart); english|japanese" },
++      { "ngp_dual_p2_rom", "2P cartridge (partner = other version from /tmp/hb_ngp_dual_p2.ngc; restart); same|partner" },
++      { NULL, NULL },
++   };
++   static const struct retro_system_content_info_override overrides[] = {
++      { "ngp|ngc|ngpc|npc", false, true },
++      { NULL, false, false },
++   };
++   static const struct retro_controller_description pads[] = {
++      { "Neo Geo Pocket", RETRO_DEVICE_JOYPAD },
++   };
++   static const struct retro_controller_info ports[] = {
++      { pads, 1 }, { pads, 1 }, { NULL, 0 },
++   };
++
++   environCallback = env;
++   env(RETRO_ENVIRONMENT_SET_VARIABLES, (void *)vars);
++   env(RETRO_ENVIRONMENT_SET_CONTENT_INFO_OVERRIDE, (void *)overrides);
++   env(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void *)ports);
++   inner[0].set_environment(envA);
++   inner[1].set_environment(envB);
++}
++
++void retro_set_video_refresh(retro_video_refresh_t cb) { videoCallback = cb; }
++void retro_set_audio_sample(retro_audio_sample_t cb) { (void)cb; }
++void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { audioBatchCallback = cb; }
++void retro_set_input_poll(retro_input_poll_t cb) { inputPollCallback = cb; }
++void retro_set_input_state(retro_input_state_t cb) { inputStateCallback = cb; }
++void retro_set_controller_port_device(unsigned port, unsigned device) { (void)port; (void)device; }
++
++void retro_init(void)
++{
++   struct retro_log_callback log;
++   const char *env;
++   logCallback = (environCallback && environCallback(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log)) ? log.log : NULL;
++   useBitmasks = environCallback && environCallback(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL);
++   env = getenv("NGP_DUAL_TRACE");
++   if (env && env[0] && !traceFile)
++      traceFile = fopen(env, "w");
++   inner[0].init();
++   inner[1].init();
++}
++
++void retro_deinit(void)
++{
++   inner[0].deinit();
++   inner[1].deinit();
++   if (traceFile)
++   {
++      fclose(traceFile);
++      traceFile = NULL;
++   }
++}
++
++void retro_get_system_info(struct retro_system_info *info)
++{
++   memset(info, 0, sizeof(*info));
++   info->library_name = "Beetle NeoPop Dual";
++   info->library_version = DUAL_VERSION;
++   info->valid_extensions = "ngp|ngc|ngpc|npc";
++   info->need_fullpath = true;
++   info->block_extract = false;
++}
++
++void retro_get_system_av_info(struct retro_system_av_info *info)
++{
++   memset(info, 0, sizeof(*info));
++   info->timing.fps = 60.25;
++   info->timing.sample_rate = 44100;
++   info->geometry.base_width = FB_W;
++   info->geometry.base_height = FB_H;
++   info->geometry.max_width = FB_W;
++   info->geometry.max_height = FB_H;
++   info->geometry.aspect_ratio = 20.0f / 19.0f;
++}
++
++bool retro_load_game(const struct retro_game_info *info)
++{
++   enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
++   static const struct retro_input_descriptor desc[] = {
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT, "D-Pad Left" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP, "D-Pad Up" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN, "D-Pad Down" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "A" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A, "B" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Option" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT, "D-Pad Left" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP, "D-Pad Up" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN, "D-Pad Down" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "A" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A, "B" },
++      { 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Option" },
++      { 0, 0, 0, 0, NULL },
++   };
++   const char *v, *dir = NULL;
++   char base[1024], fallback[2048];
++   bool host;
++
++   if (!info)
++      return false;
++   environCallback(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
++   environCallback(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void *)desc);
++
++   v = getVar("ngp_dual_link");
++   linkOn = !(v && !strcmp(v, "off"));
++   v = getVar("ngp_dual_language");
++   language = (v && !strcmp(v, "japanese")) ? "japanese" : "english";
++   readScreenOption();
++   host = (screen == 0);
++
++   memset(&stats, 0, sizeof(stats));
++   stats.magic = 0x4E475044; /* 'NGPD' */
++   stats.version = 1;
++   stats.linkOn = (uint32_t)linkOn;
++   stats.screen = (uint32_t)screen;
++
++   /* 1P 기계: 원래 코어와 같은 세이브 이름 */
++   inner[0].save_config("", "", "", host);
++   inner[0].set_link(linkOn);
++   if (!inner[0].load_game(info))
++   {
++      logf_(RETRO_LOG_ERROR, "1P 기계 불러오기 실패");
++      return false;
++   }
++
++   if (linkOn)
++   {
++      struct retro_game_info p2info = *info;
++      const char *p2 = getenv("NGP_DUAL_P2_ROM");
++      v = getVar("ngp_dual_p2_rom");
++      p2Partner = 0;
++      if ((p2 && p2[0]) || (v && !strcmp(v, "partner")))
++      {
++         snprintf(p2RomPath, sizeof(p2RomPath), "%s", (p2 && p2[0]) ? p2 : P2_TMP_ROM);
++         p2RomData = readWholeFile(p2RomPath, &p2RomSize);
++         if (p2RomData)
++         {
++            p2Partner = 1;
++            p2info.path = p2RomPath;
++            p2info.data = p2RomData;
++            p2info.size = p2RomSize;
++            p2info.meta = NULL;
++         }
++         else
++            logf_(RETRO_LOG_WARN, "2P 롬 %s 없음 → 같은 롬", p2RomPath);
++      }
++      stats.p2Loaded = (uint32_t)p2Partner;
++      contentBase(info, base, sizeof(base));
++      fallback[0] = '\0';
++      if (!p2Partner && environCallback(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &dir) && dir && dir[0] && base[0])
++         snprintf(fallback, sizeof(fallback), "%s/%s.flash", dir, base);
++      /* 2P: <롬 이름>.p2.flash, 처음이면 1P 세이브로 시작(같은 롬일 때만) */
++      inner[1].save_config(base, ".p2", fallback, host);
++      inner[1].set_link(1);
++      if (!inner[1].load_game(&p2info))
++      {
++         logf_(RETRO_LOG_ERROR, "2P 기계 불러오기 실패");
++         inner[0].unload_game();
++         return false;
++      }
++   }
++   if (linkOn)
++   {
++      /* 시계: 켤 때 지역 시각 하나를 두 기계에(넷플레이 손님은 방장 상태로 같은 값을 받음) */
++      time_t now = time(NULL);
++      struct tm lt;
++      int64_t base = (int64_t)now;
++      const char *fixed = getenv("NGP_DUAL_RTC_BASE");
++      if (localtime_r(&now, &lt))
++         base += (int64_t)lt.tm_gmtoff;
++      if (fixed && fixed[0])
++         base = (int64_t)strtoll(fixed, NULL, 10);
++      inner[0].set_rtc_base(base);
++      inner[1].set_rtc_base(base);
++   }
++   loaded = true;
++   logf_(RETRO_LOG_INFO, "켬 %s link=%s 화면=%dP 언어=%s 2P롬=%s 상태 기계당 %u 바이트(지금 1P %u)", DUAL_VERSION,
++         linkOn ? "on" : "off", screen + 1, language, p2Partner ? p2RomPath : "same", (unsigned)SLOT_SIZE,
++         (unsigned)inner[0].serialize(NULL, 0));
++   return true;
++}
++
++bool retro_load_game_special(unsigned type, const struct retro_game_info *info, size_t num)
++{
++   (void)type;
++   (void)info;
++   (void)num;
++   return false;
++}
++
++void retro_unload_game(void)
++{
++   int write;
++   if (!loaded)
++      return;
++   readScreenOption();
++   write = (screen == 0);          /* 손님(2P 화면)은 쓰지 않음 */
++   inner[0].set_flash_write(write);
++   inner[0].unload_game();
++   if (linkOn)
++   {
++      inner[1].set_flash_write(write);
++      stats.p2Writes = (uint32_t)write;
++      inner[1].unload_game();
++   }
++   logf_(RETRO_LOG_INFO, "끔 세이브 쓰기=%s 넘긴 바이트 1P->2P %u 2P->1P %u", write ? "예" : "아니오", stats.bytes[0], stats.bytes[1]);
++   free(p2RomData);
++   p2RomData = NULL;
++   loaded = false;
++}
++
++void retro_reset(void)
++{
++   inner[0].reset();
++   if (linkOn)
++      inner[1].reset();
++}
++
++static void transfer(int from)
++{
++   uint8_t byte;
++   uint32_t n = 0;
++   while (inner[from].take(&byte))
++   {
++      inner[!from].receive(byte);
++      stats.bytes[from]++;
++      n++;
++   }
++   if (n > stats.maxQueue)
++      stats.maxQueue = n;
++}
++
++void retro_run(void)
++{
++   bool updated = false;
++   int doneA = 0, doneB = 0, lines = 0, nA, nB = 0, total, shown;
++   const int16_t *snd;
++
++   if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
++      readScreenOption();
++   inputPollCallback();
++
++   inner[0].frame_begin(readPad(0));
++   if (linkOn)
++      inner[1].frame_begin(readPad(1));
++
++   if (!linkOn)
++   {
++      while (!inner[0].run_line() && ++lines < 4096)
++         ;
++   }
++   else
++   {
++      while ((!doneA || !doneB) && ++lines < 4096)
++      {
++         if (!doneA)
++         {
++            inner[0].set_cts(inner[1].rts());
++            doneA = inner[0].run_line();
++            transfer(0);
++         }
++         if (!doneB)
++         {
++            inner[1].set_cts(inner[0].rts());
++            doneB = inner[1].run_line();
++            transfer(1);
++         }
++      }
++   }
++
++   nA = inner[0].frame_end(soundBuf[0], 0x10000);
++   if (linkOn)
++      nB = inner[1].frame_end(soundBuf[1], 0x10000);
++
++   shown = (linkOn && screen == 1) ? 1 : 0;
++   videoCallback(inner[shown].framebuffer(), FB_W, FB_H, FB_W * 2);
++   snd = soundBuf[shown];
++   total = shown ? nB : nA;
++   {
++      int done = 0;
++      while (done < total)
++      {
++         size_t k = audioBatchCallback(snd + done * 2, (size_t)(total - done));
++         if (!k)
++            break;
++         done += (int)k;
++      }
++   }
++
++   stats.frames++;
++   if (traceFile && stats.frames % 60 == 0)
++   {
++      const struct hb_link_stats *a = inner[0].link_stats(), *b = inner[1].link_stats();
++      fprintf(traceFile, "f=%u 넘김 1P->2P %u 2P->1P %u | 1P 보냄 %u 받음 %u 넘침 %u CTS기다림 %u COM %u | 2P 보냄 %u 받음 %u 넘침 %u CTS기다림 %u COM %u | 밖에서온상태 %u\n",
++            stats.frames, stats.bytes[0], stats.bytes[1], a->txBytes, a->rxBytes, a->overruns, a->ctsWaits, a->comCalls,
++            b->txBytes, b->rxBytes, b->overruns, b->ctsWaits, b->comCalls, stats.outsideLoads);
++      fflush(traceFile);
++   }
++}
++
++size_t retro_serialize_size(void)
++{
++   return STATE_HEADER + SLOT_SIZE * (linkOn ? 2 : 1);
++}
++
++static void put32(uint8_t *p, uint32_t v)
++{
++   p[0] = (uint8_t)v;
++   p[1] = (uint8_t)(v >> 8);
++   p[2] = (uint8_t)(v >> 16);
++   p[3] = (uint8_t)(v >> 24);
++}
++
++static uint32_t get32(const uint8_t *p)
++{
++   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++bool retro_serialize(void *data, size_t size)
++{
++   uint8_t *out = (uint8_t *)data;
++   size_t lenA, lenB = 0;
++   if (size < retro_serialize_size())
++      return false;
++   memset(out, 0, STATE_HEADER);
++   memcpy(out, STATE_MAGIC, 8);
++   put32(out + 8, 1);
++   put32(out + 12, (uint32_t)linkOn);
++   put32(out + 16, SLOT_SIZE);
++   lenA = inner[0].serialize(out + STATE_HEADER, SLOT_SIZE);
++   if (!lenA)
++   {
++      logf_(RETRO_LOG_ERROR, "1P 상태가 칸(%u)보다 큼", (unsigned)SLOT_SIZE);
++      return false;
++   }
++   if (linkOn)
++   {
++      lenB = inner[1].serialize(out + STATE_HEADER + SLOT_SIZE, SLOT_SIZE);
++      if (!lenB)
++      {
++         logf_(RETRO_LOG_ERROR, "2P 상태가 칸(%u)보다 큼", (unsigned)SLOT_SIZE);
++         return false;
++      }
++   }
++   put32(out + 20, (uint32_t)lenA);
++   put32(out + 24, (uint32_t)lenB);
++   if (size > retro_serialize_size())
++      memset(out + retro_serialize_size(), 0, size - retro_serialize_size());
++   return true;
++}
++
++bool retro_unserialize(const void *data, size_t size)
++{
++   const uint8_t *in = (const uint8_t *)data;
++   uint32_t lenA, lenB;
++   if (size < STATE_HEADER || memcmp(in, STATE_MAGIC, 8) || get32(in + 8) != 1 || get32(in + 16) != SLOT_SIZE)
++   {
++      logf_(RETRO_LOG_ERROR, "상태 머리가 다름");
++      return false;
++   }
++   if ((int)get32(in + 12) != linkOn)
++   {
++      logf_(RETRO_LOG_ERROR, "상태의 link(%u)가 지금(%d)과 다름", get32(in + 12), linkOn);
++      return false;
++   }
++   if (size < retro_serialize_size())
++      return false;
++   lenA = get32(in + 20);
++   lenB = get32(in + 24);
++   if (!lenA || lenA > SLOT_SIZE || lenB > SLOT_SIZE || (linkOn && !lenB))
++      return false;
++   inner[0].unserialize(in + STATE_HEADER, lenA);
++   if (linkOn)
++      inner[1].unserialize(in + STATE_HEADER + SLOT_SIZE, lenB);
++   stats.outsideLoads++;
++   return true;
++}
++
++void *retro_get_memory_data(unsigned id)
++{
++   switch (id)
++   {
++      case RETRO_MEMORY_SYSTEM_RAM:
++      case DUAL_MEMORY_RAM:
++         return inner[0].ram();
++      case DUAL_MEMORY_RAM + 1:
++         return linkOn ? inner[1].ram() : NULL;
++      case DUAL_MEMORY_FRAME:
++         return (void *)inner[0].framebuffer();
++      case DUAL_MEMORY_FRAME + 1:
++         return linkOn ? (void *)inner[1].framebuffer() : NULL;
++      case DUAL_MEMORY_STATS:
++         memcpy(&stats.m[0], inner[0].link_stats(), sizeof(stats.m[0]));
++         memcpy(&stats.m[1], inner[1].link_stats(), sizeof(stats.m[1]));
++         return &stats;
++   }
++   return NULL;
++}
++
++size_t retro_get_memory_size(unsigned id)
++{
++   switch (id)
++   {
++      case RETRO_MEMORY_SYSTEM_RAM:
++      case DUAL_MEMORY_RAM:
++         return 16384;
++      case DUAL_MEMORY_RAM + 1:
++         return linkOn ? 16384 : 0;
++      case DUAL_MEMORY_FRAME:
++         return FB_W * FB_H * 2;
++      case DUAL_MEMORY_FRAME + 1:
++         return linkOn ? FB_W * FB_H * 2 : 0;
++      case DUAL_MEMORY_STATS:
++         return sizeof(stats);
++   }
++   return 0;
++}
++
++unsigned retro_get_region(void)
++{
++   return RETRO_REGION_NTSC;
++}
++
++void retro_cheat_reset(void) { }
++void retro_cheat_set(unsigned index, bool enabled, const char *code) { (void)index; (void)enabled; (void)code; }
+diff --git a/dual/link_dual.T b/dual/link_dual.T
+new file mode 100644
+index 0000000..9e82b5d
+--- /dev/null
++++ b/dual/link_dual.T
+@@ -0,0 +1,4 @@
++{
++   global: retro_*;
++   local: *;
++};
+diff --git a/libretro.c b/libretro.c
+index ef01e22..5cda70f 100644
+--- a/libretro.c
++++ b/libretro.c
+@@ -79,6 +79,7 @@ static char retro_save_directory[1024];
+ #include "mednafen/ngp/bios.h"
+ #include "mednafen/ngp/flash.h"
+ #include "mednafen/ngp/system.h"
++#include "mednafen/ngp/hb_link.h"
+ 
+ extern uint8 CPUExRAM[16384];
+ 
+@@ -141,6 +142,7 @@ void neopop_reset(void)
+    BIOSHLE_Reset();
+    reset_registers();	/* TLCS900H registers */
+    reset_dma();
++   hb_sio_reset();
+ }
+ 
+ static void extract_basename(char *buf, const char *path, size_t size)
+@@ -323,6 +325,7 @@ void StateAction(StateMem *sm, int load, int data_only)
+    int_timer_StateAction(sm, load, data_only);
+    BIOSHLE_StateAction(sm, load, data_only);
+    FLASH_StateAction(sm, load, data_only);
++   hb_sio_StateAction(sm, load, data_only);
+ 
+    if(load)
+    {
+@@ -789,6 +792,140 @@ size_t retro_get_memory_size(unsigned type)
+    return 0;
+ }
+ 
++
++/* ==================================================================
++ * 한방 두 대 코어(dual/libretro_dual.c)가 부르는 함수 (10/21)
++ * 한 대짜리로 쓸 때(retro_run)는 아무것도 바뀌지 않음.
++ * ================================================================== */
++char hb_save_base[1024];          /* 비어 있지 않으면 세이브 이름을 이것으로(2P 기계) */
++char hb_save_suffix[32];          /* 세이브 이름 뒤에 붙임(2P = ".p2") */
++char hb_flash_fallback[1024];     /* 세이브 파일이 없을 때 대신 읽을 파일(2P 처음 = 1P 세이브) */
++uint8_t hb_flash_write_enabled = 1; /* 0 = 끝낼 때 세이브 파일을 안 씀(손님 기기) */
++extern uint32_t hb_line_seq;
++
++void hb_ngp_save_config(const char *base, const char *suffix, const char *fallback, int writeEnabled)
++{
++   strlcpy(hb_save_base, base ? base : "", sizeof(hb_save_base));
++   strlcpy(hb_save_suffix, suffix ? suffix : "", sizeof(hb_save_suffix));
++   strlcpy(hb_flash_fallback, fallback ? fallback : "", sizeof(hb_flash_fallback));
++   hb_flash_write_enabled = writeEnabled ? 1 : 0;
++}
++
++void hb_ngp_set_flash_write(int enabled)
++{
++   hb_flash_write_enabled = enabled ? 1 : 0;
++}
++
++void hb_ngp_set_link(int on)
++{
++   hb_link_on = on ? 1 : 0;
++}
++
++void hb_ngp_set_cts(int on)
++{
++   hb_link_cts = on ? 1 : 0;
++}
++
++/* 연결 켬일 때 시계 기준(초, 지역 시간을 UTC 로 본 값) — 래퍼가 두 기계에 같은 값을 넣음 */
++void hb_ngp_set_rtc_base(int64_t base)
++{
++   hb_rtc_base = base;
++   hb_rtc_cycles = 0;
++}
++
++/* 한 장 시작: 원래 Emulate 앞부분과 같음 */
++void hb_ngp_frame_begin(uint8_t input)
++{
++   input_buf = input;
++   storeB(0x6F82, *chee);
++   MDFNMP_ApplyPeriodicCheats();
++   ngpc_soundTS = 0;
++}
++
++/* 가로 줄 하나가 끝날 때까지 — 원래 Emulate 고리와 같은 차례(명령 → 시계 → Z80). 장이 끝났으면 1 */
++int hb_ngp_run_line(void)
++{
++   uint32_t seq = hb_line_seq;
++   bool done = false;
++   do
++   {
++      int32 timetime = (uint8)TLCS900h_interpret();
++      done |= updateTimers(surf, timetime);
++      z80_runtime += timetime;
++
++      while(z80_runtime > 0)
++      {
++         int z80rantime = Z80_RunOP();
++
++         if (z80rantime < 0) /* Z80 inactive, so take up all run time! */
++         {
++            z80_runtime = 0;
++            break;
++         }
++
++         z80_runtime -= z80rantime << 1;
++      }
++   } while (seq == hb_line_seq);
++   return done;
++}
++
++/* 한 장 끝: 소리(스테레오 장 수) */
++int hb_ngp_frame_end(int16_t *buf, int maxFrames)
++{
++   return MDFNNGPCSOUND_Flush(buf, maxFrames);
++}
++
++const uint16_t *hb_ngp_framebuffer(void)
++{
++   return surf ? (const uint16_t *)surf->pixels : NULL;
++}
++
++uint8_t *hb_ngp_ram(void)
++{
++   return CPUExRAM;
++}
++
++const struct hb_link_stats *hb_ngp_link_stats(void)
++{
++   return &hb_link_stat;
++}
++
++/* 상태: 실제 길이를 돌려줌(남는 칸은 0 으로) — 원래 retro_serialize 는 남는 칸에 쓰레기가 남을 수 있음 */
++size_t hb_ngp_serialize(uint8_t *buf, size_t cap)
++{
++   StateMem st;
++   size_t n = 0;
++   memset(&st, 0, sizeof(st));
++   if (!MDFNSS_SaveSM(&st, 0, 0, NULL, NULL, NULL))
++   {
++      free(st.data);
++      return 0;
++   }
++   n = st.len;
++   if (buf)
++   {
++      if (n > cap)
++      {
++         free(st.data);
++         return 0;
++      }
++      memcpy(buf, st.data, n);
++      memset(buf + n, 0, cap - n);
++   }
++   free(st.data);
++   return n;
++}
++
++int hb_ngp_unserialize(const uint8_t *buf, size_t len)
++{
++   StateMem st;
++   memset(&st, 0, sizeof(st));
++   st.data = (uint8_t *)buf;
++   st.len  = len;
++   MDFNSS_LoadSM(&st, 0, 0);
++   return 1;
++}
++
+ void retro_cheat_reset(void) { }
+ void retro_cheat_set(unsigned a, bool b, const char *c) { }
+ 
+@@ -804,8 +941,10 @@ void MDFN_MakeFName(uint8_t type, char *s, size_t len,
+    switch (type)
+    {
+       case MDFNMKF_SAV:
+-         snprintf(s, len, "%s%c%s%s%s", 
+-               retro_save_directory, slash, retro_base_name, ".",
++         snprintf(s, len, "%s%c%s%s%s%s", 
++               retro_save_directory, slash,
++               hb_save_base[0] ? hb_save_base : retro_base_name,
++               hb_save_suffix, ".",
+                cd1);
+ 	 if (log_cb)
+ 	       log_cb(RETRO_LOG_INFO, "MDFN_MakeFName: %s\n", s);
+diff --git a/mednafen/ngp/biosHLE.c b/mednafen/ngp/biosHLE.c
+index fc5d39b..c37b8da 100644
+--- a/mednafen/ngp/biosHLE.c
++++ b/mednafen/ngp/biosHLE.c
+@@ -27,6 +27,7 @@
+ #include "rom.h"
+ #include "system.h"
+ #include "../state.h"
++#include "hb_link.h"
+ 
+ /* Interrupt prio registers at 0x0070-0x007a don't have priority readable. */
+ /* This should probably be stored in BIOS work RAM somewhere instead of a 
+@@ -63,6 +64,13 @@ void iBIOSHLE(void)
+    pc      --;	    /* Compensate for processing this instruction. */
+    cycles = 8;		/* TODO: Correct cycle counts (or approx?) */
+ 
++   /* 한방 두 대 연결: COM 함수는 실제 직렬 0 · 바이오스 고리 버퍼로(hb_link.c). 끄면 아래 원래 NeoPop 그대로 */
++   if (hb_link_on && hb_com_hle(pc & 0xFFFFFF))
++   {
++      pc = pop32();
++      return;
++   }
++
+    switch (pc & 0xffffff)
+    {	
+       case VECT_SHUTDOWN:
+diff --git a/mednafen/ngp/hb_link.c b/mednafen/ngp/hb_link.c
+new file mode 100644
+index 0000000..faac1fc
+--- /dev/null
++++ b/mednafen/ngp/hb_link.c
+@@ -0,0 +1,383 @@
++/* 한방(hanbang) 두 대 연결 — 네오지오 포켓 직렬 0(통신 케이블) 흉내 (10/21)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * 설명은 hb_link.h. 근거(롬에서 읽음 — analysis/ngp_dual_1021/REPORT.md):
++ *  - KOF R-2 · SNK vs 캡콤(밀레니엄) · 카드 파이터즈는 켤 때 바이오스 COMINIT 뒤 사용자 벡터 0x6FE4 에 '받기' 처리기
++ *    (SC0CR 오류 비트 → SC0BUF 를 0x6CC0 고리에, 개수 0x6D01, 55 넘으면 0x6D05=FF 로 RTS 를 끈 채 둠),
++ *    0x6FE8 에 '보냄 끝' 처리기(0x6D00 개수가 남았으면 0x6C80 고리에서 다음 바이트를 SC0BUF 에 씀, 없으면 0x6D04=0)를 깜.
++ *    → 하드웨어 INTRX0 = 0x6FE4(색인 11, 미세 DMA 0x18), INTTX0 = 0x6FE8(색인 12, 0x19).
++ *  - 메뉴에서 상대 찾기: 2장마다 COMGETDATA → COMSENDSTATUS → COMCREATEDATA(KOF 0x91 · SvC 0x92) → COMSENDSTART.
++ *    COMGETDATA 의 돌려줌 RA3 = 0 이면 받음, 1 이면 비었음(게임이 1 과 비교).
++ */
++#include <string.h>
++
++#include "hb_link.h"
++#include "mem.h"
++#include "interrupt.h"
++#include "TLCS-900h/TLCS900h_registers.h"
++#include "../state.h"
++#include "../state_helpers.h"
++
++uint8_t hb_link_on;
++uint8_t hb_link_cts;
++int64_t hb_rtc_base;
++uint64_t hb_rtc_cycles;
++struct hb_link_stats hb_link_stat;
++
++/* 직렬 0 상태(상태 저장에 들어감) */
++static uint8_t sio_mod = 0x69, sio_br = 0x15, sio_cr = 0x20, sio_err;
++static uint8_t sio_rxbuf, sio_rxfull;
++static uint8_t sio_txbyte, sio_txnext, sio_txhasnext, sio_txwait;
++static int32_t sio_txleft = -1;            /* 보내는 중이면 남은 사이클, 쉬면 -1 */
++static uint8_t sio_out[16];                /* 다 보낸 바이트(래퍼가 상대로 넘김) */
++static uint8_t sio_outn;
++
++/* 바이오스 작업 메모리(SNK 직렬 처리기와 같은 자리) */
++#define COM_TXBUF  0x6C80
++#define COM_RXBUF  0x6CC0
++#define COM_TXCNT  0x6D00
++#define COM_RXCNT  0x6D01
++#define COM_TXHEAD 0x6D02
++#define COM_RXHEAD 0x6D03
++#define COM_TXBUSY 0x6D04
++#define COM_RXSTOP 0x6D05
++#define COM_ERR    0x6D06
++
++#define VECT_COMINIT          0xFF2BBD
++#define VECT_COMSENDSTART     0xFF2C0C
++#define VECT_COMRECIVESTART   0xFF2C44
++#define VECT_COMCREATEDATA    0xFF2C86
++#define VECT_COMGETDATA       0xFF2CB4
++#define VECT_COMONRTS         0xFF2D27
++#define VECT_COMOFFRTS        0xFF2D33
++#define VECT_COMSENDSTATUS    0xFF2D3A
++#define VECT_COMRECIVESTATUS  0xFF2D4E
++#define VECT_COMCREATEBUFDATA 0xFF2D6C
++#define VECT_COMGETBUFDATA    0xFF2D85
++
++#define COM_BUF_OK    0
++#define COM_BUF_EMPTY 1
++#define COM_BUF_OVER  2
++
++void hb_sio_reset(void)
++{
++   sio_mod = 0x69;
++   sio_br = 0x15;
++   sio_cr = 0x20;
++   sio_err = 0;
++   sio_rxbuf = 0;
++   sio_rxfull = 0;
++   sio_txbyte = sio_txnext = sio_txhasnext = sio_txwait = 0;
++   sio_txleft = -1;
++   sio_outn = 0;
++}
++
++/* 한 바이트 보내는 시간(CPU 사이클 6.144MHz). BR0CR 0x15(φT2 ÷5) = 19200bps = 비트 320 사이클을 기준으로
++ * 입력 클록(φT0 · φT2 · φT8 · φT32 = 1 : 4 : 16 : 64)과 나눗수에 비례. 시작 + 8 + 정지 = 10비트(9비트 모드면 11). */
++static int32_t byte_cycles(void)
++{
++   static const int32_t pre[4] = { 1, 4, 16, 64 };
++   int32_t n = sio_br & 0x0F;
++   int32_t bit;
++   if (!n)
++      n = 16;
++   bit = 320 * pre[(sio_br >> 4) & 3] * n / 20;
++   if (bit < 16)
++      bit = 16;
++   return bit * ((((sio_mod >> 2) & 3) == 3) ? 11 : 10);
++}
++
++static void tx_start(uint8_t data)
++{
++   sio_txbyte = data;
++   if ((sio_mod & 0x40) && !hb_link_cts)
++   {
++      sio_txwait = 1;            /* CTSE: 상대가 받을 준비(RTS 켬)가 될 때까지 */
++      sio_txleft = -1;
++      hb_link_stat.ctsWaits++;
++   }
++   else
++   {
++      sio_txwait = 0;
++      sio_txleft = byte_cycles();
++   }
++}
++
++int hb_sio_io_read(uint32_t address, uint8_t *out)
++{
++   if (!hb_link_on)
++      return 0;
++   switch (address)
++   {
++      case 0x50:
++         *out = sio_rxbuf;
++         sio_rxfull = 0;
++         return 1;
++      case 0x51:
++         *out = (uint8_t)((sio_cr & 0xE3) | sio_err);
++         sio_err = 0;            /* 읽으면 오류 비트 지움 */
++         return 1;
++      case 0x52:
++         *out = sio_mod;
++         return 1;
++      case 0x53:
++         *out = sio_br;
++         return 1;
++      case 0xB2:
++         *out = COMMStatus;
++         return 1;
++   }
++   return 0;
++}
++
++int hb_sio_io_write(uint32_t address, uint8_t data)
++{
++   if (!hb_link_on)
++      return 0;
++   switch (address)
++   {
++      case 0x50:
++         if (sio_txleft < 0 && !sio_txwait)
++            tx_start(data);
++         else
++         {
++            if (sio_txhasnext)
++               hb_link_stat.txOverflow++;
++            sio_txnext = data;   /* 보내는 중이면 한 칸 기다림 */
++            sio_txhasnext = 1;
++         }
++         return 1;
++      case 0x51:
++         sio_cr = data;
++         return 1;
++      case 0x52:
++         sio_mod = data;
++         return 1;
++      case 0x53:
++         sio_br = data;
++         return 1;
++   }
++   return 0;
++}
++
++void hb_sio_tick(int32_t cycles)
++{
++   hb_rtc_cycles += (uint32_t)cycles;
++   if (sio_txwait)
++   {
++      if (!(sio_mod & 0x40) || hb_link_cts)
++      {
++         sio_txwait = 0;
++         sio_txleft = byte_cycles();
++      }
++      else
++         return;
++   }
++   if (sio_txleft < 0)
++      return;
++   sio_txleft -= cycles;
++   if (sio_txleft > 0)
++      return;
++   /* 한 바이트 다 보냄 → 상대로(래퍼) + INTTX0 */
++   sio_txleft = -1;
++   if (sio_outn < sizeof(sio_out))
++      sio_out[sio_outn++] = sio_txbyte;
++   hb_link_stat.txBytes++;
++   if (sio_txhasnext)
++   {
++      sio_txhasnext = 0;
++      tx_start(sio_txnext);
++   }
++   TestIntHDMA(12, 0x19);
++}
++
++void hb_sio_receive(uint8_t data)
++{
++   if (!(sio_mod & 0x20))
++   {
++      hb_link_stat.rxOff++;      /* 받기 꺼짐(RXE=0): 실제 기계처럼 버림 */
++      return;
++   }
++   if (sio_rxfull)
++   {
++      sio_err |= 0x10;           /* OERR: 안 읽은 바이트 위에 새 바이트 */
++      hb_link_stat.overruns++;
++   }
++   sio_rxbuf = data;
++   sio_rxfull = 1;
++   hb_link_stat.rxBytes++;
++   TestIntHDMA(11, 0x18);
++}
++
++int hb_sio_take(uint8_t *data)
++{
++   if (!sio_outn)
++      return 0;
++   *data = sio_out[0];
++   memmove(sio_out, sio_out + 1, --sio_outn);
++   return 1;
++}
++
++uint8_t hb_sio_rts(void)
++{
++   return (COMMStatus & 1) == 0;
++}
++
++/* ---- 바이오스 COM 함수(연결 켬일 때만) ---- */
++
++static void com_kick_tx(void)
++{
++   uint8_t cnt, head;
++   if (loadB(COM_TXBUSY))
++      return;                    /* 이미 보내는 중 — 0x6FE8 처리기가 이어서 보냄 */
++   cnt = loadB(COM_TXCNT);
++   if (!cnt)
++      return;
++   head = loadB(COM_TXHEAD);
++   storeB(COM_TXBUSY, 0xFF);
++   storeB(COM_TXCNT, (uint8_t)(cnt - 1));
++   storeB(COM_TXHEAD, (uint8_t)(head + 1));
++   storeB(0x50, loadB(COM_TXBUF + (head & 0x3F)));
++}
++
++static int com_put(uint8_t data)
++{
++   uint8_t cnt = loadB(COM_TXCNT);
++   if (cnt >= 64)
++   {
++      hb_link_stat.txOverflow++;
++      return 0;
++   }
++   storeB(COM_TXBUF + ((loadB(COM_TXHEAD) + cnt) & 0x3F), data);
++   storeB(COM_TXCNT, (uint8_t)(cnt + 1));
++   return 1;
++}
++
++static int com_get(uint8_t *data)
++{
++   uint8_t cnt = loadB(COM_RXCNT), head;
++   if (!cnt)
++      return 0;
++   head = loadB(COM_RXHEAD);
++   *data = loadB(COM_RXBUF + (head & 0x3F));
++   storeB(COM_RXHEAD, (uint8_t)(head + 1));
++   storeB(COM_RXCNT, (uint8_t)(cnt - 1));
++   /* 받은 고리가 거의 차서 0x6FE4 처리기가 RTS 를 끈 채 두었으면, 충분히 비었을 때 다시 켬 */
++   if (loadB(COM_RXSTOP) == 0xFF && cnt - 1 < 0x20)
++   {
++      storeB(COM_RXSTOP, 0);
++      COMMStatus &= ~1;
++   }
++   return 1;
++}
++
++int hb_com_hle(uint32_t vector)
++{
++   uint8_t data;
++   if (!hb_link_on)
++      return 0;
++   hb_link_stat.comCalls++;
++   switch (vector)
++   {
++      case VECT_COMINIT:
++         sio_mod = 0x69;         /* 8비트 UART · 받기 켬 · CTS 손잡기 · 보율 발생기 */
++         sio_br = 0x15;
++         sio_err = 0;
++         sio_rxfull = 0;
++         sio_txleft = -1;
++         sio_txwait = 0;
++         sio_txhasnext = 0;
++         {
++            uint32_t a;
++            for (a = COM_TXCNT; a <= COM_ERR; a++)
++               storeB(a, 0);
++         }
++         rCodeB(0x30) = COM_BUF_OK;
++         return 1;
++      case VECT_COMSENDSTART:
++         com_kick_tx();
++         return 1;
++      case VECT_COMRECIVESTART:
++         sio_mod |= 0x20;
++         return 1;
++      case VECT_COMCREATEDATA:
++         rCodeB(0x30) = com_put(rCodeB(0x35)) ? COM_BUF_OK : COM_BUF_OVER;
++         return 1;
++      case VECT_COMGETDATA:
++         if (com_get(&data))
++         {
++            rCodeB(0x35) = data;
++            rCodeB(0x30) = COM_BUF_OK;
++         }
++         else
++            rCodeB(0x30) = COM_BUF_EMPTY;
++         return 1;
++      case VECT_COMONRTS:
++         COMMStatus &= ~1;
++         return 1;
++      case VECT_COMOFFRTS:
++         COMMStatus |= 1;
++         return 1;
++      case VECT_COMSENDSTATUS:
++         rCodeW(0x30) = loadB(COM_TXCNT);
++         return 1;
++      case VECT_COMRECIVESTATUS:
++         rCodeW(0x30) = loadB(COM_RXCNT);
++         return 1;
++      case VECT_COMCREATEBUFDATA:
++         while (rCodeB(0x35) > 0)
++         {
++            if (!com_put(loadB(rCodeL(0x3C))))
++               break;
++            rCodeL(0x3C)++;
++            rCodeB(0x35)--;
++         }
++         rCodeB(0x30) = rCodeB(0x35) ? COM_BUF_OVER : COM_BUF_OK;
++         return 1;
++      case VECT_COMGETBUFDATA:
++         while (rCodeB(0x35) > 0)
++         {
++            if (!com_get(&data))
++               break;
++            storeB(rCodeL(0x3C), data);
++            rCodeL(0x3C)++;
++            rCodeB(0x35)--;
++         }
++         rCodeB(0x30) = rCodeB(0x35) ? COM_BUF_EMPTY : COM_BUF_OK;
++         return 1;
++   }
++   return 0;
++}
++
++int hb_sio_StateAction(void *data, int load, int data_only)
++{
++   SFORMAT StateRegs[] =
++   {
++      SFVARN(sio_mod, "mod"),
++      SFVARN(sio_br, "br"),
++      SFVARN(sio_cr, "cr"),
++      SFVARN(sio_err, "err"),
++      SFVARN(sio_rxbuf, "rxbuf"),
++      SFVARN(sio_rxfull, "rxfull"),
++      SFVARN(sio_txbyte, "txbyte"),
++      SFVARN(sio_txnext, "txnext"),
++      SFVARN(sio_txhasnext, "txhasnext"),
++      SFVARN(sio_txwait, "txwait"),
++      SFVARN(sio_txleft, "txleft"),
++      SFARRAY(sio_out, sizeof(sio_out)),
++      SFVARN(sio_outn, "outn"),
++      SFVARN(COMMStatus, "COMMStatus"),
++      SFVARN(hb_rtc_base, "rtcbase"),
++      SFVARN(hb_rtc_cycles, "rtccycles"),
++      SFEND
++   };
++   if (!MDFNSS_StateAction(data, load, data_only, StateRegs, "HBSL", true))
++      return 0;
++   if (load && sio_outn > sizeof(sio_out))
++      sio_outn = sizeof(sio_out);
++   return 1;
++}
+diff --git a/mednafen/ngp/hb_link.h b/mednafen/ngp/hb_link.h
+new file mode 100644
+index 0000000..3394164
+--- /dev/null
++++ b/mednafen/ngp/hb_link.h
+@@ -0,0 +1,53 @@
++/* 한방(hanbang) 두 대 연결 — 네오지오 포켓 직렬 0(통신 케이블) 흉내 (10/21)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * hb_link_on = 0(기본)이면 원래 NeoPop 동작 그대로(직렬 레지스터 = 버퍼 한 칸, 바이오스 COM = system_comms_* 빈 함수).
++ * hb_link_on = 1 이면(두 대 코어가 켬):
++ *  - 직렬 0 레지스터(0x50 SC0BUF · 0x51 SC0CR · 0x52 SC0MOD · 0x53 BR0CR)를 실제처럼: 보내는 바이트 · 받은 바이트 따로,
++ *    한 바이트 = 10비트 시간(BR0CR 0x15 = 19200bps 기준), 다 보내면 INTTX0(사용자 벡터 0x6FE8),
++ *    받으면 INTRX0(사용자 벡터 0x6FE4), 안 읽은 바이트 위에 또 오면 넘침(OERR).
++ *  - 0xB2 비트0 = 내 RTS(0 = 받을 준비). SC0MOD 의 CTSE 가 켜져 있으면 상대 RTS 가 켜질 때까지 다음 바이트를 안 보냄.
++ *  - 바이오스 COM 함수(COMINIT ~ COMGETBUFDATA)를 게임이 까는 SNK 직렬 처리기와 같은 바이오스 작업 메모리
++ *    (보낼 고리 0x6C80 · 받은 고리 0x6CC0 · 개수 0x6D00/0x6D01 · 머리 0x6D02/0x6D03 · 보내는 중 0x6D04 · 받기 멈춤 0x6D05 · 오류 0x6D06)로.
++ */
++#ifndef HB_LINK_H
++#define HB_LINK_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++extern uint8_t hb_link_on;   /* 1 = 연결 흉내 켬(게임 켤 때 래퍼가 정함, 상태에 안 들어감) */
++extern uint8_t hb_link_cts;  /* 상대 RTS 가 켜져 있음(받을 준비) — 래퍼가 줄마다 넣음 */
++/* 연결 켬일 때 시계(RTC): 기기 시각을 읽을 때마다 쓰지 않고 '켤 때 시각(지역 시간을 UTC 처럼) + 흐른 CPU 사이클'로 —
++ * 두 기기가 같은 값을 읽게(넷플레이 결정성). 기준 시각 · 흐른 사이클은 상태에 들어감. */
++extern int64_t hb_rtc_base;
++extern uint64_t hb_rtc_cycles;
++
++struct hb_link_stats
++{
++   uint32_t txBytes, rxBytes, overruns, rxOff, ctsWaits, comCalls, txOverflow, reserved;
++};
++extern struct hb_link_stats hb_link_stat;
++
++void    hb_sio_reset(void);
++int     hb_sio_io_read(uint32_t address, uint8_t *out);  /* 처리했으면 1 */
++int     hb_sio_io_write(uint32_t address, uint8_t data);  /* 처리했으면 1 */
++void    hb_sio_tick(int32_t cycles);
++void    hb_sio_receive(uint8_t data);
++int     hb_sio_take(uint8_t *data);
++uint8_t hb_sio_rts(void);
++int     hb_com_hle(uint32_t vector);                      /* 처리했으면 1 (RET 은 부른 쪽) */
++int     hb_sio_StateAction(void *data, int load, int data_only);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/mednafen/ngp/interrupt.c b/mednafen/ngp/interrupt.c
+index b23abfa..dff2985 100644
+--- a/mednafen/ngp/interrupt.c
++++ b/mednafen/ngp/interrupt.c
+@@ -25,12 +25,14 @@
+ #include "Z80_interface.h"
+ #include "dma.h"
+ #include "system.h"
++#include "hb_link.h"
+ 
+ #ifndef NDEBUG
+ #include <assert.h>
+ #endif
+ 
+ uint32_t timer_hint;
++uint32_t hb_line_seq; /* 한방: 가로 줄이 끝날 때마다 +1 (줄 단위 실행용, 상태에 안 들어감) */
+ static uint32_t timer_clock[4];
+ static uint8_t timer[4];	/* Up-counters */
+ static uint8_t timer_threshold[4];
+@@ -266,6 +268,9 @@ bool updateTimers(void *data, int cputicks)
+ 
+    ngpc_soundTS += cputicks;
+ 
++   if (hb_link_on)
++      hb_sio_tick(cputicks);
++
+    /* increment H-INT timer */
+    timer_hint += cputicks;
+ 
+@@ -278,6 +283,7 @@ bool updateTimers(void *data, int cputicks)
+       ret   = ngpgfx_draw(NGPGfx, data, false);
+ 
+       timer_hint -= TIMER_HINT_RATE;	/* Start of next scanline */
++      hb_line_seq++;
+ 
+       /* Comms. Read interrupt */
+       if ((COMMStatus & 1) == 0 && system_comms_poll(&_data))
+diff --git a/mednafen/ngp/mem.c b/mednafen/ngp/mem.c
+index 85a902a..8b33f4b 100644
+--- a/mednafen/ngp/mem.c
++++ b/mednafen/ngp/mem.c
+@@ -23,6 +23,7 @@
+ #include "flash.h"
+ #include "rom.h"
+ #include "rtc.h"
++#include "hb_link.h"
+ 
+ #ifdef MSB_FIRST
+ #include "../masmem.h"
+@@ -214,6 +215,13 @@ uint8_t loadB(uint32 address)
+    if(address >= 0x20 && address <= 0x29)
+       return(timer_read8(address));
+ 
++   if (hb_link_on)
++   {
++      uint8_t v;
++      if (hb_sio_io_read(address, &v))
++         return v;
++   }
++
+    switch (address)
+    {
+       case 0x50:
+@@ -271,6 +279,13 @@ uint16_t loadW(uint32 address)
+ #endif
+    }
+ 
++   if (hb_link_on && (address == 0x50 || address == 0x52 || address == 0xB2))
++   {
++      uint16 ret  = loadB(address);
++      ret        |= loadB(address + 1) << 8;
++      return(ret);
++   }
++
+    if(address == 0x50)
+       return SC0BUF;
+ 
+@@ -338,6 +353,9 @@ void storeB(uint32 address, uint8_t data)
+       return;
+    }
+ 
++   if (hb_link_on && hb_sio_io_write(address, data))
++      return;
++
+    switch (address)
+    {
+       case 0x50:
+@@ -432,6 +450,13 @@ void storeW(uint32 address, uint16_t data)
+       timer_write8(address + 1, data >> 8);
+    }
+ 
++   if (hb_link_on && address >= 0x50 && address <= 0x53)
++   {
++      storeB(address, data & 0xFF);
++      storeB(address + 1, data >> 8);
++      return;
++   }
++
+    switch (address)
+    {
+       case 0x50:
+diff --git a/mednafen/ngp/rtc.c b/mednafen/ngp/rtc.c
+index 03b6cf3..840e22d 100644
+--- a/mednafen/ngp/rtc.c
++++ b/mednafen/ngp/rtc.c
+@@ -14,6 +14,7 @@
+ 
+ #include "../mednafen-types.h"
+ #include <time.h>
++#include "hb_link.h"
+ 
+ static uint8 rtc_latch[7];
+ 
+@@ -25,8 +26,18 @@ static void update_rtc_latch(void)
+    time_t long_time;
+ 
+    //Get the system time
++   if (hb_link_on)
++   {
++      /* 한방 두 대: 상태에 든 기준 시각 + 흐른 CPU 사이클(6.144MHz) — 두 기기가 같은 값 */
++      static struct tm hb_tm;
++      time_t t = (time_t)(hb_rtc_base + (int64_t)(hb_rtc_cycles / 6144000));
++      localTime = gmtime_r(&t, &hb_tm);
++   }
++   else
++   {
+    time(&long_time);
+    localTime = localtime(&long_time);
++   }
+    if (localTime)
+    {
+       low = localTime->tm_year - 100; high = low;             /* Years */
+diff --git a/mednafen/ngp/system.c b/mednafen/ngp/system.c
+index 6ebfb2f..dbe0eef 100644
+--- a/mednafen/ngp/system.c
++++ b/mednafen/ngp/system.c
+@@ -14,6 +14,9 @@ bool system_comms_read(uint8_t* buffer) { return 0; }
+ bool system_comms_poll(uint8_t* buffer) { return 0; }
+ void system_comms_write(uint8_t data) { }
+ 
++extern char hb_flash_fallback[1024];
++extern uint8_t hb_flash_write_enabled;
++
+ bool system_io_flash_read(uint8_t *s, uint32_t len)
+ {
+    char path_str[1024];
+@@ -23,6 +26,11 @@ bool system_io_flash_read(uint8_t *s, uint32_t len)
+    flash_fp = filestream_open(path_str,
+          RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+ 
++   /* 한방 2P: 2P 세이브가 아직 없으면 1P 세이브를 읽어 시작(쓰기는 2P 이름으로) */
++   if (!flash_fp && hb_flash_fallback[0])
++      flash_fp = filestream_open(hb_flash_fallback,
++            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
++
+    if (!flash_fp)
+       return 0;
+ 
+@@ -37,6 +45,10 @@ bool system_io_flash_write(uint8_t *s, uint32_t len)
+    char path_str[1024];
+    RFILE *flash_fp = NULL;
+ 
++   /* 한방: 손님 기기(2P 화면)는 방장 세이브 내용이 든 기계라 자기 세이브 파일을 덮지 않음 */
++   if (!hb_flash_write_enabled)
++      return 0;
++
+    MDFN_MakeFName(MDFNMKF_SAV, path_str, sizeof(path_str), 0, "flash");
+    flash_fp = filestream_open(path_str,
+          RETRO_VFS_FILE_ACCESS_WRITE,
+-- 
+2.39.5
+

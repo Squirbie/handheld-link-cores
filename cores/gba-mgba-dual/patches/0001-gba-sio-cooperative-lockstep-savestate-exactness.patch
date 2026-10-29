@@ -1,0 +1,296 @@
+Subject: GBA SIO: cooperative-lockstep + savestate-exactness fork delta
+Series-Step: 1/19 (mgba_dual 1.6-os4)
+Origin: tangobattle/mgba 2db16a6053f7da68fc485589a4426825b6341f50 (2026-07-17), MPL-2.0; carried unchanged in the hb_dual branch, original authors are credited there
+요약: 한 스레드가 연결된 GBA 여럿을 번갈아 돌릴 수 있는 협력식 lockstep 케이블 + 상태 저장이 비트까지 같게 복원되도록 함(tangobattle/mgba 에서 가져옴).
+
+The squashed delta this fork carries for tango's SIO-rollback engine
+(mgba-siolink): every linked core is driven cooperatively from ONE
+thread, and link snapshots must restore bit-exactly.
+
+Lockstep driver:
+- Park a player that catches the shared clock while its queue head is
+  still in the future. The old code rescheduled at a non-positive
+  offset — busy-waiting on another thread advancing the shared clock,
+  which a single-threaded embedding does not have (netplay hard-freeze).
+- Discard stale TRANSFER_STARTs: a detach aborts the transfer but
+  leaves the event in surviving queues, and the same detach can promote
+  the holder to clock owner; draining it then flagged a phantom
+  transfer, acked a wait nobody held, and drove the finishCycle
+  reschedule non-positive.
+- Log-and-clamp any remaining non-positive reschedule instead of
+  asserting: aborting a live session over a recoverable protocol hiccup
+  is strictly worse than a clamped frame plus the host's stall guards
+  and cross-peer state checks.
+- Deschedule the lockstep timing event before restoring it: restoring
+  onto a live driver double-listed the event and corrupted the timing
+  list.
+
+Savestate exactness (rollback restores must not fork the trajectory):
+- Rebase negative CPU cycles into masterCycles when serializing: a core
+  parked mid-event-batch legitimately holds cycles == nextEvent < 0,
+  which GBADeserialize rejected as corruption.
+- Do not fire SIO driver mode switches on deserialize: restore the
+  derived link mode directly instead of re-deriving through
+  GBASIOWriteRCNT, which handed the driver a spurious edge while the
+  machine was half-restored.
+- Serialize the transfer-completion event exactly (explicit scheduled
+  bit + signed offset) instead of the legacy (SIOCNT & 0x0080) &&
+  when < 0x20000 heuristic, which both dropped overdue completions and
+  conjured phantom ones.
+- Serialize SIOMLT_SEND: the multi-mode transmit latch was never
+  stored, so a rollback resimulation could transmit a stale payload.
+
+(cherry picked from commit 2db16a6053f7da68fc485589a4426825b6341f50)
+
+---
+diff --git a/include/mgba/internal/gba/serialize.h b/include/mgba/internal/gba/serialize.h
+index 0192cd90ffee..bffc0caa6a7a 100644
+--- a/include/mgba/internal/gba/serialize.h
++++ b/include/mgba/internal/gba/serialize.h
+@@ -303,6 +303,7 @@ DECL_BITS(GBASerializedHWFlags2, GbpTxPosition, 4, 4);
+ 
+ DECL_BITFIELD(GBASerializedHWFlags3, uint8_t);
+ DECL_BITS(GBASerializedHWFlags3, RtcSioOutput, 0, 1);
++DECL_BIT(GBASerializedHWFlags3, SioCompleteScheduled, 1);
+ 
+ DECL_BITFIELD(GBASerializedUnlCartFlags, uint16_t);
+ DECL_BITS(GBASerializedUnlCartFlags, Type, 0, 5);
+diff --git a/include/mgba/internal/gba/sio/lockstep.h b/include/mgba/internal/gba/sio/lockstep.h
+index 0053e6b94b75..60c52edba101 100644
+--- a/include/mgba/internal/gba/sio/lockstep.h
++++ b/include/mgba/internal/gba/sio/lockstep.h
+@@ -45,6 +45,9 @@ struct GBASIOLockstepCoordinator {
+ 
+ 	uint16_t multiData[4];
+ 	uint32_t normalData[4];
++
++	// Reschedule-underflow log budget; diagnostic only, never serialized.
++	int underflows;
+ };
+ 
+ struct GBASIOLockstepEvent {
+diff --git a/src/gba/cart/gpio.c b/src/gba/cart/gpio.c
+index f714cf85828a..35b6f97fc2e4 100644
+--- a/src/gba/cart/gpio.c
++++ b/src/gba/cart/gpio.c
+@@ -496,6 +496,15 @@ void GBAHardwareSerialize(const struct GBACartridgeHardware* hw, struct GBASeria
+ 
+ 	GBASerializedHWFlags3 flags3 = 0;
+ 	flags3 = GBASerializedHWFlags3SetRtcSioOutput(flags3, hw->rtc.sioOutput);
++	// An explicit scheduled bit plus a signed offset: the legacy load
++	// heuristic ((SIOCNT & 0x0080) && when < 0x20000) both dropped an
++	// overdue completion (a cooperative SIO driver can park a core
++	// mid-event-batch, leaving the offset slightly negative — stored
++	// unsigned it reads back huge) and could conjure a completion that
++	// was never scheduled (a secondary can hold START with none).
++	if (mTimingIsScheduled(&hw->p->timing, &hw->p->sio.completeEvent)) {
++		flags3 = GBASerializedHWFlags3SetSioCompleteScheduled(flags3, 1);
++	}
+ 	state->hw.flags3 = flags3;
+ 
+ 	STORE_32(hw->rtc.bytesRemaining, 0, &state->hw.rtcBytesRemaining);
+@@ -522,7 +531,11 @@ void GBAHardwareSerialize(const struct GBACartridgeHardware* hw, struct GBASeria
+ 	// GBP/SIO stuff is only here for legacy reasons
+ 	flags2 = GBASerializedHWFlags2SetGbpInputsPosted(flags2, hw->p->sio.gbp.inputsPosted);
+ 	flags2 = GBASerializedHWFlags2SetGbpTxPosition(flags2, hw->p->sio.gbp.txPosition);
+-	STORE_32(hw->p->sio.completeEvent.when - mTimingCurrentTime(&hw->p->timing), 0, &state->hw.sioNextEvent);
++	if (GBASerializedHWFlags3GetSioCompleteScheduled(flags3)) {
++		STORE_32(hw->p->sio.completeEvent.when - mTimingCurrentTime(&hw->p->timing), 0, &state->hw.sioNextEvent);
++	} else {
++		STORE_32(0, 0, &state->hw.sioNextEvent);
++	}
+ 
+ 	state->hw.flags2 = flags2;
+ }
+@@ -573,12 +586,16 @@ void GBAHardwareDeserialize(struct GBACartridgeHardware* hw, const struct GBASer
+ 	hw->p->sio.gbp.inputsPosted = GBASerializedHWFlags2GetGbpInputsPosted(state->hw.flags2);
+ 	hw->p->sio.gbp.txPosition = GBASerializedHWFlags2GetGbpTxPosition(state->hw.flags2);
+ 
+-	uint32_t when;
++	int32_t when;
+ 	LOAD_32(when, 0, &state->hw.sioNextEvent);
+ 	if (hw->devices & HW_GB_PLAYER) {
+ 		GBASIOSetDriver(&hw->p->sio, &hw->p->sio.gbp.d);
+ 	}
+-	if ((hw->p->memory.io[GBA_REG(SIOCNT)] & 0x0080) && when < 0x20000) {
++	// See GBAHardwareSerialize: the scheduled bit replaces the legacy
++	// SIOCNT/range heuristic, and the offset is signed so an overdue
++	// completion restores exactly instead of being dropped.
++	mTimingDeschedule(&hw->p->timing, &hw->p->sio.completeEvent);
++	if (GBASerializedHWFlags3GetSioCompleteScheduled(state->hw.flags3)) {
+ 		mTimingSchedule(&hw->p->timing, &hw->p->sio.completeEvent, when);
+ 	}
+ }
+diff --git a/src/gba/io.c b/src/gba/io.c
+index 658036e4c56d..4ada5fe9e0bb 100644
+--- a/src/gba/io.c
++++ b/src/gba/io.c
+@@ -214,7 +214,7 @@ static const int _isRSpecialRegister[GBA_REG(INTERNAL_MAX)] = {
+ 	/* 10 */ 1, 1, 1, 1, 1, 1, 1, 1,
+ 	/* 11 */ 0, 0, 0, 0, 0, 0, 0, 0,
+ 	/*    SIO */
+-	/* 12 */ 1, 1, 1, 1, 0, 0, 0, 0,
++	/* 12 */ 1, 1, 1, 1, 0, 1, 0, 0,
+ 	/* 13 */ 1, 1, 0, 0, 0, 0, 0, 0,
+ 	/* 14 */ 1, 0, 0, 0, 0, 0, 0, 0,
+ 	/* 15 */ 1, 1, 1, 1, 1, 0, 0, 0,
+@@ -259,7 +259,7 @@ static const int _isWSpecialRegister[GBA_REG(INTERNAL_MAX)] = {
+ 	/* 10 */ 1, 1, 1, 1, 1, 1, 1, 1,
+ 	/* 11 */ 0, 0, 0, 0, 0, 0, 0, 0,
+ 	/*    SIO */
+-	/* 12 */ 1, 1, 1, 1, 1, 0, 0, 0,
++	/* 12 */ 1, 1, 1, 1, 1, 1, 0, 0,
+ 	/* 13 */ 1, 1, 1, 0, 0, 0, 0, 0,
+ 	/* 14 */ 1, 0, 0, 0, 0, 0, 0, 0,
+ 	/* 15 */ 1, 1, 1, 1, 1, 0, 0, 0,
+@@ -1055,6 +1055,18 @@ void GBAIODeserialize(struct GBA* gba, const struct GBASerializedState* state) {
+ 		}
+ 	}
+ 	gba->sio.siocnt = gba->memory.io[GBA_REG(SIOCNT)];
++	// Restore the derived link mode directly before the RCNT write-back
++	// below re-derives it: _switchMode fires the SIO driver's setMode on
++	// a mode edge, and a loaded state on the other side of a link-mode
++	// switch would hand the driver a spurious edge while the machine is
++	// half-restored (a lockstep driver would touch the shared link
++	// state). Deserialization restores state; it must not emit events.
++	unsigned sioMode = ((gba->memory.io[GBA_REG(RCNT)] & 0xC000) | (gba->memory.io[GBA_REG(SIOCNT)] & 0x3000)) >> 12;
++	if (sioMode < 8) {
++		gba->sio.mode = (enum GBASIOMode) (sioMode & 0x3);
++	} else {
++		gba->sio.mode = (enum GBASIOMode) (sioMode & 0xC);
++	}
+ 	GBASIOWriteRCNT(&gba->sio, gba->memory.io[GBA_REG(RCNT)]);
+ 
+ 	LOAD_32(gba->bus, 0, &state->bus);
+diff --git a/src/gba/serialize.c b/src/gba/serialize.c
+index a307a51e751f..b799698b280f 100644
+--- a/src/gba/serialize.c
++++ b/src/gba/serialize.c
+@@ -25,11 +25,29 @@ struct GBABundledState {
+ };
+ 
+ void GBASerialize(struct GBA* gba, struct GBASerializedState* state) {
++	// A core suspended mid-event-batch by a cooperative SIO driver can be
++	// parked with cpu->cycles == cpu->nextEvent < 0, which is a healthy
++	// live state but one GBADeserialize rejects as corrupted. Rebase it
++	// into masterCycles: only the sum masterCycles + cycles (the current
++	// time) and the distance nextEvent - cycles are meaningful, so the
++	// rebased state runs the same instructions and processes the same
++	// events at the same absolute times.
++	int32_t cycles = gba->cpu->cycles;
++	int32_t nextEvent = gba->cpu->nextEvent;
++	int32_t masterCycles = gba->timing.masterCycles;
++	int64_t globalCycles = gba->timing.globalCycles;
++	if (cycles < 0) {
++		masterCycles += cycles;
++		globalCycles += cycles;
++		nextEvent -= cycles;
++		cycles = 0;
++	}
++
+ 	STORE_32(GBASavestateMagic + GBASavestateVersion, 0, &state->versionMagic);
+ 	STORE_32(gba->biosChecksum, 0, &state->biosChecksum);
+ 	STORE_32(gba->romCrc32, 0, &state->romCrc32);
+-	STORE_32(gba->timing.masterCycles, 0, &state->masterCycles);
+-	STORE_64LE(gba->timing.globalCycles, 0, &state->globalCycles);
++	STORE_32(masterCycles, 0, &state->masterCycles);
++	STORE_64LE(globalCycles, 0, &state->globalCycles);
+ 
+ 	if (gba->memory.rom) {
+ 		switch (gba->memory.unl.type) {
+@@ -54,8 +72,8 @@ void GBASerialize(struct GBA* gba, struct GBASerializedState* state) {
+ 	}
+ 	STORE_32(gba->cpu->cpsr.packed, 0, &state->cpu.cpsr.packed);
+ 	STORE_32(gba->cpu->spsr.packed, 0, &state->cpu.spsr.packed);
+-	STORE_32(gba->cpu->cycles, 0, &state->cpu.cycles);
+-	STORE_32(gba->cpu->nextEvent, 0, &state->cpu.nextEvent);
++	STORE_32(cycles, 0, &state->cpu.cycles);
++	STORE_32(nextEvent, 0, &state->cpu.nextEvent);
+ 	for (i = 0; i < 6; ++i) {
+ 		int j;
+ 		for (j = 0; j < 7; ++j) {
+diff --git a/src/gba/sio/lockstep.c b/src/gba/sio/lockstep.c
+index 74492ec0a2ec..92bec46b0ae5 100644
+--- a/src/gba/sio/lockstep.c
++++ b/src/gba/sio/lockstep.c
+@@ -336,6 +336,11 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
+ 	player->otherModes[2] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer2Mode(flags));
+ 	player->otherModes[3] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer3Mode(flags));
+ 
++	// The event may still be scheduled, from the live pre-restore state
++	// or from a caller restoring a driver blob without a core load in
++	// between; scheduling an already-scheduled event corrupts the timing
++	// list, so always deschedule first.
++	mTimingDeschedule(&driver->p->p->timing, &lockstep->event);
+ 	if (GBASIOLockstepSerializedFlagsGetEventScheduled(flags)) {
+ 		int32_t when;
+ 		LOAD_32LE(when, 0, &state->driver.nextEvent);
+@@ -962,6 +967,20 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 			GBASIOLockstepCoordinatorAckPlayer(coordinator, player);
+ 			break;
+ 		case SIO_EV_TRANSFER_START:
++			if (player->playerId == 0 || !coordinator->transferActive) {
++				// The transfer this event announced is already dead. Only
++				// secondaries are ever sent TRANSFER_START; if we are the
++				// clock owner we inherited it from the detach that promoted
++				// us — the same detach (or an abort) that tore the transfer
++				// down. Acting on it would flag a phantom transfer busy,
++				// ack a wait nobody holds (parking us outside the sleep
++				// branch, or falsely acking a newer transfer) — and, for
++				// the clock owner, drive the finishCycle reschedule below
++				// non-positive with no sleep branch to catch it: the same
++				// busy-wait the parking fix exists to prevent.
++				mLOG(GBA_SIO, DEBUG, "Discarding stale transfer start from timestamp %X", event->timestamp);
++				break;
++			}
+ 			_setData(coordinator, player->playerId, sio);
+ 			nextEvent = event->finishCycle - GBASIOLockstepTime(player) - cyclesLate;
+ 			player->driver->d.p->siocnt |= 0x80;
+@@ -1000,7 +1019,18 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 	}
+ 
+ 	if (player->playerId != 0 && nextEvent <= LOCKSTEP_INTERVAL) {
+-		if (!player->queue || wasDetach) {
++		// Sleep when there is nothing to do before the next sync point:
++		// the queue is empty (or just a detach echo) — or the player has
++		// fully caught up to the shared clock while its queue head is
++		// still in the future (nextEvent < 1: _untilNextSync <= 0, and
++		// due events were all drained above). The old code busy-waited
++		// in that second case by rescheduling at a non-positive offset,
++		// which relies on another thread advancing the shared clock —
++		// with every core on one thread (mgba-siolink) that never
++		// happens and the timing loop spins forever. Parking is the
++		// correct behavior in both worlds: the clock owner runs,
++		// advances the shared clock, and wakes this player.
++		if (!player->queue || wasDetach || nextEvent < 1) {
+ 			GBASIOLockstepPlayerSleep(player);
+ 			// XXX: Is there a better way to gain sync lock at the beginning?
+ 			if (nextEvent < 4) {
+@@ -1009,9 +1039,26 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate)
+ 			_verifyAwake(coordinator);
+ 		}
+ 	}
++
++	if (nextEvent < 1) {
++		// A non-positive reschedule refires this event at the same
++		// timestamp: with every linked core driven from one thread,
++		// nothing else can advance the shared clock, so the timing
++		// loop spins on this event forever. Asserting instead turns a
++		// recoverable protocol hiccup into an abort of a live session.
++		// Log and clamp: the frame completes, and the host's stall
++		// guards or cross-peer state checks take it from there. The
++		// log budget is coordinator state — per link session, not per
++		// process — so a fresh link always gets its own 32 lines.
++		if (coordinator->underflows < 32) {
++			++coordinator->underflows;
++			mLOG(GBA_SIO, ERROR, "Lockstep reschedule underflow (%i) for player %i; clamping to one interval",
++			     nextEvent, player->playerId);
++		}
++		nextEvent = LOCKSTEP_INTERVAL;
++	}
+ 	MutexUnlock(&coordinator->mutex);
+ 
+-	mASSERT_DEBUG(nextEvent > 0);
+ 	mTimingSchedule(timing, &lockstep->event, nextEvent);
+ }
+ 

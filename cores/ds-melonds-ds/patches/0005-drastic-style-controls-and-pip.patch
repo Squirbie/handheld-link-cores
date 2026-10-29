@@ -1,0 +1,319 @@
+diff --git a/src/libretro/core/tasks.cpp b/src/libretro/core/tasks.cpp
+index 87bfa2a..d3d1dc9 100644
+--- a/src/libretro/core/tasks.cpp
++++ b/src/libretro/core/tasks.cpp
+@@ -414,15 +414,7 @@ retro::task::TaskSpec MelonDsDs::CoreState::OnScreenDisplayTask() noexcept {
+                 // (kind of like a blinking "recording" light)
+             }
+ 
+-            if (Config.ShowCurrentLayout()) {
+-                fmt::format_to(
+-                    inserter,
+-                    "{}Layout {}/{}",
+-                    buf.size() == 0 ? "" : OSD_DELIMITER,
+-                    _screenLayout.LayoutIndex() + 1,
+-                    _screenLayout.NumberOfLayouts()
+-                );
+-            }
++            // hanbang: layout cycling stays silent, even with the layout OSD option enabled.
+ 
+             if (Config.ShowLidState() && nds.IsLidClosed()) {
+                 fmt::format_to(
+diff --git a/src/libretro/input/input.cpp b/src/libretro/input/input.cpp
+index d7d0b9b..600c30b 100644
+--- a/src/libretro/input/input.cpp
++++ b/src/libretro/input/input.cpp
+@@ -63,9 +63,9 @@ const struct retro_input_descriptor MelonDsDs::input_descriptors[] = {
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_X,      "X / ---"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_Y,      "Y"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_L2,     "Speedup/Slowdown Pointer+Enable Alternate Controls"},
+-        {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_R2,     "Touch Joystick"},
++        {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_R2,     "Swap Screens"},
+         {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_L3,     "Microphone"},
+-        {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_R3,     "Next Screen Layout"},
++        {0, RETRO_DEVICE_JOYPAD, 0,                               RETRO_DEVICE_ID_JOYPAD_R3,     "Touch Joystick"},
+         {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X,      "Pointer X"},
+         {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y,      "Pointer Y"},
+         {},
+diff --git a/src/libretro/input/joypad.cpp b/src/libretro/input/joypad.cpp
+index e16bb21..cfaa063 100644
+--- a/src/libretro/input/joypad.cpp
++++ b/src/libretro/input/joypad.cpp
+@@ -64,14 +64,19 @@ void JoypadState::SetConfig(const CoreConfig& config) noexcept {
+ void JoypadState::Update(const InputPollResult& poll) noexcept {
+     ZoneScopedN(TracyFunction);
+     uint32_t ndsInputBits = 0xFFF; // Input bits passed to the emulated DS
++    const bool selectHeld = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_SELECT);
++    // Keep SELECT itself, but consume Left/Right while it is held.
++    const uint32_t dsButtons = selectHeld
++        ? poll.JoypadButtons & ~((1 << RETRO_DEVICE_ID_JOYPAD_LEFT) | (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT))
++        : poll.JoypadButtons;
+ 
+     // Delicate bit manipulation; do not touch!
+     ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_A, 0, poll.JoypadButtons);
+     ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_B, 1, poll.JoypadButtons);
+     ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_SELECT, 2, poll.JoypadButtons);
+     ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_START, 3, poll.JoypadButtons);
+-    ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_RIGHT, 4, poll.JoypadButtons);
+-    ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_LEFT, 5, poll.JoypadButtons);
++    ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_RIGHT, 4, dsButtons);
++    ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_LEFT, 5, dsButtons);
+     ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_UP, 6, poll.JoypadButtons);
+     ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_DOWN, 7, poll.JoypadButtons);
+     ADD_KEY_TO_MASK(RETRO_DEVICE_ID_JOYPAD_R, 8, poll.JoypadButtons);
+@@ -82,7 +87,22 @@ void JoypadState::Update(const InputPollResult& poll) noexcept {
+     // We'll send these bits to the DS in Apply() later
+     _consoleButtons = ndsInputBits;
+ 
+-    _joystickSpeedupCursorButton = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_L2);
++    const bool l2Down = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_L2);
++    if (l2Down && !_joystickSpeedupCursorButton) {
++        if (_popupPinned) {
++            _popupPinned = false;
++            _lastPopupPress.reset(); // An unpin press cannot start another double-tap.
++        } else {
++            const auto now = std::chrono::steady_clock::now();
++            if (_lastPopupPress && now - *_lastPopupPress <= std::chrono::milliseconds(350)) {
++                _popupPinned = true;
++                _lastPopupPress.reset();
++            } else {
++                _lastPopupPress = now;
++            }
++        }
++    }
++    _joystickSpeedupCursorButton = l2Down;
+ 
+     _previousMicButton = _micButton;
+     _micButton = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_L3);
+@@ -91,7 +111,11 @@ void JoypadState::Update(const InputPollResult& poll) noexcept {
+     _toggleLidButton = false; // hanbang (10/10): L2+Y lid close disabled (handhelds: the game fell asleep by accident)
+ 
+     _previousCycleLayoutButton = _cycleLayoutButton;
+-    _cycleLayoutButton = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_R3);
++    _cycleLayoutButton = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_R2); // hanbang: R2 = swap screens, as in DraStic
++    _previousNextLayoutCombo = _nextLayoutCombo;
++    _nextLayoutCombo = selectHeld && (poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT));
++    _previousPrevLayoutCombo = _prevLayoutCombo;
++    _prevLayoutCombo = selectHeld && (poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_LEFT));
+ 
+     _previousJoystickTouchButton = _joystickTouchButton;
+     _previousJoystickRawDirection = _joystickRawDirection;
+@@ -105,7 +129,7 @@ void JoypadState::Update(const InputPollResult& poll) noexcept {
+                           ((poll.JoypadButtons & LIGHT_LEVEL_DOWN_COMBO_ALT) == LIGHT_LEVEL_DOWN_COMBO_ALT);
+ 
+     if (_touchMode == TouchMode::Joystick || _touchMode == TouchMode::Auto) {
+-        _joystickTouchButton = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_R2); //Change to R2
++        _joystickTouchButton = poll.JoypadButtons & (1 << RETRO_DEVICE_ID_JOYPAD_R3); // hanbang: R3 = touch, as in DraStic
+         _joystickRawDirection = poll.AnalogCursorDirection;
+ 
+         if (_joystickTouchButton != _previousJoystickTouchButton || _joystickRawDirection != _previousJoystickRawDirection) {
+@@ -132,12 +156,12 @@ void JoypadState::Apply(melonDS::NDS& nds) const noexcept {
+ 
+ 
+ void JoypadState::Apply(ScreenLayoutData& layout) const noexcept {
+-    if (_cycleLayoutButton && !_previousCycleLayoutButton) {
+-        // If the "cycle screen layout" button was just pressed (and is not being held)...
+-
+-        layout.NextLayout(); // ...update the screen layout to the next in the sequence.
+-        retro::debug("Switched to screen layout {} of {} ({})", layout.LayoutIndex() + 1, layout.NumberOfLayouts(), layout.Layout());
+-        // Add 1 to the index because we present the layout index as 1-based to the user.
++    if (SwapScreensPressed()) {
++        layout.SwapScreens();
++    } else if (CycleLayoutPressed()) {
++        layout.NextLayout();
++    } else if (PreviousLayoutPressed()) {
++        layout.PreviousLayout();
+     }
+ }
+ 
+diff --git a/src/libretro/input/joypad.hpp b/src/libretro/input/joypad.hpp
+index 3043cbc..2cbfa63 100644
+--- a/src/libretro/input/joypad.hpp
++++ b/src/libretro/input/joypad.hpp
+@@ -18,7 +18,9 @@
+ 
+ #include "config/types.hpp"
+ 
++#include <chrono>
+ #include <cstdint>
++#include <optional>
+ 
+ #include <glm/vec2.hpp>
+ #include <libretro.h>
+@@ -55,9 +57,13 @@ namespace MelonDsDs {
+         }
+ 
+         [[nodiscard]] retro_perf_tick_t LastPointerUpdate() const noexcept { return _lastPointerUpdate; }
+-        [[nodiscard]] bool CycleLayoutPressed() const noexcept { return _cycleLayoutButton && !_previousCycleLayoutButton; }
+-        // hanbang: L2 held = show the other screen as a translucent pop-up (single-screen layouts only)
+-        [[nodiscard]] bool PopupHeld() const noexcept { return _joystickSpeedupCursorButton; }
++        [[nodiscard]] bool CycleLayoutPressed() const noexcept {
++            return _nextLayoutCombo && !_previousNextLayoutCombo;
++        }
++        [[nodiscard]] bool SwapScreensPressed() const noexcept { return _cycleLayoutButton && !_previousCycleLayoutButton; }
++        [[nodiscard]] bool PreviousLayoutPressed() const noexcept { return _prevLayoutCombo && !_previousPrevLayoutCombo; }
++        // hanbang: hold L2, or double-tap within 350 ms to pin (single-screen layouts only)
++        [[nodiscard]] bool PopupHeld() const noexcept { return _joystickSpeedupCursorButton || _popupPinned; }
+         [[nodiscard]] bool MicButtonDown() const noexcept { return _micButton; }
+         [[nodiscard]] bool MicButtonPressed() const noexcept { return _micButton && !_previousMicButton; }
+         [[nodiscard]] bool MicButtonReleased() const noexcept { return !_micButton && _previousMicButton; }
+@@ -86,7 +92,13 @@ namespace MelonDsDs {
+         bool _previousMicButton;
+         bool _cycleLayoutButton;
+         bool _previousCycleLayoutButton;
+-        bool _joystickSpeedupCursorButton;
++        bool _nextLayoutCombo = false;
++        bool _previousNextLayoutCombo = false;
++        bool _prevLayoutCombo = false;
++        bool _previousPrevLayoutCombo = false;
++        bool _joystickSpeedupCursorButton = false;
++        bool _popupPinned = false;
++        std::optional<std::chrono::steady_clock::time_point> _lastPopupPress;
+         bool _joystickTouchButton;
+         bool _previousJoystickTouchButton;
+         bool _lightLevelUpCombo;
+diff --git a/src/libretro/render/software.cpp b/src/libretro/render/software.cpp
+index 1306895..aa7040b 100644
+--- a/src/libretro/render/software.cpp
++++ b/src/libretro/render/software.cpp
+@@ -90,13 +90,20 @@ void MelonDsDs::SoftwareRenderState::Render(
+         screenLayout
+     );
+ 
++    bool mainCursorDrawn = false;
+     {
+-        // hanbang (10/9): while L2 is held in a one-screen layout (top only / bottom only), the other screen slides up from the bottom
++        // hanbang (10/9): while L2 is held or pinned in a one-screen layout (top only / bottom only), the other screen slides up from the bottom
+         // as a translucent pop-up (75% size, rounded corners), like the Android 'pop-up screen' builds. In 'top only' the touch cursor
+         // is drawn inside the pop-up so the bottom screen can be aimed at with the right stick.
+         constexpr int POPUP_ANIM = 9;
+         ScreenLayout layout = screenLayout.Layout();
+         bool single = layout == ScreenLayout::TopOnly || layout == ScreenLayout::BottomOnly;
++        if (single && screenLayout.PictureInPictureEnabled()) {
++            bool topMain = layout == ScreenLayout::TopOnly;
++            DrawPictureInPicture(topMain ? bottomScreenBuffer : topScreenBuffer,
++                                 topMain && !nds.IsLidClosed() && inputState.CursorVisible(),
++                                 inputState.ConsoleTouchPosition(), config.CursorSize());
++        }
+         if (single && inputState.PopupHeld()) popupFrames = std::min(popupFrames + 1, POPUP_ANIM);
+         else popupFrames = std::max(popupFrames - 1, 0);
+         if (single && popupFrames > 0) {
+@@ -107,7 +114,7 @@ void MelonDsDs::SoftwareRenderState::Render(
+         }
+     }
+ 
+-    if (!nds.IsLidClosed() && inputState.CursorVisible()) {
++    if (!mainCursorDrawn && !nds.IsLidClosed() && inputState.CursorVisible()) {
+         DrawCursor(inputState, config, screenLayout);
+     }
+ 
+@@ -235,6 +242,38 @@ void MelonDsDs::SoftwareRenderState::DrawCursor(const InputState& input, const C
+     }
+ }
+ 
++void MelonDsDs::SoftwareRenderState::DrawPictureInPicture(const uint32_t* src, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept {
++    ZoneScopedN(TracyFunction);
++    const int bw = static_cast<int>(buffer.Width() / 4), bh = static_cast<int>(buffer.Height() / 4);
++    constexpr int SW = NDS_SCREEN_WIDTH, SH = NDS_SCREEN_HEIGHT;
++    if (bw < 3 || bh < 3) return;
++    constexpr uint32_t BORDER = 0xFF03CF03; // opaque RGB(3, 207, 3), outermost output pixels
++    for (int y = 0; y < bh; y++) {
++        uint32_t* row = buffer[static_cast<unsigned>(y)];
++        const int sy = y * SH / bh;
++        for (int x = 0; x < bw; x++) {
++            row[x] = (x == 0 || y == 0 || x == bw - 1 || y == bh - 1)
++                ? BORDER : src[sy * SW + x * SW / bw] | 0xFF000000;
++        }
++    }
++    if (cursor) {
++        touch = glm::clamp(touch, glm::ivec2(0), glm::ivec2(SW - 1, SH - 1));
++        const float rx = std::max(0.5f, cursorRadius * bw / SW);
++        const float ry = std::max(0.5f, cursorRadius * bh / SH);
++        const float cx = std::clamp((touch.x + 0.5f) * bw / SW, 1.5f, bw - 1.5f);
++        const float cy = std::clamp((touch.y + 0.5f) * bh / SH, 1.5f, bh - 1.5f);
++        // Clip to the interior so the opaque one-pixel border stays intact.
++        const int xa = std::clamp(static_cast<int>(std::floor(cx - rx)), 1, bw - 1);
++        const int xb = std::clamp(static_cast<int>(std::ceil(cx + rx)), 1, bw - 1);
++        const int ya = std::clamp(static_cast<int>(std::floor(cy - ry)), 1, bh - 1);
++        const int yb = std::clamp(static_cast<int>(std::ceil(cy + ry)), 1, bh - 1);
++        for (int y = ya; y < yb; y++) {
++            uint32_t* row = buffer[static_cast<unsigned>(y)];
++            for (int x = xa; x < xb; x++) row[x] = (0xFFFFFF - row[x]) | 0xFF000000;
++        }
++    }
++}
++
+ void MelonDsDs::SoftwareRenderState::DrawPopup(const uint32_t* src, float t, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept {
+     ZoneScopedN(TracyFunction);
+     const int W = static_cast<int>(buffer.Width()), H = static_cast<int>(buffer.Height());
+diff --git a/src/libretro/render/software.hpp b/src/libretro/render/software.hpp
+index 5806284..3fc96fc 100644
+--- a/src/libretro/render/software.hpp
++++ b/src/libretro/render/software.hpp
+@@ -62,7 +62,9 @@ namespace MelonDsDs {
+         void PrepareBuffers(const CoreConfig& config, const ScreenLayoutData& screenLayout) noexcept;
+         void CopyScreen(const uint32_t* src, glm::uvec2 destTranslation, ScreenLayout layout) noexcept;
+         void DrawCursor(const InputState& input, const CoreConfig& config, const ScreenLayoutData& screenLayout) noexcept;
+-        // hanbang: translucent pop-up of the other screen while L2 is held
++        // hanbang: opaque quarter-size PiP, underneath the existing pop-up
++        void DrawPictureInPicture(const uint32_t* src, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept;
++        // hanbang: translucent pop-up of the other screen while L2 is held or pinned
+         void DrawPopup(const uint32_t* src, float t, bool cursor, glm::ivec2 touch, float cursorRadius) noexcept;
+         int popupFrames = 0;
+         void CombineScreens(
+diff --git a/src/libretro/screenlayout.cpp b/src/libretro/screenlayout.cpp
+index fb727c9..6684326 100644
+--- a/src/libretro/screenlayout.cpp
++++ b/src/libretro/screenlayout.cpp
+@@ -52,7 +52,9 @@ MelonDsDs::ScreenLayoutData::ScreenLayoutData() :
+     secondaryScreenScale(100),
+     secondaryScreenScaleFactor(1.0f),
+     hybridRatio(2),
+-    _numberOfLayouts(1) {
++    _layoutIndex(0),
++    _numberOfLayouts(1),
++    _layouts{} {
+ }
+ 
+ MelonDsDs::ScreenLayoutData::~ScreenLayoutData() noexcept {
+diff --git a/src/libretro/screenlayout.hpp b/src/libretro/screenlayout.hpp
+index 6edc64e..06f531d 100644
+--- a/src/libretro/screenlayout.hpp
++++ b/src/libretro/screenlayout.hpp
+@@ -187,9 +187,28 @@ namespace MelonDsDs {
+             if (oldLayout != Layout()) _dirty = true;
+         }
+ 
++        // hanbang: configured layouts with PiP on, then the same layouts with PiP off.
++        bool PictureInPictureEnabled() const noexcept { return _pipEnabled; }
++
+         void NextLayout() noexcept {
+             ScreenLayout oldLayout = Layout();
+             _layoutIndex = (_layoutIndex + 1) % _numberOfLayouts;
++            if (_layoutIndex == 0) _pipEnabled = !_pipEnabled;
++
++            if (oldLayout != Layout()) _dirty = true;
++        }
++
++        // hanbang: R2 = big screen top <-> bottom, PiP state kept (layouts are configured in top/bottom pairs)
++        void SwapScreens() noexcept {
++            ScreenLayout oldLayout = Layout();
++            if (_numberOfLayouts > 1) _layoutIndex = std::min(_layoutIndex ^ 1u, _numberOfLayouts - 1);
++            if (oldLayout != Layout()) _dirty = true;
++        }
++
++        void PreviousLayout() noexcept {
++            ScreenLayout oldLayout = Layout();
++            if (_layoutIndex == 0) _pipEnabled = !_pipEnabled;
++            _layoutIndex = (_layoutIndex + _numberOfLayouts - 1) % _numberOfLayouts;
+ 
+             if (oldLayout != Layout()) _dirty = true;
+         }
+@@ -293,6 +312,7 @@ namespace MelonDsDs {
+         HybridSideScreenDisplay hybridSmallScreenLayout;
+         unsigned hybridRatio;
+ 
++        bool _pipEnabled = true;
+         unsigned _layoutIndex;
+         unsigned _numberOfLayouts;
+         std::array<ScreenLayout, config::screen::MAX_SCREEN_LAYOUTS> _layouts;

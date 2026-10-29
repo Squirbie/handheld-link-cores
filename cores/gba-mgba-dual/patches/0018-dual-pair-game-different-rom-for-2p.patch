@@ -1,0 +1,816 @@
+Subject: Libretro dual: pair games, the 2P GBA may run a different ROM of the series
+Series-Step: 18/19 (mgba_dual 1.6-os4)
+Origin: hanbang (this project)
+요약: 1.5 짝 게임 — 2P 게임기만 다른 판(예: 에그제 블루스 ↔ 컬로넬, 봄버맨 블루 ↔ 레드) 롬으로 켤 수 있게 함. 짝일 때만 상태 판 표시가 달라지고, 짝이 아니면 1.4.1 과 바이트까지 같음.
+
+The two GBAs used to read one content ROM. The guest reads /tmp/hb_dual_p2rom (only with --connect and when the file
+is at most 180 s old); the host gets the 2P ROM from the HBQ4 request (HBQ3 + 2P ROM CRC and path) and rebuilds the 2P
+machine from it only if the CRC matches and differs from the 1P ROM. Plain .gba or a ZIP with exactly one .gba (stored
+or deflate, zlib inflate shipped with mGBA, CRC re-checked). A pair state carries DUAL_STATE_PAIR15 and the 2P ROM CRC;
+1.4.1 refuses it, 1.5 refuses a different pairing. A newly created 2P machine gets biosPrefetch 0xE129F000 when the state
+would read 0 (found as a one-in-4500 rewind mismatch). Without a pair the behaviour and states are byte-identical to
+1.4.1. Version string 1.5-os4.
+
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 47c72ffe244f..1b8e2b6e1ab4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1036,6 +1036,11 @@ if(BUILD_LIBRETRO)
+ 		              ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/libretro/libretro-vfs.c
+ 		              ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/libretro/dual/libretro_dual.c)
+ 		list(APPEND LIBRETRO_CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/gba/sio/lockstep.c)
++		# 1.5 짝 게임: 2P 짝 롬 ZIP 풀기(hb_romfile.h) — 들어 있는 zlib 의 inflate 만(이름은 link.T 로 안 내보냄)
++		foreach(HB_ZLIB_FILE adler32 crc32 inffast inflate inftrees zutil)
++			list(APPEND RETRO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/third-party/zlib/${HB_ZLIB_FILE}.c)
++			set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/third-party/zlib/${HB_ZLIB_FILE}.c PROPERTIES COMPILE_DEFINITIONS Z_PREFIX)
++		endforeach()
+ 	endif()
+ 	list(FILTER LIBRETRO_CORE_SRC EXCLUDE REGEX "/core/(scripting|library|mem-search|rewind|input)\\.c$")
+ 	list(FILTER LIBRETRO_CORE_SRC EXCLUDE REGEX "/util/(audio-resampler|interpolator)\\.c$")
+diff --git a/src/platform/libretro/dual/hb_ownsave.h b/src/platform/libretro/dual/hb_ownsave.h
+index 2a1628640f87..bc0629e75bfe 100644
+--- a/src/platform/libretro/dual/hb_ownsave.h
++++ b/src/platform/libretro/dual/hb_ownsave.h
+@@ -12,6 +12,10 @@
+  *   - 확인된 2P 일 때만: 2P 세이브가 바뀐 뒤 300장(약 5초, 되감기 최대 범위보다 훨씬 김) 그대로면
+  *     카드 거래 폴더에 checkpoint.bin, 정상 종료 때 export.bin(+램 /tmp/hb_ownsave/export)을 남긴다.
+  * 손님·방장 모두 상태에는 표 · 크기 힌트 · 장 번호만 들어간다(표가 있을 때만 상태판 3).
++ *
++ * 1.5 짝 게임(다른 판끼리, GBA 만): 방장 요청이 HBQ4(= HBQ3 + 2P 롬 CRC · 경로)면 그 롬을 이 기기에서 읽어
++ *   CRC 가 같을 때만 2P 게임기를 그 롬으로 바꾸고 손님 세이브를 넣는다(다르면 /tmp/hb_ownsave/reject 에 거절).
++ *   손님 쪽 거래 · 되쓰기의 게임 CRC 는 2P 롬 CRC(hb_own_p2crc, 짝이 아니면 콘텐츠 CRC 그대로).
+  */
+ #ifndef HB_OWNSAVE_H
+ #define HB_OWNSAVE_H
+@@ -23,6 +27,7 @@
+ #include <stdint.h>
+ #include <time.h>
+ #include "hb_storage.h"
++#include "hb_romfile.h"
+ 
+ #define HB_OWN_DIR "/tmp/hb_ownsave"
+ #define HB_OWN_MAX 131072u
+@@ -32,6 +37,9 @@
+ 
+ static uint8_t hb_own_token[16];
+ static uint32_t hb_own_crc, hb_own_kind, hb_own_max, hb_own_save_hint;
++/* 1.5 짝 게임: 코어가 hb_own_init 앞에 정함(2P 가 다른 롬이면 켬 · 그 롬 CRC) */
++static bool hb_pair_on;
++static uint32_t hb_pair_crc, hb_own_p2crc;
+ static unsigned hb_own_countdown;
+ static bool hb_own_applied, hb_own_guest, hb_own_p2_skip_logged;
+ static uint8_t hb_generation[8];
+@@ -317,16 +325,13 @@ static void hb_guest_check(void)
+    fclose(f);
+ }
+ 
+-static void hb_local_init(void)
++/* 실행 명령에 --connect(넷플레이 손님)가 있는지 */
++static bool hb_launched_as_guest(void)
+ {
+    char command[8192];
+-   uint8_t intent[4200];
+-   struct stat st;
+    int fd, i;
+    ssize_t n;
+    bool connect = false;
+-   uint64_t when;
+-   int64_t age;
+ 
+    fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+@@ -342,7 +347,19 @@ static void hb_local_init(void)
+          }
+       }
+    }
+-   if (!connect) return;
++   return connect;
++}
++
++static void hb_local_init(void)
++{
++   uint8_t intent[4200];
++   struct stat st;
++   int fd;
++   ssize_t n;
++   uint64_t when;
++   int64_t age;
++
++   if (!hb_launched_as_guest()) return;
+    hb_own_guest = true;
+ 
+    /* intent: "HBI3" 표[16] CRC[4] 기종[4] 초[8] 거래 폴더 "\n" */
+@@ -359,7 +376,7 @@ static void hb_local_init(void)
+    n = read(fd, intent, sizeof(intent) - 1);
+    close(fd);
+    if (n != st.st_size || n < 38 || memcmp(intent, "HBI3", 4) ||
+-       hb_u32(intent + 20) != hb_own_crc || hb_u32(intent + 24) != hb_own_kind) {
++       hb_u32(intent + 20) != hb_own_p2crc || hb_u32(intent + 24) != hb_own_kind) {
+       HB_LOG(RETRO_LOG_WARN, "각자 세이브: intent 의 롬 CRC · 기종이 다름 — 보통 손님");
+       return;
+    }
+@@ -412,6 +429,7 @@ static void hb_own_init(const void *rom, size_t size, uint32_t kind, uint32_t ma
+       for (bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    hb_own_crc = ~crc;
++   hb_own_p2crc = hb_pair_on ? hb_pair_crc : hb_own_crc;
+    memset(hb_generation, 0, sizeof(hb_generation));
+    random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (random_fd >= 0) {
+@@ -426,19 +444,45 @@ static void hb_own_init(const void *rom, size_t size, uint32_t kind, uint32_t ma
+    snprintf(capability, sizeof(capability), "HBO3 %u %u %u %u %s\n",
+             (unsigned)getpid(), hb_own_crc, maximum, kind, generation);
+    hb_atomic("core", capability, strlen(capability));
++   /* 1.5: 짝 게임 요청(HBQ4)을 알아듣는 코어 표시(GBA 만) — 옛 코어 방장에게는 짝 요청을 보내지 않게 */
++   if (kind == 1) {
++      snprintf(capability, sizeof(capability), "HBP5 %u %s\n", (unsigned)getpid(), generation);
++      hb_atomic("pair", capability, strlen(capability));
++   }
++}
++
++/* 짝 요청 거절: 요청을 지우고 표 · 까닭 번호를 남김(손님 도우미가 바로 알 수 있게) */
++#define HB_PAIR_READ 1      /* 2P 롬을 못 읽음 */
++#define HB_PAIR_CRC 2       /* 2P 롬 CRC 가 손님 것과 다름 */
++#define HB_PAIR_SAME 3      /* 2P 롬이 1P 와 같은 롬(짝 아님) */
++#define HB_PAIR_APPLY 4     /* 2P 게임기를 새 롬으로 못 켬 */
++static void hb_pair_reject(const uint8_t *token, uint32_t why, const char *path, const char *detail)
++{
++   uint8_t reject[24];
++   unlink(HB_OWN_DIR "/request");
++   memcpy(reject, "HBR4", 4);
++   memcpy(reject + 4, token, 16);
++   hb_put32(reject + 20, why);
++   hb_atomic("reject", reject, sizeof(reject));
++   HB_LOG(RETRO_LOG_WARN, "짝 게임 요청 거절(%u %s): %s", (unsigned)why, detail, path);
+ }
+ 
+-/* 방장: 30장마다 받은 세이브 요청 확인 → 한 번만 2P 세이브 교체 */
+-static void hb_own_poll(bool enabled, bool (*apply)(const uint8_t *, size_t))
++/* 방장: 30장마다 받은 세이브 요청 확인 → 한 번만 2P 세이브 교체
++ * HBQ3 = 머리 52 + 세이브. HBQ4(1.5 짝) = 머리 52 + 2P 롬 CRC[4] 경로 길이[4] 0[4] + 경로 + 세이브. */
++static void hb_own_poll(bool enabled, bool (*apply)(const uint8_t *, size_t),
++                        bool (*apply_pair)(const uint8_t *, size_t, void *, size_t, uint32_t))
+ {
+-   uint8_t header[52], *data;
+-   uint32_t size, port;
++   uint8_t header[64], *data;
++   char path[1024];
++   uint32_t size, port, p2crc = 0, pathlen = 0, head = 52;
+    uint64_t expires;
+    struct stat st;
+    int fd;
+    ssize_t n;
+    unsigned i;
+-   bool token_ok = false;
++   bool token_ok = false, pair;
++   void *rom = NULL;
++   size_t romSize = 0;
+    if (!enabled || --hb_own_countdown) return;
+    hb_own_countdown = 30;
+    hb_guest_check();
+@@ -446,22 +490,42 @@ static void hb_own_poll(bool enabled, bool (*apply)(const uint8_t *, size_t))
+    fd = open(HB_OWN_DIR "/request", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 52 ||
+-       st.st_size > (off_t)(52 + HB_OWN_MAX)) {
++       st.st_size > (off_t)(64 + sizeof(path) + HB_OWN_MAX)) {
+       close(fd);
+       return;
+    }
+-   n = read(fd, header, sizeof(header));
+-   if (n != (ssize_t)sizeof(header) || memcmp(header, "HBQ3", 4) ||
++   n = read(fd, header, 52);
++   pair = n == 52 && !memcmp(header, "HBQ4", 4);
++   if (n != 52 || (memcmp(header, "HBQ3", 4) && !pair) ||
+        memcmp(header + 44, hb_generation, 8) ||
+        hb_u32(header + 4) != (unsigned)getpid() || hb_u32(header + 8) != hb_own_crc) {
+       close(fd);
+       return;
+    }
++   if (pair) {
++      if (!apply_pair || read(fd, header + 52, 12) != 12) {
++         close(fd);
++         return;
++      }
++      p2crc = hb_u32(header + 52);
++      pathlen = hb_u32(header + 56);
++      if (pathlen < 2 || pathlen >= sizeof(path) || hb_u32(header + 60) ||
++          read(fd, path, pathlen) != (ssize_t)pathlen) {
++         close(fd);
++         return;
++      }
++      path[pathlen] = 0;
++      if (strlen(path) != pathlen || path[0] != '/') {
++         close(fd);
++         return;
++      }
++      head = 64 + pathlen;
++   }
+    size = hb_u32(header + 12);
+    port = hb_u32(header + 16);
+    expires = hb_u32(header + 20) | ((uint64_t)hb_u32(header + 24) << 32);
+    for (i = 28; i < 44; i++) if (header[i]) token_ok = true;
+-   if (!token_ok || size > hb_own_max || st.st_size != (off_t)(52 + size) || port > 65534 ||
++   if (!token_ok || size > hb_own_max || st.st_size != (off_t)head + (off_t)size || port > 65534 ||
+        !port || !hb_millis() || hb_millis() > expires || !hb_host_waiting(port)) {
+       close(fd);
+       return;
+@@ -473,10 +537,40 @@ static void hb_own_poll(bool enabled, bool (*apply)(const uint8_t *, size_t))
+    }
+    n = size ? read(fd, data, size) : 0;
+    close(fd);
++   if (pair && n == (ssize_t)size) {
++      /* 롬 읽기(몇십 ms)는 마지막 대기 확인보다 앞에서 */
++      uint32_t romCrc = 0;
++      const char *why = "";
++      rom = hb_rom_load(path, &romSize, &romCrc, &why);
++      if (!rom) {
++         hb_pair_reject(header + 28, HB_PAIR_READ, path, why);
++         free(data);
++         return;
++      }
++      if (romCrc != p2crc || romCrc == hb_own_crc) {
++         char detail[64];
++         snprintf(detail, sizeof(detail), "손님 %08x · 이 기기 %08x", (unsigned)p2crc, (unsigned)romCrc);
++         hb_pair_reject(header + 28, romCrc != p2crc ? HB_PAIR_CRC : HB_PAIR_SAME, path, detail);
++         mappedMemoryFree(rom, romSize);
++         free(data);
++         return;
++      }
++   }
+    if (n == (ssize_t)size && hb_millis() <= expires && hb_host_waiting(port)) {
++      bool applied;
+       /* 레트로아크의 같은 실행 스레드 안: 접속 처리보다 앞선 한 번만 바꾼다. */
+       unlink(HB_OWN_DIR "/request");
+-      if (apply(data, size)) {
++      if (pair) {
++         applied = apply_pair(data, size, rom, romSize, p2crc);   /* 성공하면 롬은 코어 것 */
++         if (!applied) {
++            mappedMemoryFree(rom, romSize);
++            hb_pair_reject(header + 28, HB_PAIR_APPLY, path, "2P 게임기 켜기 실패");
++         }
++         rom = NULL;
++      } else {
++         applied = apply(data, size);
++      }
++      if (applied) {
+          uint8_t ack[20];
+          memcpy(hb_own_token, header + 28, 16);
+          hb_own_save_hint = size;
+@@ -487,6 +581,7 @@ static void hb_own_poll(bool enabled, bool (*apply)(const uint8_t *, size_t))
+          hb_atomic("ack", ack, sizeof(ack));
+       }
+    }
++   if (rom) mappedMemoryFree(rom, romSize);   /* 짝 롬을 읽었지만 그새 대기가 끝남 */
+    free(data);
+ }
+ 
+@@ -501,7 +596,7 @@ static bool hb_packet(const char *name, const char *magic, const uint8_t *save,
+    packet = (uint8_t *)malloc(HB_OWN_PACKET_HEAD + size + 32);
+    if (!packet) return false;
+    memcpy(packet, magic, 4);
+-   hb_put32(packet + 4, hb_own_crc);
++   hb_put32(packet + 4, hb_own_p2crc);   /* 짝이면 손님 자기 게임(2P 롬) CRC */
+    hb_put32(packet + 8, hb_own_kind);
+    hb_put32(packet + 12, (uint32_t)size);
+    memcpy(packet + 16, hb_own_token, 16);
+diff --git a/src/platform/libretro/dual/hb_romfile.h b/src/platform/libretro/dual/hb_romfile.h
+new file mode 100644
+index 000000000000..0eca9ab82721
+--- /dev/null
++++ b/src/platform/libretro/dual/hb_romfile.h
+@@ -0,0 +1,204 @@
++/* GBA 두 대 코어 1.5 — 2P 짝 롬 읽기(10/21)
++ *
++ * 낱개 .gba 파일, 또는 .gba 가 정확히 하나 든 ZIP(저장 · deflate)만 읽는다. hb_ownsave.py rom_crc 와 같은 규칙.
++ * ZIP 은 안 항목의 CRC32 를 풀어낸 내용으로 다시 확인한다. 돌려주는 CRC 는 풀어낸 롬 전체의 CRC32
++ * (= ZIP 항목 CRC = 레트로아크 · hb_ownsave 가 보는 값).
++ * 압축 풀기는 mGBA 에 들어 있는 zlib(src/third-party/zlib) 의 inflate 만 쓴다(코어 밖으로 이름을 내보내지 않음).
++ */
++#ifndef HB_ROMFILE_H
++#define HB_ROMFILE_H
++/* mGBA 자체 crc32(src/util/crc32.c)와 이름이 겹치지 않게 zlib 이름에 z_ 를 붙임(CMake 에서 zlib 파일도 같은 정의) */
++#ifndef Z_PREFIX
++#define Z_PREFIX
++#endif
++#include "../../../third-party/zlib/zlib.h"
++
++#define HB_ROM_MAX (32u * 1024u * 1024u)          /* GBA 롬 최대(32MB) */
++#define HB_ROM_FILE_MAX (HB_ROM_MAX + 4u * 1024u * 1024u)
++
++static uint32_t hb_rd16(const uint8_t *p)
++{
++   return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++static uint32_t hb_rd32(const uint8_t *p)
++{
++   return hb_rd16(p) | (hb_rd16(p + 2) << 16);
++}
++
++static bool hb_ends_gba(const char *name, size_t len)
++{
++   return len > 4 && name[len - 4] == '.' && (name[len - 3] | 0x20) == 'g' &&
++      (name[len - 2] | 0x20) == 'b' && (name[len - 1] | 0x20) == 'a';
++}
++
++/* 보통 파일만, 크기 한도 안에서 통째로 */
++static uint8_t *hb_rom_read_file(const char *path, size_t *size, const char **why)
++{
++   struct stat st;
++   uint8_t *data;
++   size_t got = 0;
++   int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++   if (fd < 0) {
++      *why = "파일 없음";
++      return NULL;
++   }
++   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > (off_t)HB_ROM_FILE_MAX) {
++      close(fd);
++      *why = "보통 파일이 아니거나 크기 초과";
++      return NULL;
++   }
++   data = (uint8_t *)malloc((size_t)st.st_size);
++   if (!data) {
++      close(fd);
++      *why = "메모리 부족";
++      return NULL;
++   }
++   while (got < (size_t)st.st_size) {
++      ssize_t n = read(fd, data + got, (size_t)st.st_size - got);
++      if (n < 0 && errno == EINTR) continue;
++      if (n <= 0) break;
++      got += (size_t)n;
++   }
++   close(fd);
++   if (got != (size_t)st.st_size) {
++      free(data);
++      *why = "읽기 실패";
++      return NULL;
++   }
++   *size = got;
++   return data;
++}
++
++/* 성공하면 anonymousMemoryMap 으로 잡은 롬(mappedMemoryFree(롬, *romSize) 로 풀기) */
++static void *hb_rom_load(const char *path, size_t *romSize, uint32_t *romCrc, const char **why)
++{
++   size_t fileSize = 0, usize = 0;
++   uint8_t *file;
++   void *rom = NULL;
++   *why = "";
++   file = hb_rom_read_file(path, &fileSize, why);
++   if (!file) return NULL;
++   if (fileSize >= 4 && hb_rd32(file) == 0x04034b50u) {
++      size_t eocd, min, cd, cdEnd, p, local, start;
++      uint32_t entries, k, found = 0, method = 0, flags = 0, crc = 0, csize = 0, loff = 0;
++      if (fileSize < 22) {
++         *why = "ZIP 이 너무 짧음";
++         goto fail;
++      }
++      min = fileSize > 22 + 65535 ? fileSize - 22 - 65535 : 0;
++      for (eocd = fileSize - 22;; --eocd) {
++         if (hb_rd32(file + eocd) == 0x06054b50u) break;
++         if (eocd == min) {
++            *why = "ZIP 끝 기록 없음";
++            goto fail;
++         }
++      }
++      entries = hb_rd16(file + eocd + 10);
++      cd = hb_rd32(file + eocd + 16);
++      cdEnd = cd + hb_rd32(file + eocd + 12);
++      if (cd > eocd || cdEnd > eocd || cdEnd < cd) {
++         *why = "ZIP 목록 위치 오류";
++         goto fail;
++      }
++      for (p = cd, k = 0; k < entries; ++k) {
++         uint32_t nameLen, extraLen, commentLen;
++         const char *name;
++         if (p + 46 > cdEnd || hb_rd32(file + p) != 0x02014b50u) {
++            *why = "ZIP 목록 형식 오류";
++            goto fail;
++         }
++         nameLen = hb_rd16(file + p + 28);
++         extraLen = hb_rd16(file + p + 30);
++         commentLen = hb_rd16(file + p + 32);
++         if (p + 46 + nameLen > cdEnd) {
++            *why = "ZIP 이름 길이 오류";
++            goto fail;
++         }
++         name = (const char *)file + p + 46;
++         if (nameLen && name[nameLen - 1] != '/' && hb_ends_gba(name, nameLen)) {
++            ++found;
++            flags = hb_rd16(file + p + 8);
++            method = hb_rd16(file + p + 10);
++            crc = hb_rd32(file + p + 16);
++            csize = hb_rd32(file + p + 20);
++            usize = hb_rd32(file + p + 24);
++            loff = hb_rd32(file + p + 42);
++         }
++         p += 46 + nameLen + extraLen + commentLen;
++      }
++      if (found != 1) {
++         *why = "ZIP 안 .gba 가 정확히 하나가 아님";
++         goto fail;
++      }
++      if ((flags & 1) || !usize || usize > HB_ROM_MAX || (method != 0 && method != 8)) {
++         *why = "ZIP 항목이 암호 · 크기 · 압축 방식 오류";
++         goto fail;
++      }
++      local = loff;
++      if (local + 30 > fileSize || hb_rd32(file + local) != 0x04034b50u) {
++         *why = "ZIP 항목 머리 오류";
++         goto fail;
++      }
++      start = local + 30 + hb_rd16(file + local + 26) + hb_rd16(file + local + 28);
++      if (start > fileSize || csize > fileSize - start) {
++         *why = "ZIP 항목 길이 오류";
++         goto fail;
++      }
++      rom = anonymousMemoryMap(usize);
++      if (!rom) {
++         *why = "메모리 부족";
++         goto fail;
++      }
++      if (method == 0) {
++         if (csize != usize) {
++            *why = "ZIP 저장 항목 크기 오류";
++            goto fail;
++         }
++         memcpy(rom, file + start, usize);
++      } else {
++         z_stream z;
++         int r;
++         memset(&z, 0, sizeof(z));
++         if (inflateInit2(&z, -MAX_WBITS) != Z_OK) {
++            *why = "압축 풀기 준비 실패";
++            goto fail;
++         }
++         z.next_in = file + start;
++         z.avail_in = csize;
++         z.next_out = (Bytef *)rom;
++         z.avail_out = (uInt)usize;
++         r = inflate(&z, Z_FINISH);
++         inflateEnd(&z);
++         if (r != Z_STREAM_END || z.total_out != usize) {
++            *why = "압축 풀기 실패";
++            goto fail;
++         }
++      }
++      if ((uint32_t)crc32(0L, (const Bytef *)rom, (uInt)usize) != crc) {
++         *why = "ZIP 항목 CRC 불일치(손상)";
++         goto fail;
++      }
++   } else {
++      if (!hb_ends_gba(path, strlen(path)) || fileSize > HB_ROM_MAX) {
++         *why = ".gba · .zip 이 아니거나 크기 초과";
++         goto fail;
++      }
++      usize = fileSize;
++      rom = anonymousMemoryMap(usize);
++      if (!rom) {
++         *why = "메모리 부족";
++         goto fail;
++      }
++      memcpy(rom, file, usize);
++   }
++   free(file);
++   *romSize = usize;
++   *romCrc = (uint32_t)crc32(0L, (const Bytef *)rom, (uInt)usize);
++   return rom;
++fail:
++   if (rom) mappedMemoryFree(rom, usize);
++   free(file);
++   return NULL;
++}
++#endif
+diff --git a/src/platform/libretro/dual/libretro_dual.c b/src/platform/libretro/dual/libretro_dual.c
+index d89221e58fae..499cd02cd3a0 100644
+--- a/src/platform/libretro/dual/libretro_dual.c
++++ b/src/platform/libretro/dual/libretro_dual.c
+@@ -60,7 +60,10 @@
+ /* 1.4(10/21) = 1.3-os4(4판) + 링크 박자: SD 는 상대가 내리지 않으면 1 · 부모가 전송 중에
+  * 시작 비트 0 을 쓰면 그 전송을 멈춤. 두 대 상태는 판 칸에 DUAL_STATE_LINK14 를 넣어
+  * 1.3 코어가 거절하게 함(판이 섞인 넷플레이가 몰래 어긋나지 않게). */
+-#define DUAL_VERSION "1.4.1-os4"
++/* 1.5(10/21) = 1.4.1 + 짝 게임: 2P 게임기가 다른 판(짝) 롬을 쓸 수 있음. 손님은 /tmp/hb_dual_p2rom,
++ * 방장은 손님 세이브 요청(HBQ4)의 2P 롬. 짝일 때만 상태 판 칸에 DUAL_STATE_PAIR15 + 2P 롬 CRC
++ * (짝이 아니면 상태 · 동작이 1.4.1 과 바이트까지 같음). */
++#define DUAL_VERSION "1.5-os4"
+ #define DUAL_WIDTH GBA_VIDEO_HORIZONTAL_PIXELS
+ #define DUAL_HEIGHT GBA_VIDEO_VERTICAL_PIXELS
+ #define DUAL_AUDIO_CHUNK 1024
+@@ -74,6 +77,10 @@
+ #define DUAL_STATE_MAGIC 0x31444748 /* "HGD1" */
+ #define DUAL_STATE_VERSION 1
+ #define DUAL_STATE_LINK14 0x100
++/* 1.5: 2P 가 짝 롬인 두 대 상태. 머리 reserved[6] = 2P 롬 CRC. 1.4.1 이하는 이 판 칸을 거절하고,
++ * 1.5 는 짝 여부 · 2P 롬 CRC 가 다른 상태를 거절(서로 다른 짝끼리 몰래 어긋나지 않게). */
++#define DUAL_STATE_PAIR15 0x200
++#define DUAL_PAIR_CRC_AT 24 /* header->reserved 안 바이트 위치 */
+ #include "hb_ownsave.h"
+ 
+ /* Extra memory ids for test harnesses (RetroArch never asks for these). */
+@@ -187,6 +194,13 @@ static uint8_t* p2SaveWritten;
+ static size_t p2SaveWrittenSize;
+ static FILE* traceFile;
+ static bool biosLoaded;
++/* 1.5 짝 게임: 2P 게임기 롬(없으면 1P 와 같은 롬) · 2P 를 다시 만들 때 쓰는 켤 때 설정 */
++static void* p2RomData;
++static size_t p2RomSize;
++static uint32_t p2RomCrc;
++static char biosPathSaved[PATH_MAX];
++static bool biosPathValid;
++static struct mCoreOptions optsSaved;
+ 
+ /* Trace-only netplay check: hashes of the states this core produced (and
+  * received). Loading anything else is a state that came over the network:
+@@ -730,8 +744,9 @@ static bool _setupPlayer(int i, const char* biosPath, const struct mCoreOptions*
+ 	memset(player->save, 0xFF, DUAL_SAVE_SIZE);
+ 	core->setVideoBuffer(core, player->videoBuffer, DUAL_WIDTH);
+ 
+-	/* Both cores read the same ROM image; mGBA copies on write if a game ever writes ROM */
+-	struct VFile* rom = VFileFromMemory(romData, romSize);
++	/* Both cores read the same ROM image; mGBA copies on write if a game ever writes ROM
++	 * (1.5: 짝 게임이면 2P 만 짝 롬) */
++	struct VFile* rom = (i == 1 && p2RomData) ? VFileFromMemory(p2RomData, p2RomSize) : VFileFromMemory(romData, romSize);
+ 	if (!rom || !core->loadROM(core, rom)) {
+ 		return false;
+ 	}
+@@ -779,6 +794,12 @@ static bool _setupPlayer(int i, const char* biosPath, const struct mCoreOptions*
+ 
+ 	/* Same order as mgba-rollback: attach, then reset, one core after the other */
+ 	core->reset(core);
++	if (i == 1 && p2RomData && !((struct GBA*) core->board)->memory.biosPrefetch) {
++		/* 1.5 짝 게임: 게임 중에 새로 만든 2P 는 BIOS 열린 버스 값이 0 인데, mGBA 는 상태의 이 칸이 0 이면
++		 * 읽지 않고 지금 값을 둔다(serialize.c). 그대로면 막 만든 2P 상태로 되감을 때 앞 값이 남아 어긋남
++		 * → 실제 GBA 가 켜진 뒤의 값으로 둠(짝이 아니면 이 줄을 지나지 않음) */
++		((struct GBA*) core->board)->memory.biosPrefetch = 0xE129F000;
++	}
+ 	struct VFile* save = VFileFromMemory(player->save, DUAL_SAVE_SIZE);
+ 	if (!save || !core->loadSave(core, save)) {
+ 		return false;
+@@ -811,6 +832,71 @@ static void _freePlayers(void) {
+ 		mappedMemoryFree(p2SaveWritten, DUAL_SAVE_SIZE);
+ 		p2SaveWritten = NULL;
+ 	}
++	if (p2RomData) {
++		mappedMemoryFree(p2RomData, p2RomSize);
++		p2RomData = NULL;
++	}
++	p2RomSize = 0;
++	p2RomCrc = 0;
++	hb_pair_on = false;
++}
++
++/* 1.5 손님: /tmp/hb_dual_p2rom(한 줄 = 2P 롬 경로, ZIP 이면 안의 .gba 하나)이 있으면 2P 게임기에 그 롬.
++ * 손님 도우미(hb_joinask)가 방장 받음 확인 뒤 막 쓴 파일만: 실행 명령에 --connect · 180초 안. */
++#define HB_P2ROM_FILE "/tmp/hb_dual_p2rom"
++#define HB_P2ROM_AGE 180
++static void _p2RomFromFile(void) {
++	struct stat st;
++	char line[1100];
++	if (stat(HB_P2ROM_FILE, &st) != 0) {
++		return;
++	}
++	if (!hb_launched_as_guest()) {
++		_log(RETRO_LOG_INFO, "2P 짝 롬 파일이 있지만 넷플레이 손님(--connect)이 아님 — 무시");
++		return;
++	}
++	long long age = (long long) time(NULL) - (long long) st.st_mtime;
++	if (!S_ISREG(st.st_mode) || st.st_size < 2 || st.st_size >= (off_t) sizeof(line) || age < -5 || age > HB_P2ROM_AGE) {
++		_log(RETRO_LOG_WARN, "2P 짝 롬 파일 형식 오류 · 오래됨(%lld초) — 무시", age);
++		return;
++	}
++	int fd = open(HB_P2ROM_FILE, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++	if (fd < 0) {
++		return;
++	}
++	ssize_t n = read(fd, line, sizeof(line) - 1);
++	close(fd);
++	if (n < 2) {
++		return;
++	}
++	line[n] = '\0';
++	if (line[n - 1] == '\n') {
++		line[--n] = '\0';
++		if (n && line[n - 1] == '\r') {
++			line[--n] = '\0';
++		}
++	}
++	if (n < 2 || line[0] != '/' || strlen(line) != (size_t) n || strchr(line, '\n') || strchr(line, '\r')) {
++		_log(RETRO_LOG_WARN, "2P 짝 롬 파일 내용 오류 — 무시");
++		return;
++	}
++	const char* why = "";
++	size_t size = 0;
++	uint32_t crc = 0;
++	void* rom = hb_rom_load(line, &size, &crc, &why);
++	if (!rom) {
++		_log(RETRO_LOG_ERROR, "2P 짝 롬을 못 읽음(%s): %s — 같은 롬으로 켬(방장 짝 상태는 거절됨)", why, line);
++		return;
++	}
++	if (crc == (uint32_t) crc32(0L, (const Bytef*) romData, (uInt) romSize)) {
++		_log(RETRO_LOG_INFO, "2P 짝 롬이 1P 와 같은 롬 — 보통 두 대로 켬: %s", line);
++		mappedMemoryFree(rom, size);
++		return;
++	}
++	p2RomData = rom;
++	p2RomSize = size;
++	p2RomCrc = crc;
++	_log(RETRO_LOG_INFO, "2P 짝 롬: %s (CRC %08x, %u 바이트)", line, (unsigned) crc, (unsigned) size);
+ }
+ 
+ 
+@@ -844,6 +930,96 @@ static bool _ownSaveApply(const uint8_t* data, size_t size) {
+     return true;
+ }
+ 
++static void _freePlayer(int i) {
++	struct DualPlayer* player = &players[i];
++	if (player->core) {
++		mCoreConfigDeinit(&player->core->config);
++		player->core->deinit(player->core);
++	}
++	free(player->videoBuffer);
++	free(player->frameBuffer);
++	if (player->save) {
++		mappedMemoryFree(player->save, DUAL_SAVE_SIZE);
++	}
++	memset(player, 0, sizeof(*player));
++}
++
++/* 1.5 방장 짝 게임: 1P 의 CPU · 저장은 그대로, 2P 게임기를 짝 롬으로 처음부터 다시 만들고(손님 기기가
++ * 켤 때 만드는 것과 같은 _setupPlayer) 손님 세이브를 넣는다. 성공하면 rom 은 코어 것. */
++static bool _ownSaveApplyPair(const uint8_t* data, size_t size, void* rom, size_t romBytes, uint32_t crc) {
++	int i;
++	if (!linkOn || size > DUAL_SAVE_SIZE || !rom || !romBytes) {
++		return false;
++	}
++	if (size && size != 512 && size != 8192 && size != 32768 && size != 65536 && size != 131072) {
++		return false;
++	}
++	struct VFile* probe = VFileFromMemory(rom, romBytes);
++	bool isRom = probe && GBAIsROM(probe);
++	if (probe) {
++		probe->close(probe);
++	}
++	if (!isRom) {
++		_log(RETRO_LOG_ERROR, "짝 롬이 GBA 롬이 아님 — 2P 그대로");
++		return false;
++	}
++	for (i = 0; i < 2; i++) {
++		struct GBA* gba = players[i].core->board;
++		players[i].core->setPeripheral(players[i].core, mPERIPH_GBA_LINK_PORT, NULL);
++		mTimingDeschedule(&gba->timing, &gba->sio.completeEvent);
++		gba->sio.siocnt &= ~0x80;
++		gba->memory.io[GBA_REG_SIOCNT >> 1] = gba->sio.siocnt;
++	}
++	GBASIOLockstepCoordinatorDeinit(&coordinator);
++	GBASIOLockstepCoordinatorInit(&coordinator);
++	_freePlayer(1);
++	void* oldRom = p2RomData;
++	size_t oldRomSize = p2RomSize;
++	p2RomData = rom;
++	p2RomSize = romBytes;
++	/* 켤 때와 같은 순서: 1P 케이블 먼저, 그다음 2P 를 만들며 케이블 */
++	players[0].driver.lockstepId = 0;
++	GBASIOLockstepCoordinatorAttach(&coordinator, &players[0].driver);
++	players[0].core->setPeripheral(players[0].core, mPERIPH_GBA_LINK_PORT, &players[0].driver.d);
++	players[0].link = TableLookup(&coordinator.players, players[0].driver.lockstepId);
++	bool ok = _setupPlayer(1, biosPathValid ? biosPathSaved : NULL, &optsSaved);
++	if (!ok) {
++		/* 거의 없는 일(메모리 부족): 2P 를 원래 롬으로 다시 만들어 코어는 계속 돌게 */
++		_log(RETRO_LOG_ERROR, "짝 롬으로 2P 게임기를 못 켬 — 원래 롬으로 되돌림");
++		if (players[1].core) {
++			players[1].core->setPeripheral(players[1].core, mPERIPH_GBA_LINK_PORT, NULL);
++		}
++		_freePlayer(1);
++		players[0].core->setPeripheral(players[0].core, mPERIPH_GBA_LINK_PORT, NULL);
++		GBASIOLockstepCoordinatorDeinit(&coordinator);
++		GBASIOLockstepCoordinatorInit(&coordinator);
++		players[0].driver.lockstepId = 0;
++		GBASIOLockstepCoordinatorAttach(&coordinator, &players[0].driver);
++		players[0].core->setPeripheral(players[0].core, mPERIPH_GBA_LINK_PORT, &players[0].driver.d);
++		players[0].link = TableLookup(&coordinator.players, players[0].driver.lockstepId);
++		p2RomData = oldRom;
++		p2RomSize = oldRomSize;
++		if (!_setupPlayer(1, biosPathValid ? biosPathSaved : NULL, &optsSaved)) {
++			_log(RETRO_LOG_ERROR, "2P 게임기를 다시 켜지 못함");
++		}
++		return false;
++	}
++	if (oldRom) {
++		mappedMemoryFree(oldRom, oldRomSize);
++	}
++	p2RomCrc = crc;
++	memcpy(players[1].save, data, size);
++	players[1].saveUpdated = false;
++	/* 방장 2P 칸(<1P 롬>.p2.srm)은 이 판에서 읽지도 쓰지도 않음(2P 가 다른 게임) */
++	p2SavePath[0] = '\0';
++	hb_pair_on = true;
++	hb_pair_crc = crc;
++	hb_own_p2crc = crc;
++	_log(RETRO_LOG_INFO, "짝 게임: 2P 롬 바꿈(CRC %08x, %u 바이트) · 손님 세이브 %u 바이트 · 2P 처음부터",
++	     (unsigned) crc, (unsigned) romBytes, (unsigned) size);
++	return true;
++}
++
+ bool retro_load_game(const struct retro_game_info* game) {
+ 	if (!game || !game->data || !game->size) {
+ 		_log(RETRO_LOG_ERROR, "needs the ROM in memory");
+@@ -895,6 +1071,16 @@ bool retro_load_game(const struct retro_game_info* game) {
+ 		bios = biosPath;
+ 	}
+ 
++	/* 1.5: 2P 를 다시 만들 때(짝 게임 방장) 켤 때와 같은 바이오스 · 설정을 쓰도록 남겨 둠 */
++	biosPathValid = bios != NULL;
++	snprintf(biosPathSaved, sizeof(biosPathSaved), "%s", bios ? bios : "");
++	optsSaved = opts;
++	hb_pair_on = false;
++	hb_logger = _log;
++	if (linkOn) {
++		_p2RomFromFile();
++	}
++
+ 	GBASIOLockstepCoordinatorInit(&coordinator);
+ 	p2SaveWritten = linkOn ? anonymousMemoryMap(DUAL_SAVE_SIZE) : NULL;
+ 	if (linkOn && !p2SaveWritten) {
+@@ -910,12 +1096,18 @@ bool retro_load_game(const struct retro_game_info* game) {
+ 			return false;
+ 		}
+ 	}
+-	hb_logger = _log;
++	hb_pair_on = p2RomData != NULL;
++	hb_pair_crc = p2RomCrc;
+ 	hb_own_init(game->data, game->size, 1, linkOn ? DUAL_SAVE_SIZE : 0);
+ 	p2SavePath[0] = '\0';
+ 	if (linkOn) {
+ 		_setP2SavePath(game);
+-		_loadP2Save();
++		if (p2RomData) {
++			/* 짝 게임 손님: 2P 는 방장 상태로 받음 — 1P 롬 이름의 2P 칸은 읽지도 쓰지도 않음 */
++			p2SavePath[0] = '\0';
++		} else {
++			_loadP2Save();
++		}
+ 	}
+ 
+ 	void* state = NULL;
+@@ -1041,7 +1233,7 @@ static void _outputAudio(bool enabled) {
+ }
+ 
+ void retro_run(void) {
+-	hb_own_poll(linkOn, _ownSaveApply);
++	hb_own_poll(linkOn, _ownSaveApply, _ownSaveApplyPair);
+ 	inputPollCallback();
+ 	bool updated = false;
+ 	if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated) {
+@@ -1197,10 +1389,15 @@ bool retro_serialize(void* data, size_t size) {
+ 	memset(data, 0, total);
+ 	struct DualStateHeader* header = data;
+ 	STORE_32LE(DUAL_STATE_MAGIC, 0, &header->magic);
+-	STORE_32LE((hb_has_token() ? 3 : DUAL_STATE_VERSION) | (linkOn ? DUAL_STATE_LINK14 : 0), 0, &header->version);
++	bool pair = linkOn && p2RomData;
++	STORE_32LE((hb_has_token() ? 3 : DUAL_STATE_VERSION) | (linkOn ? DUAL_STATE_LINK14 : 0) | (pair ? DUAL_STATE_PAIR15 : 0),
++	           0, &header->version);
+ 	memcpy(header->reserved, hb_own_token, 16);
+ 	hb_put32((uint8_t*)header->reserved + 16, hb_own_save_hint);
+ 	hb_put32((uint8_t*)header->reserved + 20, hb_has_token() ? hb_own_frame : 0);
++	if (pair) {
++		hb_put32((uint8_t*)header->reserved + DUAL_PAIR_CRC_AT, p2RomCrc);
++	}
+ 	STORE_32LE(_activePlayers(), 0, &header->players);
+ 	STORE_32LE(coreStateSize, 0, &header->coreStateSize);
+ 	STORE_32LE(driverStateSize, 0, &header->driverStateSize);
+@@ -1275,7 +1472,19 @@ bool retro_unserialize(const void* data, size_t size) {
+ 		_log(RETRO_LOG_ERROR, "state from a different link-timing version (1.3 vs 1.4); update both devices");
+ 		return false;
+ 	}
+-	value &= ~DUAL_STATE_LINK14;
++	/* 1.5: 짝 게임 상태는 같은 2P 짝 롬을 켠 쪽만 읽음(짝 아닌 상태 ↔ 짝 코어도 서로 거절) */
++	bool pair = linkOn && p2RomData;
++	if (!!(value & DUAL_STATE_PAIR15) != pair) {
++		_log(RETRO_LOG_ERROR, "%s", pair ? "state is not a pair-game state (2P ROM differs); both sides must use the same pair"
++		                                 : "pair-game state (2P has another ROM); load the same pair or update both devices to 1.5");
++		return false;
++	}
++	if (pair && hb_u32((const uint8_t*)header->reserved + DUAL_PAIR_CRC_AT) != p2RomCrc) {
++		_log(RETRO_LOG_ERROR, "pair-game state with a different 2P ROM (CRC %08x, mine %08x)",
++		     (unsigned) hb_u32((const uint8_t*)header->reserved + DUAL_PAIR_CRC_AT), (unsigned) p2RomCrc);
++		return false;
++	}
++	value &= ~(DUAL_STATE_LINK14 | DUAL_STATE_PAIR15);
+ 	if (value != DUAL_STATE_VERSION && value != 2 && value != 3) {
+ 		return false;
+ 	}
+@@ -1303,7 +1512,7 @@ bool retro_unserialize(const void* data, size_t size) {
+ 
+ 	uint32_t ownVersion;
+ 	LOAD_32LE(ownVersion, 0, &header->version);
+-	ownVersion &= ~DUAL_STATE_LINK14;
++	ownVersion &= ~(DUAL_STATE_LINK14 | DUAL_STATE_PAIR15);
+ 	if (ownVersion >= 2 && hb_u32((const uint8_t*)header->reserved + 16) > DUAL_SAVE_SIZE) return false;
+ 	const uint8_t* base = (const uint8_t*) data + sizeof(*header);
+ 	size_t stride = _playerStateSize();

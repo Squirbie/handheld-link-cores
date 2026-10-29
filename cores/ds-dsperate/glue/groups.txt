@@ -1,0 +1,11 @@
+# (2026-10-12): DSperate 같이하기 그룹 — 같은 그룹 게임끼리만 자동으로 붙음. 줄 = 롬이름(확장자 뺀 것)<탭>그룹
+# 없는 게임은 게임 코드 4글자가 그룹(같은 롬끼리). 포켓몬은 세대가 같으면 서로 교환·대전 되니 묶음.
+Pokemon Diamond (K)	pkm4
+Pokemon Pearl (K)	pkm4
+Pokemon Platinum (K)	pkm4
+Pokemon Heart Gold (K)	pkm4
+Pokemon SoulSilver(K)	pkm4
+Pokemon Black (K)	pkm5
+Pokemon White (K)	pkm5
+Pokemon Black 2(K)	pkm5
+Pokemon White 2(K)	pkm5

@@ -1,0 +1,33 @@
+From bcd00bf7c14de1776ef2ec6d8536d6e354123eb9 Mon Sep 17 00:00:00 2001
+From: hanbang <hanbang@localhost>
+Date: Thu, 22 Oct 2026 02:26:41 +0900
+Subject: [PATCH 1/2] NGP Dual: option descriptions use , instead of ;
+
+RetroArch splits a core option description from its value list at the
+first ;, so the link, language and 2P cartridge options showed values
+like "restart); on". Only the description text changes.
+
+---
+ dual/libretro_dual.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/dual/libretro_dual.c b/dual/libretro_dual.c
+index 74b8845..d361f7a 100644
+--- a/dual/libretro_dual.c
++++ b/dual/libretro_dual.c
+@@ -299,9 +299,9 @@ void retro_set_environment(retro_environment_t env)
+    /* 메뉴 글씨: 기기 레트로아크 글꼴에 한글이 없을 수 있어 영어(원더스완 Dual 과 같음) */
+    static const struct retro_variable vars[] = {
+       { "ngp_dual_screen", "Screen and sound (host/solo = 1P, guest = 2P); 1P|2P" },
+-      { "ngp_dual_link", "2P console on the link cable (off = solo, one console; restart); on|off" },
+-      { "ngp_dual_language", "Language (both consoles; restart); english|japanese" },
+-      { "ngp_dual_p2_rom", "2P cartridge (partner = other version from /tmp/hb_ngp_dual_p2.ngc; restart); same|partner" },
++      { "ngp_dual_link", "2P console on the link cable (off = solo, one console, restart); on|off" },
++      { "ngp_dual_language", "Language (both consoles, restart); english|japanese" },
++      { "ngp_dual_p2_rom", "2P cartridge (partner = other version from /tmp/hb_ngp_dual_p2.ngc, restart); same|partner" },
+       { NULL, NULL },
+    };
+    static const struct retro_system_content_info_override overrides[] = {
+-- 
+2.39.5
+

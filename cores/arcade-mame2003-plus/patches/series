@@ -1,0 +1,8 @@
+0001-state-completeness-blankfix1.patch
+0002-driver-h-game-doesnt-serialize-own-bit.patch
+0003-h6280-huc6270-battlera-state.patch
+0004-register-banks-skip-readonly-large-banks.patch
+0005-tms32031-cage-atarirle-atarigt-state.patch
+0006-atarigen-persistent-timers-atarigt-only.patch
+0007-atari-system1-gauntlet-slapstic-atarimo-state.patch
+0008-vsnes-mmc3-and-protection-state.patch
