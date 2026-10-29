@@ -1,3 +1,0 @@
-# Cores that card-update can replace: file<TAB>known older md5s (comma separated)<TAB>new md5<TAB>release zip<TAB>path in the zip
-# 카드 업데이트가 바꾸는 코어: 파일 · 아는 옛 판 md5(쉼표) · 새 md5 · 릴리즈 zip · zip 안 자리
-mame2003_plus_libretro.so	30e1ebc1ea097bd2cddd4e8e85b31f7e	5dbeaf459d9c05a5eb175a286c7ed4a7	arcade-mame2003-plus-linux-aarch64.zip	arcade-mame2003-plus/mame2003_plus_libretro.so

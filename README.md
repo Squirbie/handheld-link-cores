@@ -205,10 +205,6 @@ What the script does:
 > [!NOTE]
 > `install.sh` is new (2026-10-29). If anything goes wrong, the manual steps below always work, and an issue with the output helps a lot.
 
-### Already have a card with these cores?
-
-Update it from a Windows or Mac PC with [`card-update`](card-update/): put the card in the PC and run one file. It replaces only known older builds, checks every file first, and keeps the old file in `system/hanbang_cores/backup/`.
-
 ### Install by hand
 
 Example for **mGBA Dual**, over SSH on the device. Every package README has the exact lines for its core.
