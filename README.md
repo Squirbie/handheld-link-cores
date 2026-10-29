@@ -158,6 +158,55 @@ No ROMs, BIOS, firmware or saves are included. Use files you are allowed to use.
 
 ## Quick start (KNULLI)
 
+One command over SSH on the device (as root). Pick the package names from the table below:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Squirbie/handheld-link-cores/main/install.sh | sh -s -- gba-mgba-dual knulli-scripts
+```
+
+No `curl`? `wget -qO- https://raw.githubusercontent.com/Squirbie/handheld-link-cores/main/install.sh | sh -s -- gba-mgba-dual`
+
+To read the script first, or to pick from a numbered list, save it and run it:
+
+```sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/Squirbie/handheld-link-cores/main/install.sh
+sh install.sh            # numbered list
+sh install.sh --list     # package names and what is installed
+```
+
+| I want to … | Install this package |
+|---|---|
+| Link-cable multiplayer for Game Boy Advance games | `gba-mgba-dual` |
+| Wireless Adapter trades and battles (Pokémon FireRed, LeafGreen, Emerald) | `gba-gpsp-rfu` |
+| Link cable and infrared for Game Boy / Game Boy Color | `gb-gambatte-link` |
+| Link cable for WonderSwan | `wswan-mednafen-dual` |
+| Link cable for Neo Geo Pocket | `ngp-mednafen-dual` |
+| Gear-to-Gear cable for Game Gear (non-commercial license) | `gg-genesisplusgx-dual` |
+| Nintendo DS local wireless between two devices | `ds-dsperate` |
+| Big DS ROMs and steadier DS netplay in RetroArch | `ds-melonds-ds` |
+| Arcade netplay that stays in sync (non-commercial license) | `arcade-mame2003-plus` or `arcade-fbneo` |
+| Mahjong keys on the gamepad for arcade mahjong games (non-commercial license) | `arcade-mahjong-pad` (adds the two arcade packages it needs) |
+| MSX saves that stick and MSX netplay that stays in sync | `msx-bluemsx` |
+| Work RAM for NES mapper 14 (a fan translation that stopped at a black screen) | `nes-fceumm-mapper14` |
+| DOS IPX netplay without crashes | `dos-dosbox-pure-ipx` |
+| The one-button **Join / Solo** prompt, per-player saves, DS direct link | `knulli-scripts` (recommended with the cores above) |
+| Everything | `--all` |
+
+**Both devices need the same packages and the same game file.** Then pick the core for a game in EmulationStation (game → advanced settings → core) and start the same game on both devices. With `knulli-scripts`, the second device offers **Join / Solo**.
+
+What the script does:
+
+- Downloads each package from the latest release and checks it against `SHA256SUMS.txt`. On a mismatch it stops.
+- Follows each package README: cores go to `/userdata/system/hanbang_cores/` and are linked into `/usr/lib/libretro/`, cores with a new name get their `.info`, and the overlay is saved once at the end. No reboot needed.
+- Anything it would overwrite that it did not put there itself (such as a stock core of the same name) is first moved to `/userdata/system/hanbang_cores/backup/`, and `--uninstall` puts it back.
+- Writes what it installed to `/userdata/system/hanbang_cores/installed.txt`, so running it again is safe. It never edits `knulli.conf`.
+- `--dry-run` shows what would happen without changing anything. If a KNULLI update brought a stock core back, run the same command again.
+
+> [!NOTE]
+> `install.sh` is new (2026-10-29). If anything goes wrong, the manual steps below always work, and an issue with the output helps a lot.
+
+### Install by hand
+
 Example for **mGBA Dual**, over SSH on the device. Every package README has the exact lines for its core.
 
 ```sh

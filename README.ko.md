@@ -158,6 +158,55 @@ KNULLI 에 붙이는 것(같이하기 창 · 각자 세이브 · DS 직접 연�
 
 ## 빠르게 시작 (KNULLI)
 
+기기에 SSH 로(root) 들어가서 한 줄이면 돼요. 아래 표에서 꾸러미 이름을 고르세요.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Squirbie/handheld-link-cores/main/install.sh | sh -s -- gba-mgba-dual knulli-scripts
+```
+
+`curl` 이 없으면: `wget -qO- https://raw.githubusercontent.com/Squirbie/handheld-link-cores/main/install.sh | sh -s -- gba-mgba-dual`
+
+스크립트를 먼저 읽어 보거나 번호 목록에서 고르고 싶다면 저장한 뒤 실행하세요.
+
+```sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/Squirbie/handheld-link-cores/main/install.sh
+sh install.sh            # 번호 목록
+sh install.sh --list     # 꾸러미 이름과 이미 넣은 것
+```
+
+| 이걸 하려면 | 이 꾸러미 |
+|---|---|
+| 게임보이 어드밴스 통신 케이블 같이하기 | `gba-mgba-dual` |
+| 무선 어댑터 교환 · 대전 (포켓몬 파이어레드 · 리프그린 · 에메랄드) | `gba-gpsp-rfu` |
+| 게임보이 · 게임보이 컬러 통신 케이블과 적외선 | `gb-gambatte-link` |
+| 원더스완 통신 케이블 | `wswan-mednafen-dual` |
+| 네오지오 포켓 통신 케이블 | `ngp-mednafen-dual` |
+| 게임기어 기어 투 기어 케이블 (비상업 라이선스) | `gg-genesisplusgx-dual` |
+| 닌텐도 DS 두 기기 로컬 무선 | `ds-dsperate` |
+| 큰 DS 롬 · 더 안정적인 DS 넷플레이 (RetroArch) | `ds-melonds-ds` |
+| 안 어긋나는 오락실 넷플레이 (비상업 라이선스) | `arcade-mame2003-plus` 또는 `arcade-fbneo` |
+| 오락실 마작 게임을 게임패드로 (비상업 라이선스) | `arcade-mahjong-pad` (필요한 오락실 꾸러미 둘도 같이 넣어요) |
+| 저장이 되는 MSX · 안 어긋나는 MSX 넷플레이 | `msx-bluemsx` |
+| NES 매퍼 14 작업 램 (검은 화면에서 멈추던 한글화 롬) | `nes-fceumm-mapper14` |
+| 튕김 없는 DOS IPX 넷플레이 | `dos-dosbox-pure-ipx` |
+| 한 버튼 **같이하기 / 혼자 하기** 창 · 사람마다 자기 세이브 · DS 직접 연결 | `knulli-scripts` (위 코어들과 같이 넣기를 권해요) |
+| 전부 | `--all` |
+
+**두 기기에 같은 꾸러미와 같은 게임 파일이 있어야 해요.** 그다음 EmulationStation 에서 게임별 코어를 고르고(게임 → 고급 설정 → 코어) 두 기기에서 같은 게임을 켜면 돼요. `knulli-scripts` 를 넣었다면 2번 기기에 **같이하기 / 혼자 하기** 창이 떠요.
+
+스크립트가 하는 일:
+
+- 최신 릴리즈에서 꾸러미를 받아 `SHA256SUMS.txt` 와 맞춰 봐요. 안 맞으면 멈춰요.
+- 꾸러미 README 의 넣는 법 그대로 해요. 코어는 `/userdata/system/hanbang_cores/` 에 두고 `/usr/lib/libretro/` 에 링크를 걸고, 새 이름 코어는 `.info` 도 넣고, 끝에 오버레이를 한 번 저장해요. 다시 켤 필요 없어요.
+- 스크립트가 넣지 않은 파일을 덮게 되면(같은 이름의 순정 코어 등) 먼저 `/userdata/system/hanbang_cores/backup/` 으로 옮겨 두고, `--uninstall` 하면 되돌려요.
+- 넣은 것은 `/userdata/system/hanbang_cores/installed.txt` 에 적어서 몇 번 다시 실행해도 안전해요. `knulli.conf` 는 건드리지 않아요.
+- `--dry-run` 은 무엇을 할지만 보여 주고 아무것도 안 바꿔요. KNULLI 업데이트로 순정 코어가 돌아왔다면 같은 명령을 한 번 더 실행하세요.
+
+> [!NOTE]
+> `install.sh` 는 새로 만든 것(2026-10-29)이에요. 문제가 생기면 아래 손으로 넣는 법은 늘 돼요. 나온 글을 이슈로 남겨 주시면 큰 도움이 돼요.
+
+### 손으로 넣기
+
 **mGBA Dual** 을 예로, 기기에 SSH 로 들어가서 해요. 꾸러미마다 README 에 그 코어에 맞는 줄이 그대로 있어요.
 
 ```sh
