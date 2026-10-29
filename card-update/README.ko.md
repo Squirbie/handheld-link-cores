@@ -7,6 +7,7 @@
 - [최신 릴리스](https://github.com/Squirbie/handheld-link-cores/releases/latest)의 `card-updates.txt` 에 적힌 **아는 옛 판(md5)일 때만** 바꿔요. 모르는 파일은 건드리지 않아요.
 - 새 파일은 먼저 확인하고(릴리스 `SHA256SUMS.txt` · 목록의 md5), 옛 파일 옆에 쓴 뒤 한 번 더 확인하고 나서야 바꿔치기해요.
 - 옛 파일은 `system/hanbang_cores/backup/` 에 남겨요.
+- **인터넷 없이 되는 꾸러미:** 스크립트 옆에 `card-updates.txt` · `SHA256SUMS.txt` · 꾸러미 zip 이 있으면 그 파일을 써서 인터넷이 필요 없어요(`.bat` · `.command` · `bash update-card.sh` 는 옆 파일부터 봐요. 한 줄 명령은 늘 받아요).
 
 지금 바꾸는 것: **MAME 2003-Plus bf8 → bf9** (`mame2003_plus_libretro.so`).
 
@@ -38,4 +39,4 @@
 - **같이하기는 두 기기가 같은 판이어야 해요.** 카드 두 장을 모두 바꿔 주세요.
 - 새 판은 옛 판의 상태 저장을 못 불러와요(상태 모양이 바뀜). 게임 속 저장 · 하이스코어는 그대로예요.
 - 되돌리려면 `system/hanbang_cores/backup/` 의 파일을 제자리에 다시 놓으면 돼요.
-- 2026-10-29 시험: 맥(exFAT 카드 이미지 — Enter · n · 터미널 없음 · 이미 새 판 · 모르는 판 · `curl | bash` · `.command`), 윈도우 서버 2025 의 Windows PowerShell 5.1(`.bat` 으로 Enter · n, 이미 새 판, 모르는 판, 카드 없음). 맥에서 카드에 `._` 파일이 남지 않아요.
+- 2026-10-29 시험: 맥(exFAT 카드 이미지 — Enter · n · 터미널 없음 · 이미 새 판 · 모르는 판 · `curl | bash` · `.command`), 윈도우 서버 2025 의 Windows PowerShell 5.1(`.bat` 으로 Enter · n, 이미 새 판, 모르는 판, 카드 없음). 맥에서 카드에 `._` 파일이 남지 않아요. 두 쪽 모두 한글 · 띄어쓰기가 든 폴더의 꾸러미를 깃허브를 막은 채로 돌려 봤고, `.bat` 을 PowerShell 7 에서 불러도 돼요.

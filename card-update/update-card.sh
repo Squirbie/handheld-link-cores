@@ -5,8 +5,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/Squirbie/handheld-link-cores/main/card-update/update-card.sh | bash
 #   (or double-click update-card-mac.command from card-update.zip)
 #
-# It looks for <card>/system/hanbang_cores/ on the mounted cards, reads card-updates.txt from the
-# latest release, and replaces only the files whose md5 is a known older build. A file it does not
+# It looks for <card>/system/hanbang_cores/ on the mounted cards, reads card-updates.txt (from the folder
+# this script is in when the files are there, as in an offline package; otherwise from the latest release), and replaces only the files whose md5 is a known older build. A file it does not
 # recognise is left alone. The new file is written and checked first; the old one is kept in
 # <card>/system/hanbang_cores/backup/.
 #
@@ -37,7 +37,18 @@ ask() {  # yes unless the answer starts with n; no answer possible = no (nothing
 }
 
 say "== 코어 업데이트 · Core update =="
-command -v curl >/dev/null 2>&1 || die "curl 이 없어요 · curl is missing"
+# files next to this script (an offline package) are used before anything is downloaded
+LOCAL=""
+SELF=${BASH_SOURCE[0]:-}
+if [ -z "${HB_BASE_URL:-}" ] && [ -n "$SELF" ] && [ -f "$SELF" ]; then
+  d=$(cd "$(dirname "$SELF")" && pwd)
+  [ -f "$d/card-updates.txt" ] && [ -f "$d/SHA256SUMS.txt" ] && LOCAL=$d
+fi
+fetch() {  # fetch NAME DEST
+  if [ -n "$LOCAL" ] && [ -f "$LOCAL/$1" ]; then cp "$LOCAL/$1" "$2"; else curl -fsSL "$BASE/$1" -o "$2"; fi
+}
+[ -n "$LOCAL" ] && say "이 폴더의 파일을 써요 · Using the files in this folder: $LOCAL"
+[ -n "$LOCAL" ] || command -v curl >/dev/null 2>&1 || die "curl 이 없어요 · curl is missing"
 command -v unzip >/dev/null 2>&1 || die "unzip 이 없어요 · unzip is missing"
 
 # ---- 1. find the cards
@@ -59,9 +70,9 @@ fi
 # ---- 2. what the latest release has
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/hb-card.XXXXXX") || die "임시 폴더를 못 만들었어요 · cannot make a temp folder"
 trap 'rm -rf "$TMP"' EXIT
-say "새 판 목록 받는 중 · Downloading the update list..."
-curl -fsSL "$BASE/card-updates.txt" -o "$TMP/card-updates.txt" || die "목록을 못 받았어요(인터넷 연결을 확인해 주세요) · could not download card-updates.txt"
-curl -fsSL "$BASE/SHA256SUMS.txt" -o "$TMP/SHA256SUMS.txt" || die "지문 목록을 못 받았어요 · could not download SHA256SUMS.txt"
+say "새 판 목록 읽는 중 · Reading the update list..."
+fetch card-updates.txt "$TMP/card-updates.txt" || die "목록을 못 받았어요(인터넷 연결을 확인해 주세요) · could not download card-updates.txt"
+fetch SHA256SUMS.txt "$TMP/SHA256SUMS.txt" || die "지문 목록을 못 받았어요 · could not download SHA256SUMS.txt"
 
 # ---- 3. compare every card file with the list
 PLAN="$TMP/plan.txt"; : > "$PLAN"
@@ -96,8 +107,8 @@ ask "바꿀까요? 그냥 Enter = 예 · n = 아니요 · Update now? Enter = ye
 while IFS=$'\t' read -r card file cur new zip inzip; do
   [ -f "$TMP/new_$file" ] && continue
   if [ ! -f "$TMP/$zip" ]; then
-    say "받는 중 · Downloading $zip ..."
-    curl -fsSL "$BASE/$zip" -o "$TMP/$zip" || die "$zip 을 못 받았어요 · download failed"
+    say "새 코어 준비 중 · Getting $zip ..."
+    fetch "$zip" "$TMP/$zip" || die "$zip 을 못 받았어요 · download failed"
     want=$(awk -v z="$zip" '$2 == z {print $1}' "$TMP/SHA256SUMS.txt")
     [ -n "$want" ] && [ "$(sha256of "$TMP/$zip")" = "$want" ] || die "$zip 지문이 안 맞아요 · checksum mismatch"
   fi

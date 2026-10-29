@@ -7,6 +7,7 @@ if not exist "%HB_PS1%" (
   pause
   exit /b 1
 )
+set PSModulePath=
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create([IO.File]::ReadAllText($env:HB_PS1, [Text.Encoding]::UTF8)))"
 echo.
 pause

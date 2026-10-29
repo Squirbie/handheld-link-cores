@@ -4,8 +4,8 @@
 #   Double-click update-card-windows.bat (from card-update.zip), or paste into PowerShell:
 #   irm https://raw.githubusercontent.com/Squirbie/handheld-link-cores/main/card-update/update-card-windows.ps1 | iex
 #
-# It looks for <drive>:\system\hanbang_cores\ on every drive, reads card-updates.txt from the latest
-# release, and replaces only the files whose md5 is a known older build. A file it does not recognise is
+# It looks for <drive>:\system\hanbang_cores\ on every drive, reads card-updates.txt (from the folder of
+# the .bat when the files are there, as in an offline package; otherwise from the latest release), and replaces only the files whose md5 is a known older build. A file it does not recognise is
 # left alone. The new file is written and checked first; the old one is kept in
 # <drive>:\system\hanbang_cores\backup\.
 #
@@ -21,14 +21,30 @@ function Update-HbCard {
     if ($env:HB_BASE_URL) { $base = $env:HB_BASE_URL }
     $yes = ($env:HB_YES -eq '1')
 
-    function Md5Of([string]$p) { (Get-FileHash -Algorithm MD5 -LiteralPath $p).Hash.ToLower() }
-    function Sha256Of([string]$p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLower() }
+    # hashes with .NET directly: Get-FileHash lives in a module that may not load (for example when started from PowerShell 7)
+    function HashOf($alg, [string]$p) {
+        $s = [IO.File]::OpenRead($p)
+        try { ([BitConverter]::ToString($alg.ComputeHash($s))).Replace('-', '').ToLower() } finally { $s.Dispose(); $alg.Dispose() }
+    }
+    function Md5Of([string]$p) { HashOf ([Security.Cryptography.MD5]::Create()) $p }
+    function Sha256Of([string]$p) { HashOf ([Security.Cryptography.SHA256]::Create()) $p }
     function Get-Url([string]$url, [string]$out) {
         if ($url -like 'file://*') { Copy-Item -LiteralPath ([Uri]$url).LocalPath -Destination $out -Force }
         else { Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $out }
     }
+    # files next to the .bat (an offline package) are used before anything is downloaded
+    $localDir = $null
+    if (-not $env:HB_BASE_URL -and $env:HB_PS1) {
+        $d = Split-Path -Parent $env:HB_PS1
+        if ((Test-Path -LiteralPath (Join-Path $d 'card-updates.txt')) -and (Test-Path -LiteralPath (Join-Path $d 'SHA256SUMS.txt'))) { $localDir = $d }
+    }
+    function Get-File([string]$name, [string]$out) {
+        if ($localDir -and (Test-Path -LiteralPath (Join-Path $localDir $name))) { Copy-Item -LiteralPath (Join-Path $localDir $name) -Destination $out -Force }
+        else { Get-Url "$base/$name" $out }
+    }
 
     Write-Host '== 코어 업데이트 · Core update =='
+    if ($localDir) { Write-Host "이 폴더의 파일을 써요 · Using the files in this folder: $localDir" }
 
     # ---- 1. find the cards
     if ($env:HB_CARD_ROOTS) { $roots = $env:HB_CARD_ROOTS -split ';' | Where-Object { $_ } }
@@ -45,10 +61,10 @@ function Update-HbCard {
     New-Item -ItemType Directory -Path $tmp | Out-Null
     try {
         # ---- 2. what the latest release has
-        Write-Host '새 판 목록 받는 중 · Downloading the update list...'
+        Write-Host '새 판 목록 읽는 중 · Reading the update list...'
         try {
-            Get-Url "$base/card-updates.txt" (Join-Path $tmp 'card-updates.txt')
-            Get-Url "$base/SHA256SUMS.txt" (Join-Path $tmp 'SHA256SUMS.txt')
+            Get-File 'card-updates.txt' (Join-Path $tmp 'card-updates.txt')
+            Get-File 'SHA256SUMS.txt' (Join-Path $tmp 'SHA256SUMS.txt')
         } catch {
             Write-Host '!! 목록을 못 받았어요(인터넷 연결을 확인해 주세요) · could not download the update list'
             return 1
@@ -99,8 +115,8 @@ function Update-HbCard {
             if ($newFiles.ContainsKey($p.Name)) { continue }
             $zip = Join-Path $tmp $p.Zip
             if (-not (Test-Path -LiteralPath $zip)) {
-                Write-Host "받는 중 · Downloading $($p.Zip) ..."
-                Get-Url "$base/$($p.Zip)" $zip
+                Write-Host "새 코어 준비 중 · Getting $($p.Zip) ..."
+                Get-File $p.Zip $zip
                 if (-not $sums.ContainsKey($p.Zip) -or (Sha256Of $zip) -ne $sums[$p.Zip]) { Write-Host "!! $($p.Zip) 지문이 안 맞아요 · checksum mismatch"; return 1 }
             }
             $out = Join-Path $tmp ('new_' + $p.Name)
