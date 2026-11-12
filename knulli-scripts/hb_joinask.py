@@ -7,14 +7,17 @@ UDP 55435) whether a netplay room for the same game is already open. If one is, 
 /dev/fb0 - [A] Join / [B] Solo, solo after 10 s - and hands the choice to emulatorlauncher. It also handles
 DSperate rooms (--ds), paired versions (two different games that link) and per-player saves (hb_ownsave).
 UI language: HB_LANG, else system.language in knulli.conf (Korean when it starts with "ko", otherwise English).
+Room search: up to 0.8 s for an answer (it ends at once when a room for the same game answers);
+global.hb_joinask_wait=<seconds> (0.2 - 3.0) in knulli.conf changes that, for slow Wi-Fi.
+On older KNULLI builds without knulli.conf the same lines are read from batocera.conf.
 The notes below are the original Korean design log.
 
 
 10/19: 같은 게임을 켤 때 '같이 / 혼자'를 고르는 창
 - 게임을 켤 때 emulatorlauncher 의 gameStart 훅(scripts/nds_save_sync.sh 17번 블록)이 부름:
   레트로아크 게임이고, 넷플레이로 켠 게 아닐 때만(방장 'A 길게 → 넷플레이 호스트'는 그대로).
-- 같은 와이파이에 레트로아크 방 찾기 신호(RANQ, UDP 55435 방송)를 0 · 0.1 · 0.25초에 보내고 0.4초 동안 답(RANS)을 모음.
-  '같은 게임' 방이 없으면 바로 끝남 → 평소처럼 혼자 켜짐(늘어나는 시간 0.4초 이하, 와이파이가 없으면 0초).
+- 같은 와이파이에 레트로아크 방 찾기 신호(RANQ, UDP 55435 방송)를 0 · 0.1 · 0.25 · 0.5초에 보내고 0.8초 동안(11/13 · 예전 0.4초) 답(RANS)을 모음.
+  '같은 게임' 방이 없으면 바로 끝남 → 평소처럼 혼자 켜짐(늘어나는 시간 0.8초 이하, 와이파이가 없으면 0초).
   같은 게임 = 답의 content(방장 롬 이름, 확장자 뺌)가 이 롬 이름과 같음. 이름이 달라도 content_crc 가 같으면 같은 게임
   (zip 은 안의 첫 파일 CRC, 32MB 이하 낱개 파일만 직접 계산 — 큰 CD 이미지는 이름으로만).
 - 방이 있으면 화면(/dev/fb0, 640x480 BGRA 두 장)에 창: '같은 게임 방이 열려 있어요 · 방장 OO' + [A 같이하기] [B 혼자 하기],
@@ -22,7 +25,7 @@ The notes below are the original Korean design log.
   '같이'면 /tmp/hb_joinask.json 에 {rom, ip, port, nick, t} → emulatorlauncher.py(오버레이에 넣은 몇 줄)가 손님(--connect)으로 켬.
 - 켜는 동안 로딩 그림(hb_gamesplash.py)은 SIGSTOP 으로 잠깐 멈추고, 창을 닫을 때 화면 두 장을 창 뜨기 전 그대로 되돌린 뒤 SIGCONT.
 - 끄기: knulli.conf 에 global.hb_joinask=0 (기기 메뉴 → 게임 설정 → '같이하기 방 물어보기') 또는 /userdata/system/claude/hb_joinask.off
-- 기록: /tmp/hb_joinask.log (램). 시험: --fake-fb 파일(화면 대신 파일) · --fake-keys 파일(hb_osd FakeKeys 형식) · --bcast 주소 · --png 저장 경로.
+- 기록: /tmp/hb_joinask.log (램). 시험: --fake-fb 파일(화면 대신 파일) · --fake-keys 파일(hb_keys FakeKeys 형식) · --bcast 주소 · --png 저장 경로.
 - DS 같이하기(--ds, hb_dsperate_run.sh 가 부름): DSperate 방장은 1초마다 UDP 7063 으로 방 알림(80바이트, 이름 '<이름>'s game [<그룹>]')을 보냄.
   1.1초 듣고 같은 그룹(groups.txt 그룹 > 롬 게임 코드 4글자 > 파일 이름 — DSperate hbfam2 와 같은 규칙) 방이 있으면 같은 창.
   '같이'면 방장 주소를 화면에 안 쓰고 stdout 한 줄로 → 스크립트가 --lan-join 주소로 켬. '혼자'면 넷 없이 켬.
@@ -56,6 +59,8 @@ import zlib
 CLAUDE = '/userdata/system/claude'
 OFF = CLAUDE + '/hb_joinask.off'
 CONF = '/userdata/system/knulli.conf'
+if not os.path.exists(CONF) and os.path.exists('/userdata/system/batocera.conf'):
+    CONF = '/userdata/system/batocera.conf'      # older KNULLI builds (2024 - 2025) keep their settings here
 
 
 def ui_lang():
@@ -118,11 +123,12 @@ KEY_FONT = ('Galmuri11-Bold.ttf', 24)
 BADGE = (2, 4, 5, 6, 7, 7, 8, 8, 8, 8, 8, 7, 7, 6, 5, 4, 2)   # 단추 그림 원: 줄마다 가운데 칸에서 양쪽 칸 수(지름 17칸)
 PORT = 55435
 RANQ, RANS = 0x52414E51, 0x52414E53
-SENDS = (0.0, 0.1, 0.25)      # 방 찾기 신호 보내는 때(초)
-WAIT = 0.4                    # 답을 기다리는 가장 긴 시간(초) — 같은 게임 방 답이 오면 그 자리에서 끝
+SENDS = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0)   # 방 찾기 신호 보내는 때(초) · 11/13 뒤쪽 셋 더함(기다리는 시간 안의 것만 보냄)
+WAIT = 0.8                    # 답을 기다리는 가장 긴 시간(초) — 같은 게임 방 답이 오면 그 자리에서 끝
+#   11/13: 0.4 → 0.8(느린 공유기 · 휴대폰 핫스팟에서 답이 0.3초 넘게 걸려 방을 놓침) · knulli.conf 의 global.hb_joinask_wait=<초>(0.2 ~ 3.0)로 바꿀 수 있음
 ASK_SEC = 10                  # 창에서 안 고르면 혼자
 IGNORE_SEC = 0.25             # 창이 뜬 뒤 이 시간 동안은 키를 안 셈(켤 때 누른 A 가 튀는 것 막기)
-A_KEY, B_KEY = 304, 305       # 기기 패드 A · B (es_input.cfg, hb_osd.py 와 같음)
+A_KEY, B_KEY = 304, 305       # 기기 패드 A · B (es_input.cfg)
 W, H, STRIDE = 640, 480, 2560
 HALF = STRIDE * H
 FAMILY = {}   # optional nickname -> label map (empty: the RetroArch nickname is shown as is)
@@ -162,6 +168,18 @@ def turned_off():
     except OSError:
         pass
     return False
+
+
+def conf_wait():
+    """(11/13) 방 답을 기다리는 시간(초) — knulli.conf 의 global.hb_joinask_wait=<초>(0.2 ~ 3.0) · 없거나 이상한 값이면 WAIT"""
+    try:
+        with open(CONF, errors='replace') as f:
+            for line in f:
+                if line.startswith('global.hb_joinask_wait='):
+                    return min(3.0, max(0.2, float(line.split('=', 1)[1].strip())))
+    except (OSError, ValueError):
+        pass
+    return WAIT
 
 
 def stem(p):
@@ -761,11 +779,11 @@ def ask(host, args):
         if args.fake_keys:
             sys.path.insert(0, CLAUDE)
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            import hb_osd as HO
+            import hb_keys as HO
             keys = HO.FakeKeys(args.fake_keys)
         else:
             sys.path.insert(0, CLAUDE)
-            import hb_osd as HO
+            import hb_keys as HO
             keys = HO.EvdevKeys([A_KEY, B_KEY])
         try:
             os.remove(PRESS)   # 지난 시험이 남긴 시험 파일이 같이하기 창을 저절로 고르지 않게(창이 뜬 뒤에 쓴 것만 셈)
@@ -895,7 +913,7 @@ def main():
     if args.ds:
         rooms = [r + (None,) for r in find_ds_rooms(ds_group(args.rom, args.ds_group), args.ds_port)]
     else:
-        rooms = find_rooms(args.rom, args.bcast, args.port,
+        rooms = find_rooms(args.rom, args.bcast, args.port, wait=conf_wait(),
                            core=args.core if args.system in ('gba', 'ngp', 'ngpc', 'wswan', 'wswanc') else '')
     if args.find_only:
         print(json.dumps(rooms, ensure_ascii=False))

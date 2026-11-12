@@ -16,7 +16,9 @@
 |---|---|
 | `nds_save_sync.sh` | EmulationStation game-start / game-end hook — the entry point that calls the helpers below. It must be the **only** file in `/userdata/system/scripts/` (KNULLI runs every file there). |
 | `hb_joinask.py` | The **Join / Solo** prompt. When a game starts, it asks the local network whether a netplay room for the same game is open and, if so, offers to join it (solo after 10 s). Handles DSperate rooms and paired versions too. Shows Korean when `system.language` starts with `ko`, English otherwise (override with `HB_LANG`). |
+| `hb_keys.py` | Reads the A / B buttons for the prompt (read-only, through python-evdev, which KNULLI ships). `hb_joinask.py` imports it, so the two go together. |
 | `launcher/emulatorlauncher.patch` | Small patch for KNULLI's `configgen/emulatorlauncher.py`: starts the guest after the prompt picked Join, and keeps the per-game core for guests joining from the ES netplay lobby. |
+| `launcher/hb_patch.py` | Puts that patch in, or takes it out, without the `patch` command (some KNULLI builds have none). It only accepts an exact match of the surrounding lines. |
 | `hb_ownsave.py` | Per-player saves for the dual-console cores (GBA, WonderSwan, Neo Geo Pocket, Game Gear): the guest's own save plays in the host's P2 slot and goes back to the guest afterwards. Also holds the table of paired versions. |
 | `netplay_sram_flush.py` | Writes in-game saves to disk right away during netplay, with an optional CPU boost while a session runs. |
 | `nds_save_sync.py` | Keeps DS saves in step between DraStic, melonDS DS and DSperate. |
@@ -30,7 +32,9 @@
 
 ## Install
 
-On the device over SSH, from the unpacked `knulli-scripts` folder:
+The quick way is `sh install.sh knulli-scripts` (see [Quick start](../README.md#quick-start-knulli)). It does the steps below, finds the launcher whichever Python the build has (3.11, 3.12, …) and needs no `patch` command.
+
+By hand, on the device over SSH, from the unpacked `knulli-scripts` folder:
 
 ```sh
 # 1) scripts (default folder: DSperate's prebuilt binary calls hb_direct.py and hb_joinask.py from here)
@@ -45,8 +49,10 @@ chmod +x /userdata/system/scripts/nds_save_sync.sh
 
 # 3) the launcher patch, so "Join" really starts the guest
 mount -o remount,rw /
-patch -p1 -d / < launcher/emulatorlauncher.patch
-knulli-save-overlay
+L=$(ls /usr/lib/python3*/site-packages/configgen/emulatorlauncher.py)    # python3.11 on 2024 builds, python3.12 on newer ones
+cp "$L" /userdata/system/emulatorlauncher.py.before_patch                 # a copy of the original, just in case
+python3 launcher/hb_patch.py apply launcher/emulatorlauncher.patch "$L"   # no patch command needed
+knulli-save-overlay                                                       # older KNULLI builds: batocera-save-overlay
 
 # 4) optional services: copy, then add their names to system.services in knulli.conf
 mkdir -p /userdata/system/services
@@ -54,8 +60,15 @@ cp services/* /userdata/system/services/
 ```
 
 - Turn the prompt off: `global.hb_joinask=0` in `/userdata/system/knulli.conf`, or create `/userdata/system/claude/hb_joinask.off`.
-- Undo the launcher patch: `patch -R -p1 -d / < launcher/emulatorlauncher.patch && knulli-save-overlay`.
+- Undo the launcher patch: `python3 launcher/hb_patch.py reverse launcher/emulatorlauncher.patch "$L"`, then save the overlay again.
 - Logs go to `/tmp` (RAM), for example `/tmp/hb_joinask.log`.
+
+## Good to know
+
+- **Slow Wi-Fi.** When a game starts, the prompt waits up to 0.8 s for a room to answer (0.4 s before release 2026.11.13). If a room is open and still no prompt appears, give it more time: `global.hb_joinask_wait=1.5` in `knulli.conf`, anything from 0.2 to 3.0 seconds. The wait only costs time when nobody answers; a room for the same game ends the search at once. `/tmp/hb_joinask.log` shows how long each search took and which rooms answered.
+- **Rooms with a password.** The prompt skips rooms that have a netplay or spectator password, because it has no way to type one, so no window appears. Host without a password at home, or join that room from the netplay menu.
+- **Paired versions go by file name.** `PAIRS` in `hb_ownsave.py` lists each pair by ROM file name without the extension. Upper and lower case do not matter, but everything else has to match, tags such as `(U) (V1.1)` included. Put your own names into that table on both devices, for example `(("Pokemon - Ruby Version (U) (V1.1)", "Ruby"), ("Pokemon - Sapphire Version (U) (V1.1)", "Sapphire")),` — the second word of each entry is the short name shown in the window. The guest also needs the host's game in the same ROM folder, as the same file. `LINK_FAMILIES` in `hb_joinask.py` goes by file name in the same way.
+- **Older KNULLI builds (2024–2025).** They use `batocera-save-overlay` instead of `knulli-save-overlay` and `/userdata/system/batocera.conf` instead of `knulli.conf`; the 2024/12 build also has Python 3.11 and no `patch` command. `install.sh` and the prompt handle all of that. The other switches (`global.hb_direct`, `global.hb_ds_autopop`) and the lobby-guest part of the launcher patch still read `knulli.conf` only.
 
 ## Before you use them
 
