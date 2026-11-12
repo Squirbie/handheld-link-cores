@@ -14,6 +14,9 @@
 #   - a file that this script would overwrite and did not put there itself is moved to
 #     /userdata/system/hanbang_cores/backup/ first, and put back by --uninstall
 #   - what was installed is recorded in /userdata/system/hanbang_cores/installed.txt
+#   - the launcher patch (knulli-scripts) goes in with patch, or with the bundled Python helper on builds that have
+#     no patch command; KNULLI's emulatorlauncher.py is looked up under /usr/lib/python3.*/ (3.11, 3.12, ...)
+#   - the overlay is saved with knulli-save-overlay, or batocera-save-overlay on older KNULLI builds
 # It never edits knulli.conf. Running it again, or removing twice, is safe.
 #
 # POSIX sh (BusyBox ash is fine). No bash-only syntax.
@@ -50,13 +53,33 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+overlay_cmd() {
+  # The command that keeps the /usr overlay across a reboot: knulli-save-overlay, or batocera-save-overlay on older KNULLI
+  # builds (2024-2025). Prints nothing when there is neither.
+  if command -v knulli-save-overlay >/dev/null 2>&1; then
+    printf '%s' knulli-save-overlay
+  elif command -v batocera-save-overlay >/dev/null 2>&1; then
+    printf '%s' batocera-save-overlay
+  fi
+}
+
+conf_name() {
+  # The settings file of this build: knulli.conf, or batocera.conf on older KNULLI builds that have no knulli.conf.
+  if [ ! -e "$ROOT/userdata/system/knulli.conf" ] && [ -e "$ROOT/userdata/system/batocera.conf" ]; then
+    printf '%s' batocera.conf
+  else
+    printf '%s' knulli.conf
+  fi
+}
+
 save_overlay() {
   # KNULLI keeps /usr in an overlay; this makes links and .info files survive a reboot.
   if [ "$SYS_TOUCHED" = 1 ] && [ -z "$ROOT" ] && [ "$DRY" = 0 ]; then
     mount -o remount,rw / 2>/dev/null || true
-    if command -v knulli-save-overlay >/dev/null 2>&1; then
-      say "Saving the overlay so the changes under /usr survive a reboot ..."
-      knulli-save-overlay || warn "knulli-save-overlay failed; run it by hand"
+    so_cmd=$(overlay_cmd)
+    if [ -n "$so_cmd" ]; then
+      say "Saving the overlay so the changes under /usr survive a reboot ($so_cmd) ..."
+      "$so_cmd" || warn "$so_cmd failed; run it by hand"
     fi
     SYS_TOUCHED=0
   fi
@@ -85,7 +108,8 @@ Usage:
 Options:
   --dry-run       show what would happen; change nothing
   --root DIR      put DIR in front of every absolute path (for testing off-device);
-                  remount and knulli-save-overlay are skipped
+                  remount and the overlay save (knulli-save-overlay, or batocera-save-overlay
+                  on older builds) are skipped
   --from DIR      use the zip files in DIR instead of downloading them
                   (checked against DIR/SHA256SUMS.txt when that file is there)
   --release TAG   download a specific release (for example 2026.10.29) instead of the latest
@@ -578,13 +602,78 @@ patch_state() { # patchfile target
   else printf 'partial'; fi
 }
 
+# KNULLI's emulatorlauncher.py sits under /usr/lib/python3.<minor>/ (3.11 on the 2024 builds, 3.12 on later ones), so it is
+# looked up instead of assumed. With more than one, the folder of the python3 that really runs wins, otherwise the newest.
+# Prints the path without the leading "/" (the way a diff header has it), or nothing.
+find_launcher() {
+  fl_run=""
+  if command -v python3 >/dev/null 2>&1; then
+    fl_run=$(python3 -c 'import sys; print("python%d.%d" % sys.version_info[:2])' 2>/dev/null) || fl_run=""
+  fi
+  fl_pick=""; fl_best=""; fl_bestv=-1
+  for fl_f in "$ROOT"/usr/lib/python3*/site-packages/configgen/emulatorlauncher.py; do
+    [ -f "$fl_f" ] || continue
+    fl_rel=${fl_f#"$ROOT"/}
+    fl_dir=${fl_rel#usr/lib/}
+    fl_dir=${fl_dir%%/*}
+    fl_v=${fl_dir#python3}
+    fl_v=${fl_v#.}
+    case "$fl_v" in *[!0-9]*) continue ;; esac
+    fl_v=${fl_v:-0}
+    if [ "$fl_dir" = "$fl_run" ]; then fl_pick=$fl_rel; fi
+    if [ "$fl_v" -gt "$fl_bestv" ]; then fl_bestv=$fl_v; fl_best=$fl_rel; fi
+  done
+  printf '%s' "${fl_pick:-$fl_best}"
+}
+
+# The diff in the package names the launcher of one KNULLI version (python3.12). This writes a copy whose file names
+# point at the launcher that is really there.
+lp_retarget() { # diff copy launcher(no leading /)
+  sed -e "s|^--- a/usr/lib/python3[^/]*/site-packages/configgen/emulatorlauncher\\.py|--- a/$3|" \
+      -e "s|^+++ b/usr/lib/python3[^/]*/site-packages/configgen/emulatorlauncher\\.py|+++ b/$3|" "$1" > "$2"
+}
+
+# Would the launcher patch go in (apply) or come out (reverse)? Changes nothing; sets LP_TOOL to the tool that can do it.
+# The patch command is asked first. Where there is none (some KNULLI builds), or it gives up, the Python helper
+# launcher/hb_patch.py is asked: it wants every context line to match exactly, wherever the hunk sits in the file.
+lp_can() { # apply|reverse diff launcher(with $ROOT) helper
+  LP_TOOL=""
+  lp_rev=""
+  if [ "$1" = reverse ]; then lp_rev="-R"; fi
+  if command -v patch >/dev/null 2>&1; then
+    lp_flag=$(patch_gnu_flag)
+    # shellcheck disable=SC2086
+    if patch $lp_flag $lp_rev --dry-run -p1 -d "${ROOT:-/}" < "$2" >/dev/null 2>&1; then LP_TOOL=patch; return 0; fi
+  fi
+  if [ -f "$4" ] && command -v python3 >/dev/null 2>&1; then
+    if python3 "$4" "$1" --dry-run "$2" "$3" >/dev/null 2>&1; then LP_TOOL=python3; return 0; fi
+  fi
+  return 1
+}
+
+lp_do() { # same arguments, after lp_can said yes
+  if [ "$LP_TOOL" = patch ]; then
+    lp_rev=""
+    if [ "$1" = reverse ]; then lp_rev="-R"; fi
+    lp_had=0
+    if [ -e "$3.orig" ]; then lp_had=1; fi
+    lp_flag=$(patch_gnu_flag)
+    # shellcheck disable=SC2086
+    patch $lp_flag $lp_rev -p1 -d "${ROOT:-/}" < "$2" >/dev/null
+    if [ "$lp_had" = 0 ]; then rm -f "$3.orig"; fi      # some patch tools leave this copy when the line numbers differ
+  else
+    python3 "$4" "$1" "$2" "$3" >/dev/null
+  fi
+}
+
 install_scripts() {
   isp=knulli-scripts
   if [ "$DRY" = 1 ] && [ ! -d "$PKGDIR" ]; then
     say "  would install  the .py helpers and fonts/ into $CLAUDE_DIR/"
     say "  would install  nds_save_sync.sh into /userdata/system/scripts/ (it must be the only file there)"
     say "  would install  service wrappers into /userdata/system/services/ (they stay off until named in knulli.conf)"
-    say "  would patch    KNULLI's emulatorlauncher.py with launcher/emulatorlauncher.patch (skipped if already applied)"
+    say "  would patch    KNULLI's emulatorlauncher.py with launcher/emulatorlauncher.patch (skipped if already applied;"
+    say "                 uses the bundled Python helper when the device has no patch command)"
     return 0
   fi
   for isp_f in "$PKGDIR"/*.py; do
@@ -609,35 +698,43 @@ install_scripts() {
   done
   # The launcher patch.
   isp_patch=$PKGDIR/launcher/emulatorlauncher.patch
+  isp_help=$PKGDIR/launcher/hb_patch.py
   [ -f "$isp_patch" ] || die "the package is missing launcher/emulatorlauncher.patch"
-  isp_tgt=$(awk '/^--- /{print $2; exit}' "$isp_patch")
-  isp_tgt=${isp_tgt#a/}
-  isp_flag=$(patch_gnu_flag)
-  if [ ! -f "$ROOT/$isp_tgt" ]; then
-    warn "/$isp_tgt not found, so the launcher patch was skipped (a Join will not start the guest automatically)"
+  isp_tgt=$(find_launcher)
+  if [ -z "$isp_tgt" ]; then
+    warn "KNULLI's emulatorlauncher.py was not found under /usr/lib/python3*/site-packages/configgen/, so the launcher patch was skipped (a Join will not start the guest automatically)"
     return 0
   fi
-  isp_state=$(patch_state "$isp_patch" "$ROOT/$isp_tgt")
+  isp_work=$TMP/emulatorlauncher.patch
+  lp_retarget "$isp_patch" "$isp_work" "$isp_tgt"
+  isp_state=$(patch_state "$isp_work" "$ROOT/$isp_tgt")
   case "$isp_state" in
     applied)
-      say "  launcher patch already applied" ;;
+      say "  launcher patch already applied (/$isp_tgt)"
+      if [ "$DRY" = 0 ] && [ -f "$isp_help" ] && rec_has X $isp "$HCL/patches/emulatorlauncher.patch" && [ -d "$ROOT$HCL/patches" ]; then
+        cp "$isp_help" "$ROOT$HCL/patches/hb_patch.py"      # an install from before this helper existed: --uninstall can use it now
+      fi ;;
     partial)
       warn "/$isp_tgt contains only part of the launcher patch; left alone. Compare it with knulli-scripts/launcher/emulatorlauncher.patch." ;;
     *)
-      # shellcheck disable=SC2086
-      if patch $isp_flag --dry-run -p1 -d "${ROOT:-/}" < "$isp_patch" >/dev/null 2>&1; then
+      if lp_can apply "$isp_work" "$ROOT/$isp_tgt" "$isp_help"; then
         if [ "$DRY" = 1 ]; then
-          say "  would patch    /$isp_tgt"
+          say "  would patch    /$isp_tgt (with $LP_TOOL)"
         else
           touch_path "/$isp_tgt"
-          mkdir -p "$ROOT$HCL/patches"
-          cp "$isp_patch" "$ROOT$HCL/patches/emulatorlauncher.patch"
-          # shellcheck disable=SC2086
-          patch $isp_flag -p1 -d "${ROOT:-/}" < "$isp_patch" >/dev/null
-          if [ "$(patch_state "$isp_patch" "$ROOT/$isp_tgt")" != applied ]; then die "the launcher patch did not take; check /$isp_tgt"; fi
+          mkdir -p "$ROOT$HCL/patches" "$ROOT$HCL/backup"
+          cp -p "$ROOT/$isp_tgt" "$ROOT$HCL/backup/emulatorlauncher.py.before_patch"
+          cp "$isp_work" "$ROOT$HCL/patches/emulatorlauncher.patch"
+          if [ -f "$isp_help" ]; then cp "$isp_help" "$ROOT$HCL/patches/hb_patch.py"; fi      # --uninstall needs it where there is no patch command
+          lp_do apply "$isp_work" "$ROOT/$isp_tgt" "$isp_help"
+          if [ "$(patch_state "$isp_work" "$ROOT/$isp_tgt")" != applied ]; then die "the launcher patch did not take; check /$isp_tgt"; fi
           rec_add X $isp "$HCL/patches/emulatorlauncher.patch"
-          say "  patched        /$isp_tgt"
+          say "  patched        /$isp_tgt (with $LP_TOOL; the file as it was is kept in $HCL/backup/emulatorlauncher.py.before_patch)"
         fi
+      elif ! command -v patch >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+        warn "neither patch nor python3 was found, so the launcher patch was skipped. Everything else was installed; see knulli-scripts/README.md."
+      elif ! command -v patch >/dev/null 2>&1 && [ ! -f "$isp_help" ]; then
+        warn "there is no patch command here and this package has no launcher/hb_patch.py (a release from before 2026.11.13?), so the launcher patch was skipped. Everything else was installed."
       else
         warn "the launcher patch does not apply to /$isp_tgt (a different KNULLI version?). Everything else was installed; see knulli-scripts/README.md."
       fi ;;
@@ -726,24 +823,31 @@ uninstall_pkg() {
   rec_list "$up" X > "$up_l"
   while IFS="$TAB" read -r up_k up_p up_a up_b; do
     [ -n "$up_p" ] || continue
-    up_flag=$(patch_gnu_flag)
     if [ -f "$ROOT$up_a" ]; then
       up_tgt=$(awk '/^--- /{print $2; exit}' "$ROOT$up_a")
       up_tgt=${up_tgt#a/}
+      up_help=$(dirname "$ROOT$up_a")/hb_patch.py
+      up_bak=$ROOT$HCL/backup/emulatorlauncher.py.before_patch
       if [ -f "$ROOT/$up_tgt" ] && [ "$(patch_state "$ROOT$up_a" "$ROOT/$up_tgt")" = applied ]; then
-        # shellcheck disable=SC2086
-        if patch $up_flag --dry-run -R -p1 -d "${ROOT:-/}" < "$ROOT$up_a" >/dev/null 2>&1; then
+        if lp_can reverse "$ROOT$up_a" "$ROOT/$up_tgt" "$up_help"; then
           touch_path "/$up_tgt"
-          # shellcheck disable=SC2086
-          patch $up_flag -R -p1 -d "${ROOT:-/}" < "$ROOT$up_a" >/dev/null
-          say "  launcher patch taken out of /$up_tgt"
+          lp_do reverse "$ROOT$up_a" "$ROOT/$up_tgt" "$up_help"
+          say "  launcher patch taken out of /$up_tgt (with $LP_TOOL)"
+          if [ -f "$up_bak" ]; then
+            if cmp -s "$up_bak" "$ROOT/$up_tgt"; then
+              rm -f "$up_bak"
+            else
+              say "  note: /$up_tgt differs from the copy saved before patching; that copy stays in $HCL/backup/emulatorlauncher.py.before_patch"
+            fi
+          fi
         else
-          warn "the launcher patch no longer reverses cleanly (the file changed); /$up_tgt left as it is"
+          warn "the launcher patch no longer reverses cleanly (the file changed, or there is neither patch nor python3); /$up_tgt left as it is"
         fi
       else
         say "  launcher patch is not in /$up_tgt any more; nothing to take out"
+        rm -f "$up_bak"
       fi
-      rm -f "$ROOT$up_a"
+      rm -f "$ROOT$up_a" "$up_help"
     fi
   done < "$up_l"
   rec_list "$up" D > "$up_l"
@@ -919,8 +1023,8 @@ if [ -z "$ROOT" ] && [ "$FORCE" = 0 ]; then
   if [ ! -d /userdata ]; then die "/userdata not found: this does not look like KNULLI. Use --force to try anyway."; fi
 fi
 if [ -z "$ROOT" ] && [ "$DRY" = 0 ]; then
-  if ! command -v knulli-save-overlay >/dev/null 2>&1; then
-    warn "knulli-save-overlay not found: links and .info files under /usr will be gone after a reboot"
+  if [ -z "$(overlay_cmd)" ]; then
+    warn "neither knulli-save-overlay nor batocera-save-overlay was found: links and .info files under /usr will be gone after a reboot"
   fi
   if command -v curl >/dev/null 2>&1; then
     rg=$(curl -s -m 2 http://127.0.0.1:1234/runningGame 2>/dev/null || true)
@@ -977,7 +1081,8 @@ if [ "$DRY" = 1 ]; then
 fi
 if [ "$SYS_TOUCHED" = 1 ]; then
   if [ -n "$ROOT" ]; then
-    say "(--root: skipped remount and knulli-save-overlay)"
+    w_cmd=$(overlay_cmd)
+    say "(--root: skipped remount and ${w_cmd:-the overlay save})"
   else
     save_overlay
   fi
@@ -987,8 +1092,12 @@ sync 2>/dev/null || true
 if [ "$MODE" = install ]; then
   say "Done. Installed:$DONE_PKGS"
   say ""
-  say "Next: this script never edits knulli.conf. Choose a core per game in EmulationStation (game > advanced settings > core)"
-  say "or with a line such as  gba[\"My Game.gba\"].core=mgba_dual  in /userdata/system/knulli.conf. Details: cores/<package>/README.md."
+  n_conf=$(conf_name)
+  say "Next: this script never edits $n_conf. Choose a core per game in EmulationStation (game > advanced settings > core)"
+  say "or with a line such as  gba[\"My Game.gba\"].core=mgba_dual  in /userdata/system/$n_conf. Details: cores/<package>/README.md."
+  if [ "$n_conf" != knulli.conf ]; then
+    say "(This KNULLI build keeps its settings in $n_conf: wherever a README or a line below says knulli.conf, use that file.)"
+  fi
   for n_p in $DONE_PKGS; do
     pkg_meta "$n_p"
     say "  $n_p: $M_HINT"

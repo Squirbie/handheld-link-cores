@@ -1,8 +1,12 @@
 KNULLI configgen patch for the Join / Solo prompt and ES-lobby guests (part of handheld-link-cores)
 SPDX-License-Identifier: GPL-3.0-or-later
-Target: /usr/lib/python3.12/site-packages/configgen/emulatorlauncher.py, stock md5 96581451043c1ba63ff799c9d59f0bda
-Apply on the device:  mount -o remount,rw / && patch -p1 -d / < emulatorlauncher.patch && knulli-save-overlay
-Undo:                 patch -R -p1 -d / < emulatorlauncher.patch && knulli-save-overlay
+Made against /usr/lib/python3.12/site-packages/configgen/emulatorlauncher.py, stock md5 96581451043c1ba63ff799c9d59f0bda.
+Older KNULLI builds keep the same file under /usr/lib/python3.11/. The hunks also fit the launcher sources of the
+20241204, 20250505 and 20250813 releases, at most one line away from the line numbers below.
+install.sh finds the file and applies this. By hand, with L = the full path of emulatorlauncher.py on the device:
+  apply:  mount -o remount,rw / && python3 hb_patch.py apply emulatorlauncher.patch "$L" && knulli-save-overlay
+  undo:   python3 hb_patch.py reverse emulatorlauncher.patch "$L" && knulli-save-overlay
+hb_patch.py (next to this file) needs no patch command. On older builds the last command is batocera-save-overlay.
 
 --- a/usr/lib/python3.12/site-packages/configgen/emulatorlauncher.py
 +++ b/usr/lib/python3.12/site-packages/configgen/emulatorlauncher.py

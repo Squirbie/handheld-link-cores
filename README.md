@@ -201,6 +201,7 @@ What the script does:
 - Anything it would overwrite that it did not put there itself (such as a stock core of the same name) is first moved to `/userdata/system/hanbang_cores/backup/`, and `--uninstall` puts it back.
 - Writes what it installed to `/userdata/system/hanbang_cores/installed.txt`, so running it again is safe. It never edits `knulli.conf`.
 - `--dry-run` shows what would happen without changing anything. If a KNULLI update brought a stock core back, run the same command again.
+- It also handles older KNULLI builds (2024–2025): it finds the launcher whichever Python the build has (3.11, 3.12, …), patches it without the `patch` command when there is none, and saves the overlay with `batocera-save-overlay` where there is no `knulli-save-overlay`.
 
 > [!NOTE]
 > `install.sh` is new (2026-10-29). If anything goes wrong, the manual steps below always work, and an issue with the output helps a lot.
@@ -218,10 +219,10 @@ cp mgba_dual_libretro.so /userdata/system/hanbang_cores/
 mount -o remount,rw /
 ln -sfn /userdata/system/hanbang_cores/mgba_dual_libretro.so /usr/lib/libretro/mgba_dual_libretro.so
 cp mgba_dual_libretro.info /usr/share/libretro/info/   # only for cores with a new name
-knulli-save-overlay
+knulli-save-overlay                                    # older KNULLI builds: batocera-save-overlay
 ```
 
-3. Pick the core for a game in `/userdata/system/knulli.conf` — for example `gba["My Game.gba"].core=mgba_dual` — or in the game's advanced settings in EmulationStation.
+3. Pick the core for a game in `/userdata/system/knulli.conf` (`batocera.conf` on older builds) — for example `gba["My Game.gba"].core=mgba_dual` — or in the game's advanced settings in EmulationStation.
 4. Do the same on the second device. **Both devices need the same core build and the same game file.**
 5. Host a netplay room on one device and join it from the other — or install [`knulli-scripts/`](knulli-scripts/) to get the one-button **Join / Solo** prompt.
 

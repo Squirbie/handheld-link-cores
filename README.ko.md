@@ -201,6 +201,7 @@ sh install.sh --list     # 꾸러미 이름과 이미 넣은 것
 - 스크립트가 넣지 않은 파일을 덮게 되면(같은 이름의 순정 코어 등) 먼저 `/userdata/system/hanbang_cores/backup/` 으로 옮겨 두고, `--uninstall` 하면 되돌려요.
 - 넣은 것은 `/userdata/system/hanbang_cores/installed.txt` 에 적어서 몇 번 다시 실행해도 안전해요. `knulli.conf` 는 건드리지 않아요.
 - `--dry-run` 은 무엇을 할지만 보여 주고 아무것도 안 바꿔요. KNULLI 업데이트로 순정 코어가 돌아왔다면 같은 명령을 한 번 더 실행하세요.
+- 옛 KNULLI 빌드(2024 ~ 2025년)에도 맞춰 두었어요. 빌드의 파이썬이 3.11 이든 3.12 든 실행기를 찾아내고, `patch` 명령이 없으면 그것 없이 패치하고, `knulli-save-overlay` 가 없으면 `batocera-save-overlay` 로 저장해요.
 
 > [!NOTE]
 > `install.sh` 는 새로 만든 것(2026-10-29)이에요. 문제가 생기면 아래 손으로 넣는 법은 늘 돼요. 나온 글을 이슈로 남겨 주시면 큰 도움이 돼요.
@@ -218,10 +219,10 @@ cp mgba_dual_libretro.so /userdata/system/hanbang_cores/
 mount -o remount,rw /
 ln -sfn /userdata/system/hanbang_cores/mgba_dual_libretro.so /usr/lib/libretro/mgba_dual_libretro.so
 cp mgba_dual_libretro.info /usr/share/libretro/info/   # 이름을 바꾼 코어만
-knulli-save-overlay
+knulli-save-overlay                                    # 옛 KNULLI 빌드는 batocera-save-overlay
 ```
 
-3. 게임에 코어를 정해요: `/userdata/system/knulli.conf` 에 `gba["내 게임.gba"].core=mgba_dual` 같은 줄을 넣거나, ES 의 게임별 고급 설정에서 골라요.
+3. 게임에 코어를 정해요: `/userdata/system/knulli.conf`(옛 빌드는 `batocera.conf`)에 `gba["내 게임.gba"].core=mgba_dual` 같은 줄을 넣거나, ES 의 게임별 고급 설정에서 골라요.
 4. 둘째 기기에도 똑같이 해요. **두 기기는 같은 코어 파일 · 같은 게임 파일이어야 해요.**
 5. 한 기기에서 넷플레이 방을 열고 다른 기기에서 들어가요 — [`knulli-scripts/`](knulli-scripts/README.ko.md) 를 넣으면 단추 하나로 고르는 **같이하기 창**이 떠요.
 
