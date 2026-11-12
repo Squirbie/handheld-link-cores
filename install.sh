@@ -14,6 +14,8 @@
 #   - a file that this script would overwrite and did not put there itself is moved to
 #     /userdata/system/hanbang_cores/backup/ first, and put back by --uninstall
 #   - what was installed is recorded in /userdata/system/hanbang_cores/installed.txt
+#   - when an update replaces a helper script (/userdata/system/claude/*.py) that differs from the new one, the file as
+#     it was is kept as /userdata/system/hanbang_cores/backup/<name>.previous, in case you had edited it
 #   - the launcher patch (knulli-scripts) goes in with patch, or with the bundled Python helper on builds that have
 #     no patch command; KNULLI's emulatorlauncher.py is looked up under /usr/lib/python3.*/ (3.11, 3.12, ...)
 #   - the overlay is saved with knulli-save-overlay, or batocera-save-overlay on older KNULLI builds
@@ -48,6 +50,8 @@ RW_DONE=0
 SYS_TOUCHED=0
 SUMS=""
 DONE_PKGS=""
+X_LEFT=0        # 1 = a launcher patch could not be taken out and was left in place
+up_l=""
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -90,6 +94,7 @@ cleanup() {
   trap - EXIT
   if [ "$cl_rc" -ne 0 ]; then save_overlay; fi     # stopped half way: keep what was done consistent with installed.txt
   if [ -n "$TMP" ] && [ -d "$TMP" ]; then rm -rf "$TMP"; fi
+  if [ -n "$up_l" ]; then rm -f "$up_l"; fi
   exit "$cl_rc"
 }
 trap cleanup EXIT
@@ -365,7 +370,19 @@ place_file() { # src dest mode pkg
     if [ "$pf_exists" = 0 ]; then
       say "  would add      $pf_dest"
     elif rec_has F "$pf_pkg" "$pf_dest"; then
-      say "  would update   $pf_dest"
+      if [ -f "$pf_src" ] && [ -f "$pf_real" ] && [ ! -L "$pf_real" ] && cmp -s "$pf_src" "$pf_real"; then
+        say "  up to date     $pf_dest"
+      else
+        case "$pf_dest" in
+          "$CLAUDE_DIR"/*.py)
+            if [ -f "$pf_src" ]; then
+              say "  would update   $pf_dest (the current file is copied to $HCL/backup/$(basename "$pf_dest").previous first)"
+            else
+              say "  would update   $pf_dest"
+            fi ;;
+          *) say "  would update   $pf_dest" ;;
+        esac
+      fi
     else
       say "  would replace  $pf_dest (the current file is moved to $HCL/backup/ first, unless it is identical)"
     fi
@@ -381,7 +398,20 @@ place_file() { # src dest mode pkg
       say "  up to date     $pf_dest"
       return 0
     fi
-    if ! rec_has F "$pf_pkg" "$pf_dest"; then backup_path "$pf_dest" "$pf_pkg"; fi
+    if ! rec_has F "$pf_pkg" "$pf_dest"; then
+      backup_path "$pf_dest" "$pf_pkg"
+    else
+      # A helper script of ours is about to be replaced by a different one. You may have edited it (the PAIRS table in
+      # hb_ownsave.py, LINK_FAMILIES in hb_joinask.py ...), so the file as it was is kept, one copy per name. It is not
+      # recorded: --uninstall never puts it back.
+      case "$pf_dest" in
+        "$CLAUDE_DIR"/*.py)
+          mkdir -p "$ROOT$HCL/backup"
+          if cp -p "$pf_real" "$ROOT$HCL/backup/$(basename "$pf_dest").previous"; then
+            say "  kept a copy    $pf_dest -> $HCL/backup/$(basename "$pf_dest").previous (if you had edited it, copy your lines back from there)"
+          fi ;;
+      esac
+    fi
   fi
   pf_new=$pf_real.hbnew
   if ! cp "$pf_src" "$pf_new"; then rm -f "$pf_new"; die "cannot write $pf_dest (disk full?)"; fi
@@ -662,7 +692,7 @@ lp_do() { # same arguments, after lp_can said yes
     patch $lp_flag $lp_rev -p1 -d "${ROOT:-/}" < "$2" >/dev/null
     if [ "$lp_had" = 0 ]; then rm -f "$3.orig"; fi      # some patch tools leave this copy when the line numbers differ
   else
-    python3 "$4" "$1" "$2" "$3" >/dev/null
+    lp_out=$(python3 "$4" "$1" "$2" "$3" 2>&1) || die "could not change $3: ${lp_out:-python3 failed} (is / writable?)"
   fi
 }
 
@@ -782,6 +812,7 @@ uninstall_pkg() {
   fi
   up_l=$(mktemp "${TMPDIR:-/tmp}/hbun.XXXXXX")
   up_keep=" "
+  up_xkeep=""
   # 1) symlinks over stock files: only remove the link when the original can be put back
   rec_list "$up" S > "$up_l"
   while IFS="$TAB" read -r up_k up_p up_a up_b; do
@@ -828,26 +859,43 @@ uninstall_pkg() {
       up_tgt=${up_tgt#a/}
       up_help=$(dirname "$ROOT$up_a")/hb_patch.py
       up_bak=$ROOT$HCL/backup/emulatorlauncher.py.before_patch
-      if [ -f "$ROOT/$up_tgt" ] && [ "$(patch_state "$ROOT$up_a" "$ROOT/$up_tgt")" = applied ]; then
+      up_state=none
+      if [ -f "$ROOT/$up_tgt" ]; then up_state=$(patch_state "$ROOT$up_a" "$ROOT/$up_tgt"); fi
+      up_stuck=""
+      if [ "$up_state" = applied ]; then
         if lp_can reverse "$ROOT$up_a" "$ROOT/$up_tgt" "$up_help"; then
           touch_path "/$up_tgt"
           lp_do reverse "$ROOT$up_a" "$ROOT/$up_tgt" "$up_help"
-          say "  launcher patch taken out of /$up_tgt (with $LP_TOOL)"
-          if [ -f "$up_bak" ]; then
-            if cmp -s "$up_bak" "$ROOT/$up_tgt"; then
-              rm -f "$up_bak"
-            else
-              say "  note: /$up_tgt differs from the copy saved before patching; that copy stays in $HCL/backup/emulatorlauncher.py.before_patch"
+          if [ "$(patch_state "$ROOT$up_a" "$ROOT/$up_tgt")" = none ]; then
+            say "  launcher patch taken out of /$up_tgt (with $LP_TOOL)"
+            if [ -f "$up_bak" ]; then
+              if cmp -s "$up_bak" "$ROOT/$up_tgt"; then
+                rm -f "$up_bak"
+              else
+                say "  note: /$up_tgt differs from the copy saved before patching; that copy stays in $HCL/backup/emulatorlauncher.py.before_patch"
+              fi
             fi
+          else
+            up_stuck="the launcher patch did not come out of /$up_tgt cleanly"
           fi
         else
-          warn "the launcher patch no longer reverses cleanly (the file changed, or there is neither patch nor python3); /$up_tgt left as it is"
+          up_stuck="the launcher patch no longer reverses cleanly (the file changed, or there is neither patch nor python3), so /$up_tgt was left as it is"
         fi
+      elif [ "$up_state" = partial ]; then
+        up_stuck="/$up_tgt contains only part of the launcher patch (changed by hand?), so it was left as it is"
       else
         say "  launcher patch is not in /$up_tgt any more; nothing to take out"
         rm -f "$up_bak"
       fi
-      rm -f "$ROOT$up_a" "$up_help"
+      if [ -n "$up_stuck" ]; then
+        # Keep the stored patch, the helper and the record, so the same --uninstall can be tried again later.
+        up_xkeep=$up_a
+        X_LEFT=1
+        warn "$up_stuck. The stored patch stays in $up_a; run \"--uninstall $up\" again once the launcher is back to how install.sh left it."
+        if [ -f "$up_bak" ]; then warn "the launcher as it was before patching is kept in $HCL/backup/emulatorlauncher.py.before_patch"; fi
+      else
+        rm -f "$ROOT$up_a" "$up_help"
+      fi
     fi
   done < "$up_l"
   rec_list "$up" D > "$up_l"
@@ -877,9 +925,11 @@ uninstall_pkg() {
     fi
   done < "$up_l"
   rm -f "$up_l"
+  up_l=""
   rmdir "$ROOT$CLAUDE_DIR/fonts" 2>/dev/null || true
   rmdir "$ROOT$DSP_DIR" 2>/dev/null || true
   rec_drop "" "$up" ""
+  if [ -n "$up_xkeep" ]; then rec_add X "$up" "$up_xkeep"; fi
   DONE_PKGS="$DONE_PKGS $up"
 }
 
@@ -1106,5 +1156,11 @@ if [ "$MODE" = install ]; then
   say "Do the same on the second device: both need the same packages and the same game file."
 else
   if [ -n "$DONE_PKGS" ]; then say "Done. Removed:$DONE_PKGS"; else say "Nothing was removed."; fi
+  if [ "$X_LEFT" = 1 ]; then
+    say "Not everything came out: the launcher patch is still in place (see the warning above)."
+  fi
+  if ! is_installed knulli-scripts && ls "$ROOT$HCL/backup"/*.previous >/dev/null 2>&1; then
+    say "Earlier copies of helper scripts, kept when an update replaced them, are still in $HCL/backup/ (*.previous). Delete them if you do not need them."
+  fi
 fi
 say "Record of what was installed: $REC"

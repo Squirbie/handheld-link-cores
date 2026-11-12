@@ -201,7 +201,8 @@ sh install.sh --list     # 꾸러미 이름과 이미 넣은 것
 - 스크립트가 넣지 않은 파일을 덮게 되면(같은 이름의 순정 코어 등) 먼저 `/userdata/system/hanbang_cores/backup/` 으로 옮겨 두고, `--uninstall` 하면 되돌려요.
 - 넣은 것은 `/userdata/system/hanbang_cores/installed.txt` 에 적어서 몇 번 다시 실행해도 안전해요. `knulli.conf` 는 건드리지 않아요.
 - `--dry-run` 은 무엇을 할지만 보여 주고 아무것도 안 바꿔요. KNULLI 업데이트로 순정 코어가 돌아왔다면 같은 명령을 한 번 더 실행하세요.
-- 옛 KNULLI 빌드(2024 ~ 2025년)에도 맞춰 두었어요. 빌드의 파이썬이 3.11 이든 3.12 든 실행기를 찾아내고, `patch` 명령이 없으면 그것 없이 패치하고, `knulli-save-overlay` 가 없으면 `batocera-save-overlay` 로 저장해요.
+- 옛 KNULLI 빌드(2024년 12월 빌드와 2025년 빌드)에도 맞춰 두었어요. 빌드의 파이썬이 3.11 이든 3.12 든 실행기를 찾아내고, `patch` 명령이 없으면 그것 없이 패치하고, `knulli-save-overlay` 가 없으면 `batocera-save-overlay` 로 저장해요. 2024년 12월보다 앞선 빌드는 실행기가 달라서 실행기 패치는 알리고 건너뛰어요.
+- 업데이트하면서 `/userdata/system/claude/` 의 도우미 스크립트가 다른 판으로 바뀔 때는 쓰던 파일을 `hanbang_cores/backup/<이름>.previous` 로 남겨 둬요. 그 안의 표를 고쳐 쓰셨다면 거기서 다시 옮기면 돼요.
 
 > [!NOTE]
 > `install.sh` 는 새로 만든 것(2026-10-29)이에요. 문제가 생기면 아래 손으로 넣는 법은 늘 돼요. 나온 글을 이슈로 남겨 주시면 큰 도움이 돼요.

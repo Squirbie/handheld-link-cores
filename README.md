@@ -201,7 +201,8 @@ What the script does:
 - Anything it would overwrite that it did not put there itself (such as a stock core of the same name) is first moved to `/userdata/system/hanbang_cores/backup/`, and `--uninstall` puts it back.
 - Writes what it installed to `/userdata/system/hanbang_cores/installed.txt`, so running it again is safe. It never edits `knulli.conf`.
 - `--dry-run` shows what would happen without changing anything. If a KNULLI update brought a stock core back, run the same command again.
-- It also handles older KNULLI builds (2024–2025): it finds the launcher whichever Python the build has (3.11, 3.12, …), patches it without the `patch` command when there is none, and saves the overlay with `batocera-save-overlay` where there is no `knulli-save-overlay`.
+- It also handles older KNULLI builds (the 2024/12 release and the 2025 ones): it finds the launcher whichever Python the build has (3.11, 3.12, …), patches it without the `patch` command when there is none, and saves the overlay with `batocera-save-overlay` where there is no `knulli-save-overlay`. Builds from before 2024/12 have a different launcher, so the launcher patch is skipped there with a warning.
+- When an update replaces one of the helper scripts in `/userdata/system/claude/` with a different version, the file as it was is kept as `hanbang_cores/backup/<name>.previous`, in case you had edited a table in it.
 
 > [!NOTE]
 > `install.sh` is new (2026-10-29). If anything goes wrong, the manual steps below always work, and an issue with the output helps a lot.
