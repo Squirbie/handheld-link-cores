@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
-# KNULLI service: remembers Wi-Fi networks you joined and reconnects when one is in range, like a phone
+# KNULLI service: turns off background Wi-Fi scanning while connected, so netplay does not stall every few minutes
 # (runs /userdata/system/claude/hb_wifimem.py; it only reads knulli.conf). Details at the top of hb_wifimem.py.
 # Enable: add "hb_wifimem" to system.services in /userdata/system/knulli.conf (S99userservices starts it at boot).
 # Disable: remove that word and reboot. Install this file as /userdata/system/services/hb_wifimem

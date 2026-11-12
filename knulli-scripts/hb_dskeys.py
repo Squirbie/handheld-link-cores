@@ -4,16 +4,16 @@
 """(2026-10-10): DS(DraStic) 버튼 도우미 (기기: /userdata/system/claude/hb_dskeys.py)
 
 1) DS 메뉴 = M+B (레트로아크와 같게). 원래 DraStic 은 M 을 누르는 순간 메뉴를 열어서
-   M+볼륨(밝기)·M 꾹(배터리)·M+START(끄기)를 쓸 때마다 메뉴가 떴다(사용자 10/10).
+   M+볼륨(밝기)·M 꾹(배터리)·M+START(끄기)를 쓸 때마다 메뉴가 떴다.
    drastic.cfg 에서 패드 M(controls_b[CONTROL_INDEX_MENU])을 65535(안 씀)로 바꾸고, 이 도우미가 M 을 누른 채 B 를 누르면
    가상 키보드 Home(drastic.cfg controls_a[CONTROL_INDEX_MENU] = 330 = Home)을 보낸다.
    (10/10 21:4x) 메뉴를 열기 전에 게임 안 팝업 글(/tmp/hb_osd.txt, M 꾹 배터리 등)을 비우고 2프레임 기다린다.
-   DraStic 메뉴는 화면을 넘기지(pan) 않아서, 열 때 떠 있던 팝업 글이 메뉴 위에 그대로 남았다(사용자 10/10 21:2x).
+   DraStic 메뉴는 화면을 넘기지(pan) 않아서, 열 때 떠 있던 팝업 글이 메뉴 위에 그대로 남았다.
 2) 끄기 = M+START (10/10 21:4x 바꿈): ds_quit.py 가 /tmp/hb_dskeys.quit 를 만들면 가상 키보드 '3'
    (drastic.cfg controls_a[CONTROL_INDEX_QUIT] = 51 = '3', DraStic 원래 '끄기' 키)을 보낸다 → 메뉴를 거치지 않고 바로 꺼짐.
-   예전에는 메뉴를 열고 맨 밑 Exit 까지 내려가서(3.5초, 메뉴가 보임) '기괴하다'(사용자 10/10 21:2x).
+   예전에는 메뉴를 열고 맨 밑 Exit 까지 내려갔다(3.5초, 메뉴가 보임).
 3) ds_quit.py 가 /tmp/hb_dskeys.menu 를 만들면 메뉴 열기(Home) — 키 '3' 이 안 먹을 때 쓰는 예비 길.
-- (10/10 21:4x 뺌) 오른쪽 스틱(펜)을 쓰면 터치 화면을 자동으로 크게 바꾸던 것: 사용자가 'L2 팝업 확대가 기본, 자동 바꾸기는 없애자'.
+- (10/10 21:4x 뺌) 오른쪽 스틱(펜)을 쓰면 터치 화면을 자동으로 크게 바꾸던 것(L2 팝업 확대가 기본).
 - advanced_drastic/launch.sh 가 DraStic 보다 먼저 띄운다(가상 키보드가 DraStic 시작 전에 있어야 SDL 이 잡음).
 - 패드는 막지(grab) 않는다. DraStic 이 30초 안에 안 뜨거나 뜬 뒤 꺼지면 스스로 끝난다.
 끄기: /userdata/system/claude/hb_dskeys.off (그때는 drastic.cfg 의 controls_b[CONTROL_INDEX_MENU] 를 1035 로 되돌려야 M 으로 메뉴가 열림)

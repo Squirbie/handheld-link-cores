@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# hb_wifimem.py - Remembers several Wi-Fi networks and reconnects on its own, like a phone.
+# hb_wifimem.py - Turns off background Wi-Fi scanning while connected (fewer netplay stalls). The Wi-Fi memory part is off (MEMORY = False).
 # (2026-10-13) 와이파이 여러 개 기억 — 스마트폰처럼, 한 번 연결한 와이파이는 다음에 보이면 저절로 붙게
 # 기기: /userdata/system/claude/hb_wifimem.py · 서비스: /userdata/system/services/hb_wifimem
 # 왜: KNULLI 메뉴에서 와이파이에 연결하면 knulli.conf 의 wifi.ssid·wifi.key 한 쌍을 덮어써서 그 전 와이파이를 잊는다.
@@ -24,12 +24,12 @@
 #   끊겼을 때 다시 찾는 검색(connman)과 메뉴의 와이파이 찾기는 그대로라 저장한 와이파이에 저절로 붙는 것은 안 바뀜.
 #   connman 이 새로 붙을 때마다 다시 걸므로 5초마다 보고 다시 끔(10분에 3번까지 — 혹시 계속 다시 붙는 일이 생기면 그만).
 #   끄기: /userdata/system/claude/hb_bgscan.on 파일이 있으면 이 일은 안 함(KNULLI 기본대로 5분 검색).
-# 고침(10/26 사용자 M218 '핫스팟을 골랐는데 주소가 그대로'): 메뉴에서 다른 와이파이를 고르면 그 순간 옛 망들을 저절로 붙을 곳으로
+# 고침(10/26): 메뉴에서 다른 와이파이를 고르면 그 순간 옛 망들을 저절로 붙을 곳으로
 #   다시 적고 35초 뒤 붙은 망에 Reattach 까지 해서, 신호가 센 옛 망(집)에 그대로 남았음 → 메뉴에서 고른 망이 바뀌면
 #   ① 옛 망 설정 파일을 잠깐 치우고(connman 이 옛 망에서 떨어져 새 망으로) 새 망에 connmanctl connect ② 새 망에 붙거나 60초가 지나면
 #   옛 망 파일을 다시 적음(다음에 그곳에 가면 저절로) ③ 그동안 검색 끄기(Reattach)도 쉼. 비밀번호 없는 와이파이는 기억하지 않음
 #.
-# 바꿈(10/26 03:4x 사용자 M220 '이 기능 넣지 말까? 너무 안 좋아 보여'): **비밀번호 기억 · 저절로 붙기는 뺌**(MEMORY=False) —
+# 바꿈(10/26): **비밀번호 기억 · 저절로 붙기는 뺌**(MEMORY=False) —
 #   메뉴 비번 칸은 KNULLI 가 마지막 비번 하나만 보여 주는데 숨긴 목록 때문에 화면과 실제가 어긋나고 고른 망으로 안 옮겨 갔음.
 #   켜질 때 · 설정이 바뀔 때 목록 파일(hb_wifi/known.json)을 지우고, 우리 connman 파일은 지금 붙은 망 것만 남김(지우면 끊김 — 다음 부팅에 사라짐).
 #   남긴 것: 붙어 있는 동안 배경 검색 끄기(bgscan none + Reattach — 같이하기 렉 줄이기, 10/13). 비밀번호는 안 다룸.
@@ -51,7 +51,7 @@ PREFIX = 'hb_wifimem_'
 MAX = 8
 BG_OFF = 'none'                    # bgscan 값: 없는 방식 이름 → 백그라운드 검색 없음(빈 값은 D-Bus 가 거절)
 BG_KEEP = '/userdata/system/claude/hb_bgscan.on'
-MEMORY = False                     # (10/26 M220) 비밀번호 기억 · 저절로 붙기 끔 — 배경 검색 끄기만 함
+MEMORY = False                     # (10/26) 비밀번호 기억 · 저절로 붙기 끔 — 배경 검색 끄기만 함
 W = 'fi.w1.wpa_supplicant1'
 
 

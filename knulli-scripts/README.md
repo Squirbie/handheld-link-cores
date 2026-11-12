@@ -27,7 +27,7 @@
 | `hb_pspadhoc.py` | PSP ad-hoc multiplayer: a local relay server plus automatic host selection. |
 | `hb_dskeys.py` · `hb_dshold.py` · `hb_ds_remember.py` | DraStic helpers: button helper, swap the screens while L2 is held, remember the large-screen layout per game. |
 | `hb_idlesave.py` | Saves a state and sleeps after a long idle time in game; saves and powers off just before the battery runs out. |
-| `hb_wifimem.py` | Remembers several Wi-Fi networks and reconnects on its own, like a phone. |
+| `hb_wifimem.py` | Turns off background Wi-Fi scanning while connected, which removes periodic netplay stalls (the Wi-Fi memory it is named after is switched off). |
 | `services/` | KNULLI service wrappers for `hb_idlesave`, `hb_wifimem`, `hb_dsmac` and `hb_pspadhoc`. |
 
 ## Install
@@ -49,7 +49,7 @@ chmod +x /userdata/system/scripts/nds_save_sync.sh
 
 # 3) the launcher patch, so "Join" really starts the guest
 mount -o remount,rw /
-L=$(ls /usr/lib/python3*/site-packages/configgen/emulatorlauncher.py)    # python3.11 on 2024 builds, python3.12 on newer ones
+L=$(ls /usr/lib/python3*/site-packages/configgen/emulatorlauncher.py)    # python3.11 on the 2024/12 build, python3.12 on newer ones
 cp "$L" /userdata/system/emulatorlauncher.py.before_patch                 # a copy of the original, just in case
 python3 launcher/hb_patch.py apply launcher/emulatorlauncher.patch "$L"   # no patch command needed
 knulli-save-overlay                                                       # older KNULLI builds: batocera-save-overlay
@@ -60,15 +60,15 @@ cp services/* /userdata/system/services/
 ```
 
 - Turn the prompt off: `global.hb_joinask=0` in `/userdata/system/knulli.conf`, or create `/userdata/system/claude/hb_joinask.off`.
-- Undo the launcher patch: `python3 launcher/hb_patch.py reverse launcher/emulatorlauncher.patch "$L"`, then save the overlay again.
+- Undo the launcher patch: `L=$(ls /usr/lib/python3*/site-packages/configgen/emulatorlauncher.py); python3 launcher/hb_patch.py reverse launcher/emulatorlauncher.patch "$L"`, then save the overlay again.
 - Logs go to `/tmp` (RAM), for example `/tmp/hb_joinask.log`.
 
 ## Good to know
 
 - **Slow Wi-Fi.** When a game starts, the prompt waits up to 0.8 s for a room to answer (0.4 s before release 2026.11.13). If a room is open and still no prompt appears, give it more time: `global.hb_joinask_wait=1.5` in `knulli.conf`, anything from 0.2 to 3.0 seconds. The wait only costs time when nobody answers; a room for the same game ends the search at once. `/tmp/hb_joinask.log` shows how long each search took and which rooms answered.
 - **Rooms with a password.** The prompt skips rooms that have a netplay or spectator password, because it has no way to type one, so no window appears. Host without a password at home, or join that room from the netplay menu.
-- **Paired versions go by file name.** `PAIRS` in `hb_ownsave.py` lists each pair by ROM file name without the extension. Upper and lower case do not matter, but everything else has to match, tags such as `(U) (V1.1)` included. Put your own names into that table on both devices, for example `(("Pokemon - Ruby Version (U) (V1.1)", "Ruby"), ("Pokemon - Sapphire Version (U) (V1.1)", "Sapphire")),` — the second word of each entry is the short name shown in the window. The guest also needs the host's game in the same ROM folder, as the same file. `LINK_FAMILIES` in `hb_joinask.py` goes by file name in the same way.
-- **Older KNULLI builds (2024–2025).** They use `batocera-save-overlay` instead of `knulli-save-overlay` and `/userdata/system/batocera.conf` instead of `knulli.conf`; the 2024/12 build also has Python 3.11 and no `patch` command. `install.sh` and the prompt handle all of that. The other switches (`global.hb_direct`, `global.hb_ds_autopop`) and the lobby-guest part of the launcher patch still read `knulli.conf` only.
+- **Paired versions go by file name.** `PAIRS` in `hb_ownsave.py` lists each pair by ROM file name without the extension. Upper and lower case do not matter, but everything else has to match, tags such as `(U) (V1.1)` included. Put your own names into that table on both devices, for example `(("Pokemon - Ruby Version (U) (V1.1)", "Ruby"), ("Pokemon - Sapphire Version (U) (V1.1)", "Sapphire")),` — the second word of each entry is the short name shown in the window. The guest also needs the host's game in the same ROM folder, as the same file. `LINK_FAMILIES` in `hb_joinask.py` goes by file name in the same way. An update with `install.sh` replaces both files with the new ones; the file as you had it is kept as `/userdata/system/hanbang_cores/backup/<name>.previous`, so copy your lines over again afterwards.
+- **Older KNULLI builds (2024/12 – 2025).** They use `batocera-save-overlay` instead of `knulli-save-overlay` and `/userdata/system/batocera.conf` instead of `knulli.conf`; the 2024/12 build also has Python 3.11 and no `patch` command. `install.sh`, the prompt and the launcher patch handle all of that (checked against those releases' launcher sources; we have no device running such a build). Builds from before 2024/12 have a different launcher, so the launcher patch is skipped there with a warning. The other switches (`global.hb_direct`, `global.hb_ds_autopop`) still read `knulli.conf` only, and the `hb_idlesave` service calls `knulli-settings-get`, `knulli-suspend` and `knulli-shutdown`, so it only works on builds that have those commands.
 
 ## Before you use them
 

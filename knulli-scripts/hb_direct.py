@@ -12,7 +12,7 @@
 누가 방장: 게임이 정한다. DSperate 는 손님이 붙었을 때 방장 기기가, 레트로아크 넷플레이는 방을 연 기기가 'ap',
     손님은 'sta'. 이 파일은 그 말을 받아서 무선을 켜고, 0.5초마다 wlan1 로 '나 여기(집 주소)' 인사를 주고받아
     인사가 들리는 짝 기기만 길을 돌린다. 1.5초 동안 인사가 끊기면 길을 바로 원래대로(공유기) 되돌린다.
-이웃이 못 들어오게(사용자 01:5x '암호 없이 OK, 우리 기기만'): 이 칩은 방장 모드에서 WPA2 정보가 깨져서 암호 없이 쓰는 대신
+이웃이 못 들어오게: 이 칩은 방장 모드에서 WPA2 정보가 깨져서 암호 없이 쓰는 대신
     ① 이름 숨김(ignore_broadcast_ssid) ② 방장은 짝 기기 무선 주소만 받음(macaddr_acl, 같은 와이파이에 보이는 짝 기기 칩 주소에서
     wlan1 주소를 만들어 더함) ③ 손님은 짝 기기 칩 주소의 방장에만 붙음(bssid_whitelist) ④ wlan1 로 들어오는 것은
     인사와 인사한 짝 기기 것만 받고 나머지는 버림(iptables HBD 사슬 — ssh 등 다 막힘).
@@ -536,7 +536,7 @@ def watch_ownsave(pid, port, system, rom):
 def watch_retroarch(system=None, rom=None, core=None):
     """레트로아크 게임마다(ES 훅이 띄움): 넷플레이 방을 열면 방장(ap), 남의 방에 들어가면 손님(sta), 레트로아크가 끝나면 끔.
     10/20 20:5x: 직접 연결을 꺼 두었어도 역할은 계속 봐서 /tmp/hb_dual_screen 에 1P/2P 를 씀 — 혼자로 켠 뒤 게임 안 메뉴로
-    남의 방에 들어간 손님도 두 대 코어가 2P 화면으로 바뀌게(체크리스트 O). 끝나거나 끌려 나가면(SIGTERM) 파일을 지움."""
+    남의 방에 들어간 손님도 두 대 코어가 2P 화면으로 바뀌게. 끝나거나 끌려 나가면(SIGTERM) 파일을 지움."""
     off = turned_off()
     set_screen(None)
     signal.signal(signal.SIGTERM, lambda *_: (set_screen(None), sys.exit(0)))

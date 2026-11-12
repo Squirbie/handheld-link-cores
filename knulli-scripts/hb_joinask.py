@@ -30,7 +30,7 @@ The notes below are the original Korean design log.
   1.1초 듣고 같은 그룹(groups.txt 그룹 > 롬 게임 코드 4글자 > 파일 이름 — DSperate hbfam2 와 같은 규칙) 방이 있으면 같은 창.
   '같이'면 방장 주소를 화면에 안 쓰고 stdout 한 줄로 → 스크립트가 --lan-join 주소로 켬. '혼자'면 넷 없이 켬.
 - 끝 코드: 0 = 같이(json 씀) · 1 = 방 없음 · 꺼 둠 · 오류(평소대로) · 2 = 창에서 혼자 고름(B · 10초 지남)
-- 10/20 M158: 창을 로딩 그림처럼 픽셀 디자인으로
+- 10/20: 창을 로딩 그림처럼 픽셀 디자인으로
   다시 그림 — 갈무리 픽셀 글꼴(OFL, /userdata/system/claude/fonts/ + Galmuri-OFL.txt) · 계단 모서리 금색 테 · 단추 글자 · 그림을
   실제 점 상자로 재서 정가운데. 글꼴이 없으면 예전 글꼴(FONT)로 같은 자리.
 - 10/21 짝 게임(new3, GBA 두 대 코어 1.5 · hb_ownsave 5판): 같은 게임 방이 없어도 방장 방 게임 A 가 내가 켠 게임 B 의 짝
@@ -189,6 +189,12 @@ def stem(p):
     return os.path.splitext(b)[0].strip().lower()
 
 
+def content_names(content):
+    """(11/13) 방장 답의 content 를 견줄 이름 꼴 둘. content 는 이미 확장자가 빠진 이름이라, 점이 든 이름('(V1.1)' · 'Dr. Mario')은
+    stem() 이 점 뒤를 한 번 더 잘라 이름으로 못 맞췄음 → 자르지 않은 이름도 같이 견줌(예전 꼴도 그대로 받음)"""
+    return (stem(content), content.strip().lower())
+
+
 def rom_crcs(rom):
     """이 롬의 CRC 후보(zip 은 안의 파일들, 32MB 이하 낱개 파일은 전체). 비싼 계산은 안 함."""
     out = set()
@@ -283,15 +289,15 @@ def pair_room(rom, my_core, room_core, content, crc):
         except (OSError, ValueError) as e:
             log('짝 게임 롬 못 읽음 %s %r' % (local.name, e))
             continue
-        if (crc and local_crc == crc) or (not crc and stem(content) == name.lower()):
+        if (crc and local_crc == crc) or (not crc and name.lower() in content_names(content)):
             labels = own.pair_info(local, rom)
             return dict(content=str(local), host_label=label(labels[0]), my_label=label(labels[1]), crc=local_crc, kind=kind)
-        if stem(content) == name.lower():
+        if name.lower() in content_names(content):
             log('짝 게임 방이지만 방장 롬(%08x)이 내 %s(%08x)와 다름 → 짝 안 함' % (crc, local.name, local_crc))
     return None
 
 
-# (10/21 Claude) 짝 묶음 — 넷패킷 코어(각자 자기 게임을 돌리고 통신만 주고받음)라 다른 판끼리 붙음. 롬 이름(확장자 뺌)으로.
+# (10/21) 짝 묶음 — 넷패킷 코어(각자 자기 게임을 돌리고 통신만 주고받음)라 다른 판끼리 붙음. 롬 이름(확장자 뺌)으로.
 LINK_FAMILIES = [
     {'Pocket Monsters - FireRed', 'Pocket Monsters - Leaf Green', 'Pocket Monsters - Emerald',
      'Pokemon - FireRed (K)', 'Pokemon - LeafGreen (K)', 'Pokemon - Emerald (K)'},
@@ -417,7 +423,7 @@ def find_rooms(rom, bcast='255.255.255.255', port=PORT, wait=WAIT, core=''):
             if key in seen:
                 continue
             seen.add(key)
-            same = stem(content) == want
+            same = want in content_names(content)
             if not same and crc:
                 if crcs is None:
                     crcs = rom_crcs(rom)
@@ -425,7 +431,7 @@ def find_rooms(rom, bcast='255.255.255.255', port=PORT, wait=WAIT, core=''):
             fam = False
             if not same and not has_pw:
                 fam_no = link_family(want)
-                if fam_no and link_family(stem(content)) == fam_no and any(k in room_core.lower() for k in LINK_FAMILY_CORES):
+                if fam_no and fam_no in [link_family(n) for n in content_names(content)] and any(k in room_core.lower() for k in LINK_FAMILY_CORES):
                     same = fam = True                # 짝 묶음: 내 롬 그대로 붙음(같은 게임 길)
                     lab = family_label(content)
                     ROOM_TITLE[0] = tr('room_family') + ('(%s)' % label(lab) if lab else '')
@@ -855,7 +861,7 @@ def ask(host, args):
             screen.put(frame(host, '세이브 보내는 중'))
             args.ownsave_result = send_ownsave(args.system, args.rom, *args.ownsave_room)
             if not args.ownsave_result.get('ok'):
-                # 10/21 R07: 못 보냈거나 받음 확인을 못 받음 → 2초 알림 뒤 보통 접속(이번 판 2P 진행은 되쓰지 않음)
+                # 10/21: 못 보냈거나 받음 확인을 못 받음 → 2초 알림 뒤 보통 접속(이번 판 2P 진행은 되쓰지 않음)
                 screen.put(frame(host, NOTICE_LINE, NOTICE_TITLE))
                 time.sleep(NOTICE_SEC)
         screen.restore()

@@ -27,7 +27,7 @@
 | `hb_pspadhoc.py` | PSP 애드혹: 집 안 중계 서버 + 방장 자동 고르기. |
 | `hb_dskeys.py` · `hb_dshold.py` · `hb_ds_remember.py` | DraStic 도우미: 버튼 도우미 · L2 누르는 동안 두 화면 바꾸기 · 게임마다 큰 화면 배치 기억. |
 | `hb_idlesave.py` | 게임 중 오래 안 누르면 상태 저장하고 잠자기, 배터리가 바닥나기 직전 저장하고 끄기. |
-| `hb_wifimem.py` | 와이파이 여러 개를 기억해서 스마트폰처럼 저절로 다시 붙어요. |
+| `hb_wifimem.py` | 와이파이에 붙어 있는 동안 배경 검색을 꺼서 같이하기 중 주기적으로 끊기는 것을 줄여요(이름과 달리 와이파이 기억 기능은 꺼 두었어요). |
 | `services/` | `hb_idlesave` · `hb_wifimem` · `hb_dsmac` · `hb_pspadhoc` 를 켜는 KNULLI 서비스 파일. |
 
 ## 넣는 법
@@ -49,7 +49,7 @@ chmod +x /userdata/system/scripts/nds_save_sync.sh
 
 # 3) 실행기 패치 — '같이'를 고르면 정말 손님으로 켜지게
 mount -o remount,rw /
-L=$(ls /usr/lib/python3*/site-packages/configgen/emulatorlauncher.py)    # 2024년 빌드는 python3.11, 그 뒤는 python3.12
+L=$(ls /usr/lib/python3*/site-packages/configgen/emulatorlauncher.py)    # 2024년 12월 빌드는 python3.11, 그 뒤는 python3.12
 cp "$L" /userdata/system/emulatorlauncher.py.before_patch                 # 혹시 몰라 원본을 한 부 남겨요
 python3 launcher/hb_patch.py apply launcher/emulatorlauncher.patch "$L"   # patch 명령이 없어도 돼요
 knulli-save-overlay                                                       # 옛 KNULLI 빌드는 batocera-save-overlay
@@ -60,15 +60,15 @@ cp services/* /userdata/system/services/
 ```
 
 - 창 끄기: `/userdata/system/knulli.conf` 에 `global.hb_joinask=0`, 또는 `/userdata/system/claude/hb_joinask.off` 파일을 만들어요.
-- 실행기 패치 되돌리기: `python3 launcher/hb_patch.py reverse launcher/emulatorlauncher.patch "$L"` 을 실행하고 오버레이를 한 번 더 저장해요.
+- 실행기 패치 되돌리기: `L=$(ls /usr/lib/python3*/site-packages/configgen/emulatorlauncher.py); python3 launcher/hb_patch.py reverse launcher/emulatorlauncher.patch "$L"` 을 실행하고 오버레이를 한 번 더 저장해요.
 - 기록은 `/tmp`(램)에 남아요. 예: `/tmp/hb_joinask.log`.
 
 ## 알아 두면 좋은 것
 
 - **와이파이가 느릴 때.** 게임을 켜면 방이 답하기를 길게는 0.8초 기다려요(2026.11.13 릴리즈 전에는 0.4초). 방이 열려 있는데도 창이 안 뜨면 `knulli.conf` 에 `global.hb_joinask_wait=1.5` 처럼 적어 더 기다리게 하세요. 0.2 ~ 3.0초 사이면 돼요. 아무도 답하지 않을 때만 그만큼 늦게 켜지고, 같은 게임 방이 답하면 바로 창이 떠요. 찾는 데 걸린 시간과 답한 방은 `/tmp/hb_joinask.log` 에 남아요.
 - **비밀번호를 건 방.** 넷플레이 비밀번호나 관전 비밀번호가 걸린 방은 창이 건너뛰어요. 창에서는 비밀번호를 넣을 수 없어서예요. 집에서는 비밀번호 없이 방을 열거나, 그 방에는 넷플레이 메뉴로 들어가세요.
-- **짝 게임은 파일 이름으로 맞춰요.** `hb_ownsave.py` 의 `PAIRS` 에 짝마다 롬 파일 이름(확장자 뺌)이 적혀 있어요. 대소문자는 가리지 않지만 나머지는 `(U) (V1.1)` 같은 꼬리표까지 똑같아야 해요. 두 기기 모두 그 표의 이름을 가진 파일 이름으로 바꿔 주세요. 예: `(("Pokemon - Ruby Version (U) (V1.1)", "루비"), ("Pokemon - Sapphire Version (U) (V1.1)", "사파이어")),` — 칸마다 둘째 낱말은 창에 보이는 짧은 이름이에요. 손님 기기의 같은 롬 폴더에 방장 게임도 같은 파일로 있어야 해요. `hb_joinask.py` 의 `LINK_FAMILIES` 도 같은 식으로 파일 이름을 봐요.
-- **옛 KNULLI 빌드(2024 ~ 2025년).** `knulli-save-overlay` 대신 `batocera-save-overlay`, `knulli.conf` 대신 `/userdata/system/batocera.conf` 를 써요. 2024년 12월 빌드는 파이썬도 3.11 이고 `patch` 명령이 없어요. `install.sh` 와 같이하기 창은 이걸 알아서 맞춰요. 다른 스위치(`global.hb_direct` · `global.hb_ds_autopop`)와 실행기 패치의 로비 손님 부분은 아직 `knulli.conf` 만 읽어요.
+- **짝 게임은 파일 이름으로 맞춰요.** `hb_ownsave.py` 의 `PAIRS` 에 짝마다 롬 파일 이름(확장자 뺌)이 적혀 있어요. 대소문자는 가리지 않지만 나머지는 `(U) (V1.1)` 같은 꼬리표까지 똑같아야 해요. 두 기기 모두 그 표의 이름을 가진 파일 이름으로 바꿔 주세요. 예: `(("Pokemon - Ruby Version (U) (V1.1)", "루비"), ("Pokemon - Sapphire Version (U) (V1.1)", "사파이어")),` — 칸마다 둘째 낱말은 창에 보이는 짧은 이름이에요. 손님 기기의 같은 롬 폴더에 방장 게임도 같은 파일로 있어야 해요. `hb_joinask.py` 의 `LINK_FAMILIES` 도 같은 식으로 파일 이름을 봐요. `install.sh` 로 업데이트하면 두 파일이 새것으로 바뀌어요. 고쳐 쓰던 파일은 `/userdata/system/hanbang_cores/backup/<이름>.previous` 로 남으니, 고친 줄을 거기서 다시 옮겨 주세요.
+- **옛 KNULLI 빌드(2024년 12월 ~ 2025년).** `knulli-save-overlay` 대신 `batocera-save-overlay`, `knulli.conf` 대신 `/userdata/system/batocera.conf` 를 써요. 2024년 12월 빌드는 파이썬도 3.11 이고 `patch` 명령이 없어요. `install.sh` 와 같이하기 창, 실행기 패치는 이걸 알아서 맞춰요(그 릴리즈의 실행기 소스로 확인했고, 그런 빌드가 깔린 기기는 우리에게 없어요). 2024년 12월보다 앞선 빌드는 실행기가 달라서 실행기 패치는 알리고 건너뛰어요. 다른 스위치(`global.hb_direct` · `global.hb_ds_autopop`)는 아직 `knulli.conf` 만 읽고, `hb_idlesave` 서비스는 `knulli-settings-get` · `knulli-suspend` · `knulli-shutdown` 을 불러서 그 명령이 있는 빌드에서만 일해요.
 
 ## 쓰기 전에
 

@@ -112,7 +112,7 @@ case "$5" in
     ;;
 esac
 # 10) 포켓몬 리본: 켤 때만 CPU 최고 속도를 1.512 → 1.704GHz(이 칩의 가장 높은 단계, KNULLI 기본은 위 2단계를 막아 둠) +
-#     performance 로. 맵 29 측정 29~30 → 33fps(10/5, 사용자: 최적화 다 해 보고 부족하면 켜기). 끝나면 켜기 전 값으로 되돌림.
+#     performance 로. 맵 29 측정 29~30 → 33fps(10/5). 끝나면 켜기 전 값으로 되돌림.
 #     마인크래프트 포트도 게임 중 같은 방식(perf_mode)을 씀. 재부팅하면 어차피 원래대로. 끄기: /userdata/system/claude/reborn_fast.off
 case "$5" in
   */"Pokemon Reborn.sh")
@@ -217,11 +217,11 @@ fi
 #     스완 콜로세움)만 게임별로 이 코어를 씀(knulli.conf wswanc["<롬 파일 이름>"].core=mednafen_wswan_dual). 켤 때마다 이 게임 전용 설정(.opt)을 씀 —
 #     방장(ES 에서 A 길게 → 넷플레이 게임 시작 = -netplaymode host) = 1P 화면 · 소리 + 2P 기계 켬(link on),
 #     손님(-netplaymode client · 17번 창에서 '같이') = 2P 화면 · 소리 + link on, 혼자(넷플레이 아님) = 1P 화면 + link on.
-#     (10/20 20:2x M178: 예전엔 혼자 = link off(2P 기계를 안 돌림)였는데, link 는 켤 때만 읽어서 설명서의 '게임 하다가 MENU+B 로 방 열기'
+#     (10/20: 예전엔 혼자 = link off(2P 기계를 안 돌림)였는데, link 는 켤 때만 읽어서 설명서의 '게임 하다가 MENU+B 로 방 열기'
 #      길이 깨짐 → 늘 link on — 혼자 해도 2P 기계가 같이 돎. GBA Dual 도 늘 link on.)
 #     2P 세이브는 방장 기기의 /userdata/saves/wswanc/<롬 이름(zip 이면 대개 안 파일 이름)>.p2.sav(없으면 새 카트, 손님 자기 세이브는 17번에서 따로 보냄).
 if [ "$1" = "gameStart" ] && [ "$4" = "mednafen_wswan_dual" ]; then
-  m=1P; l=on; c="$(tr '\0' ' ' < /proc/$PPID/cmdline 2>/dev/null)"   # 10/20 M178: 혼자도 link on(MENU+B 방 열기 길)
+  m=1P; l=on; c="$(tr '\0' ' ' < /proc/$PPID/cmdline 2>/dev/null)"   # 10/20: 혼자도 link on(MENU+B 방 열기 길)
   case "$c" in *emulatorlauncher*) ;; *) c="$(for p in /proc/[0-9]*; do tr '\0' ' ' < "$p/cmdline" 2>/dev/null; echo; done | grep emulatorlauncher)" ;; esac
   case "$c" in *"-netplaymode client"*) m=2P; l=on ;; *"-netplaymode "*) l=on ;; esac
   [ -f /tmp/hb_joinask.json ] && { m=2P; l=on; }     # 17번 창에서 '같이'(손님)를 골랐음
