@@ -97,7 +97,7 @@ fi
 for kv in $(awk -F'\t' -v n="$NAME" '$1==n{print $2; exit}' $D/mpenv.txt 2>/dev/null); do
   [[ "$kv" =~ ^(DSPERATE_MP_[A-Z_]+|DS_WIFI_SKIP)=[0-9]+$ ]] && { export "$kv"; echo "mpenv: $kv" >> $LOG; }
 done
-# (10/20 08:1x Claude) 푼 롬 캐시 남은 것 비우기: zip 롬은 DSperate 가 <롬 폴더>/.dsperate/ 에 풀고, 공통 설정 [cart] cache = session 이라 정상 종료면 지우지만
+# (10/20 08:1x) 푼 롬 캐시 남은 것 비우기: zip 롬은 DSperate 가 <롬 폴더>/.dsperate/ 에 풀고, 공통 설정 [cart] cache = session 이라 정상 종료면 지우지만
 #   강제로 꺼지면(배터리 방전 · 멈춤 · 시험 kill) 그대로 남아 cache_mb 한도(2GB)까지 쌓임(10/20 기기에 드퀘 9 237MB 남아 있었음).
 #   DSperate 자체 옵션 --clear-cache = 켜려는 롬 것만 빼고 .dsperate · paths.cache 를 비운 뒤 그대로 실행(기록에 "cache: cleared N MB").
 ARGS+=(--clear-cache)
@@ -124,7 +124,7 @@ if [ -n "$FBV" ] && [ "$(cat $FB/virtual_size 2>/dev/null)" != "$FBV" ]; then
 fi
 echo "fb: $(cat $FB/virtual_size 2>/dev/null) pan $(cat $FB/pan 2>/dev/null)" >> $LOG
 python3 $D/hb_dsperate.py post "$ROM" >> $LOG 2>&1
-# (10/20 22:0x Claude) 켠 뒤 40초 안에 끝난 판은 기록을 남김 — 성검전설 '처음 켤 때 가끔 일찍 꺼짐'(8번 중 1번, 그때 기록은 다음 게임이 덮어 못 봄)이
+# (10/20 22:0x) 켠 뒤 40초 안에 끝난 판은 기록을 남김 — 성검전설 '처음 켤 때 가끔 일찍 꺼짐'(8번 중 1번, 그때 기록은 다음 게임이 덮어 못 봄)이
 #   다시 생기면 원인을 보려고. /userdata/system/logs/hb_dsperate_short_<월일_시분초>.log · 최근 5개만 남김
 if [ -n "${HB_T0:-}" ] && [ $(( $(date +%s) - HB_T0 )) -lt 40 ]; then
   mkdir -p /userdata/system/logs && cp -f $LOG "/userdata/system/logs/hb_dsperate_short_$(date +%m%d_%H%M%S).log" 2>/dev/null
