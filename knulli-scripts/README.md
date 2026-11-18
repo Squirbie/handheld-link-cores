@@ -27,7 +27,7 @@
 | `hb_pspadhoc.py` | PSP ad-hoc multiplayer: a local relay server plus automatic host selection. |
 | `hb_dskeys.py` · `hb_dshold.py` · `hb_ds_remember.py` | DraStic helpers: button helper, swap the screens while L2 is held, remember the large-screen layout per game. |
 | `hb_idlesave.py` | Saves a state and sleeps after a long idle time in game; saves and powers off just before the battery runs out. |
-| `hb_wifimem.py` | Turns off background Wi-Fi scanning while connected, which removes periodic netplay stalls (the Wi-Fi memory it is named after is switched off). |
+| `hb_wifimem.py` | Turns off background Wi-Fi scanning while connected, which removes periodic netplay stalls (the Wi-Fi memory it is named after is switched off). After waking from sleep it leaves the connection alone, and if Wi-Fi does not come back within about a minute it switches Wi-Fi off and on for you. |
 | `services/` | KNULLI service wrappers for `hb_idlesave`, `hb_wifimem`, `hb_dsmac` and `hb_pspadhoc`. |
 
 ## Install

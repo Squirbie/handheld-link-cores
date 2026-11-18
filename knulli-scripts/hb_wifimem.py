@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # hb_wifimem.py - Turns off background Wi-Fi scanning while connected (fewer netplay stalls). The Wi-Fi memory part is off (MEMORY = False).
+#   2026-11-18: after waking from sleep it no longer re-attaches; if Wi-Fi was connected before sleep and is not back
+#   25 s / 70 s after waking, it switches Wi-Fi off and on once each (only within 3 minutes of waking).
 # (2026-10-13) 와이파이 여러 개 기억 — 스마트폰처럼, 한 번 연결한 와이파이는 다음에 보이면 저절로 붙게
 # 기기: /userdata/system/claude/hb_wifimem.py · 서비스: /userdata/system/services/hb_wifimem
 # 왜: KNULLI 메뉴에서 와이파이에 연결하면 knulli.conf 의 wifi.ssid·wifi.key 한 쌍을 덮어써서 그 전 와이파이를 잊는다.
@@ -267,12 +269,81 @@ def wifi_cycle():
     subprocess.run(['connmanctl', 'enable', 'wifi'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
 
 
+def slept_total():
+    """잠든(suspend) 시간 합 = BOOTTIME − MONOTONIC(MONOTONIC 은 잠든 동안 안 감). 값이 늘면 그 사이 잠들었다 깬 것."""
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+    except (AttributeError, OSError):
+        return 0.0
+
+
+def wifi_powered():
+    """connman 의 wifi Powered(켜짐/꺼짐)만 읽음 — 이름 · 비번은 안 봄. 모르면 None."""
+    try:
+        out = subprocess.run(['connmanctl', 'technologies'], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    cur = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith('/net/connman/technology/'):
+            cur = line.rsplit('/', 1)[-1]
+        elif cur == 'wifi' and line.startswith('Powered'):
+            return line.split('=', 1)[-1].strip() == 'True'
+    return None
+
+
+def wpa_state(st):
+    import dbus
+    if 'bus' not in st:
+        st['bus'] = dbus.SystemBus()
+    bus = st['bus']
+    ipath = dbus.Interface(bus.get_object(W, '/fi/w1/wpa_supplicant1'), W).GetInterface('wlan0')
+    return str(dbus.Interface(bus.get_object(W, ipath), 'org.freedesktop.DBus.Properties').Get(W + '.Interface', 'State'))
+
+
+def wake_watch(st):
+    """(2026-11-18) 절전으로 잠들었다 깬 뒤의 와이파이:
+    ① 잠들었다 깨면 그 깸 동안은 검색 끄기(Reattach)를 하지 않음 — 깬 직후 Reattach 가 공유기에 다시 못 붙어 끊긴 일이 있었음
+    ② 잠들기 전에 붙어 있었고 와이파이가 켜져 있는데 깬 뒤 25초 · 70초에도 안 붙어 있으면 와이파이를 한 번씩 껐다 켬(메뉴에서 껐다 켠 것과 같음)
+    ③ 잠들기 전 꺼져 있었거나 사용자가 와이파이를 꺼 두었으면 아무것도 안 함"""
+    now = time.monotonic()
+    sl = slept_total()
+    try:
+        state = wpa_state(st)
+    except Exception:
+        st.pop('bus', None)
+        state = '?'
+    if 'slept' in st and sl - st['slept'] > 3:
+        st['woke'] = now
+        st['woke_connected'] = st.get('last_state') == 'completed'
+        st['wake_cycles'] = 0
+        log(f'깨어남(잠 {sl - st["slept"]:.0f}초) · 잠들기 전 {"붙어 있음" if st["woke_connected"] else "안 붙어 있음"} · 이번 부팅 동안 검색 끄기(Reattach) 안 함')
+    st['slept'] = sl
+    st['last_state'] = state
+    w = st.get('woke')
+    if w is None or not st.get('woke_connected'):
+        return
+    if state == 'completed' or now - w > 180:   # 깬 뒤 붙었거나 3분이 지나면 이번 깸 일은 끝(나중 끊김엔 손대지 않음)
+        st['woke_connected'] = False
+        return
+    k = st.get('wake_cycles', 0)
+    due = (25, 70)
+    if k < len(due) and now - w >= due[k]:
+        if wifi_powered() is not True:
+            st['woke_connected'] = False       # 사용자가 꺼 둠 → 손대지 않음
+            return
+        st['wake_cycles'] = k + 1
+        log(f'깬 뒤 {now - w:.0f}초에도 안 붙음 → 와이파이 껐다 켬({k + 1}번째)')
+        wifi_cycle()
+
+
 def bgscan_off(st):
     """붙어 있는 와이파이의 bgscan 이 켜져 있으면 'none' 으로 + Reattach. 네트워크 속성 중 bgscan 만 보고 다른 값(이름·비번)은 안 씀.
     10/19 고침: 2번 기기가 부팅 23초에 붙자마자 Reattach 한 뒤 와이파이가 안 돌아옴(사용자가 메뉴에서 껐다 켜서 붙음) →
       ① 켜진 지 120초 안 · 붙은 지 30초 안에는 건드리지 않음 ② Reattach 뒤 60초 안에 다시 안 붙으면 와이파이를 한 번 껐다 켜고
       그 부팅 동안은 검색 끄기를 그만둠(같은 일이 되풀이되지 않게)."""
-    if os.path.exists(BG_KEEP) or st.get('gaveup'):
+    if os.path.exists(BG_KEEP) or st.get('gaveup') or st.get('woke') is not None:   # (2026-11-18) 잠들었다 깬 뒤엔 Reattach 안 함
         return
     now = time.time()
     import dbus
@@ -321,6 +392,10 @@ def main():
         return
     last = None
     bg = {}
+    if uptime() > 600:   # (2026-11-18) 부팅 한참 뒤 다시 켠 것(새 판 넣기 등) → 붙어 있는 와이파이를 다시 잡지 않음
+        bg['woke'] = time.monotonic()
+        bg['woke_connected'] = False
+        log('부팅 뒤 늦게 켜짐 → 이번 부팅 동안 검색 끄기(Reattach) 안 함')
     while True:
         try:
             m = os.stat(CONF).st_mtime_ns
@@ -335,6 +410,12 @@ def main():
         if SW['target'] is not None:                   # (10/26) 새 망으로 옮기는 동안엔 검색 끄기(Reattach) 쉼
             time.sleep(5)
             continue
+        try:
+            wake_watch(bg)
+        except Exception as e:
+            if bg.get('werr') != type(e).__name__:
+                bg['werr'] = type(e).__name__
+                log(f'wake check: {type(e).__name__}')
         try:
             bgscan_off(bg)
             bg.pop('err', None)
