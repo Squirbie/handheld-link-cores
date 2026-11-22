@@ -1,14 +1,14 @@
 Subject: gpSP RFU netplay v3 with the arm64 cache fix, all three patches in one
-Series-Step: all-in-one (gpsp rfu v3)
-Origin: hanbang (this project); apply to libretro/gpsp 4caf7a167d159866479ea94d6b2d13c26ceb3e72 (tree 74ff670e602c)
+Series-Step: all-in-one (gpsp rfu v3, base 5819380)
+Origin: hanbang (this project); apply to libretro/gpsp 5819380c2ffb0900219d700a382ee68c464ebb99 (tree aa956b7c1f9b)
 요약: 0001 ~ 0003 을 차례로 얹은 결과와 같은 한 덩어리 패치. 개별 패치와 함께 쓰지 말 것(둘 중 하나만).
 
 ---
 diff --git a/cpu_threaded.c b/cpu_threaded.c
-index f49167090086..fcb7e8abffa7 100644
+index 923d962..84cf908 100644
 --- a/cpu_threaded.c
 +++ b/cpu_threaded.c
-@@ -243,6 +243,23 @@ typedef struct
+@@ -244,6 +244,23 @@ typedef struct
    void platform_cache_sync(void *baseaddr, void *endptr) {
      ctr_flush_invalidate_cache();
    }
@@ -33,7 +33,7 @@ index f49167090086..fcb7e8abffa7 100644
    void platform_cache_sync(void *baseaddr, void *endptr) {
      __clear_cache(baseaddr, endptr);
 diff --git a/rfu.c b/rfu.c
-index f4ae0b701d0a..a87fabb37277 100644
+index d5add44..7353bdf 100644
 --- a/rfu.c
 +++ b/rfu.c
 @@ -33,6 +33,63 @@
@@ -173,7 +173,7 @@ index f4ae0b701d0a..a87fabb37277 100644
  static void rfu_net_send_bcast(u32 ptype, u32 h, const u32 *pload) {
    u32 i;
    u32 pkt[9] = {
-@@ -368,9 +451,17 @@ static s32 rfu_process_command() {
+@@ -373,9 +456,17 @@ static s32 rfu_process_command() {
      // clients, it will return to idle state (I think!).
      if (rfu_state == RFU_STATE_HOST) {
        for (i = 0; i < 4; i++)
@@ -192,7 +192,7 @@ index f4ae0b701d0a..a87fabb37277 100644
        rfu_state = RFU_STATE_IDLE;
      }
  
-@@ -439,6 +530,7 @@ static s32 rfu_process_command() {
+@@ -444,6 +535,7 @@ static s32 rfu_process_command() {
  
    case RFU_CMD_SEND_DATAW:
    case RFU_CMD_SEND_DATA:
@@ -200,7 +200,7 @@ index f4ae0b701d0a..a87fabb37277 100644
      if (!rfu_plen)
        return 0;
  
-@@ -461,9 +553,11 @@ static s32 rfu_process_command() {
+@@ -466,9 +558,11 @@ static s32 rfu_process_command() {
                      rfu_tx_buf.blen, rfu_plen - 1);
        if (rfu_tx_buf.blen <= 90) {
          for (i = 0; i < 4; i++)
@@ -213,7 +213,7 @@ index f4ae0b701d0a..a87fabb37277 100644
        }
      }
      else if (rfu_state == RFU_STATE_CLIENT) {
-@@ -482,24 +576,29 @@ static s32 rfu_process_command() {
+@@ -487,24 +581,29 @@ static s32 rfu_process_command() {
      break;
  
    case RFU_CMD_RECV_DATA:
@@ -248,7 +248,7 @@ index f4ae0b701d0a..a87fabb37277 100644
          }
        }
        // Copy data into words into the RFU buffer.
-@@ -509,15 +608,23 @@ static s32 rfu_process_command() {
+@@ -514,15 +613,23 @@ static s32 rfu_process_command() {
      }
      else if (rfu_state == RFU_STATE_CLIENT) {
        u32 cnt = 0;
@@ -276,7 +276,7 @@ index f4ae0b701d0a..a87fabb37277 100644
        return cnt;
      }
      break;
-@@ -555,19 +662,47 @@ static s32 rfu_process_command() {
+@@ -560,19 +667,47 @@ static s32 rfu_process_command() {
  // Returns true if a Wait event can finish due to new data being available.
  static bool rfu_data_avail() {
    if (rfu_state == RFU_STATE_CLIENT) {
@@ -326,7 +326,7 @@ index f4ae0b701d0a..a87fabb37277 100644
  // Called whenever the game flips the SIOCNT:Start bit to transmit a value.
  // We simulate the reception and response of said value (over the SPI bus).
  u32 rfu_transfer(u32 sent_value) {
-@@ -639,8 +774,12 @@ u32 rfu_transfer(u32 sent_value) {
+@@ -644,8 +779,12 @@ u32 rfu_transfer(u32 sent_value) {
      // and reverse the clock roles (the RFU becomes master).
      if (rfu_cmd == RFU_CMD_WAIT || rfu_cmd == RFU_CMD_RTX_WAIT || rfu_cmd == RFU_CMD_SEND_DATAW) {
        rfu_comstate = RFU_COMSTATE_WAITEVENT;
@@ -341,7 +341,7 @@ index f4ae0b701d0a..a87fabb37277 100644
      } else {
        rfu_comstate = rfu_plen ? RFU_COMSTATE_RESPDAT : RFU_COMSTATE_WAITCMD;
      }
-@@ -676,6 +815,10 @@ u32 rfu_transfer(u32 sent_value) {
+@@ -681,6 +820,10 @@ u32 rfu_transfer(u32 sent_value) {
  
  // Gets called every frame for basic device updates.
  void rfu_frame_update() {
@@ -352,7 +352,7 @@ index f4ae0b701d0a..a87fabb37277 100644
    // If device is in reset state, do nothing really.
    if (rfu_comstate != RFU_COMSTATE_RESET) {
      u32 i;
-@@ -739,6 +882,11 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+@@ -744,6 +887,11 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
          for (i = 0; i < 4; i++)
            if (rfu_host.clients[i].devid &&
                rfu_host.clients[i].client_id == client_id) {
@@ -364,7 +364,7 @@ index f4ae0b701d0a..a87fabb37277 100644
  
              RFU_DEBUG_LOG("Connection request ignored: already connected!\n");
              return;
-@@ -787,39 +935,60 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+@@ -792,39 +940,60 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
        break;
  
      case NET_RFU_DISCONNECT:
@@ -440,7 +440,7 @@ index f4ae0b701d0a..a87fabb37277 100644
          }
        }
        break;
-@@ -832,16 +1001,20 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+@@ -837,16 +1006,20 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
          u32 clid = (hdata >> 16) & 0x3;
          u32 blen = hdata >> 24;
  
@@ -470,7 +470,7 @@ index f4ae0b701d0a..a87fabb37277 100644
            }
            RFU_DEBUG_LOG("Host dropped a client packet\n");
          }
-@@ -853,8 +1026,21 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+@@ -858,8 +1031,21 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
          u32 devid = hdata & 0xffff;
          u32 clid = (hdata >> 16) & 0x3;
  
@@ -493,15 +493,21 @@ index f4ae0b701d0a..a87fabb37277 100644
        }
      };
    } else {
-@@ -865,9 +1051,15 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+@@ -870,6 +1056,8 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
  // Account for consumed cycles and return if a serial IRQ should be raised.
  bool rfu_update(unsigned cycles) {
    if (rfu_comstate == RFU_COMSTATE_WAITEVENT) {
 +    HBS(hb_rfu_stats.wait_cycles += cycles);
 +    HBS(if (rfu_state == RFU_STATE_HOST && !rfu_resp_timeout && (rfu_net_backlogged() || rfu_net_wait_peer())) hb_rfu_stats.hold_cycles += cycles);
-     // Force receive packets so that we can perhaps abort the wait
-     // This helps minimize latency (othweise we need to wait a full frame!)
+     /* Force receive packets so that we can perhaps abort the wait.
+      * This helps minimize latency (otherwise we need to wait a full
+      * frame!).
+@@ -881,7 +1069,12 @@ bool rfu_update(unsigned cycles) {
+      * rfu_peer_bcst[] and other rfu_* globals.  All reads below must
+      * re-fetch these globals after this point - do NOT cache rfu_state
+      * etc. into a local across this call. */
 -    netpacket_poll_receive();
++    // 한방 v3: 받기는 1/8 프레임마다(+기다림 시작 때 한 번)만
 +    rfu_poll_acc += cycles;
 +    if (rfu_poll_acc >= RFU_POLL_CYCLES) {
 +      rfu_poll_acc = 0;
@@ -510,7 +516,7 @@ index f4ae0b701d0a..a87fabb37277 100644
  
      // Check if we are running our of time to respond.
      rfu_timeout_cycles -= MIN(cycles, rfu_timeout_cycles);
-@@ -884,18 +1076,40 @@ bool rfu_update(unsigned cycles) {
+@@ -898,18 +1091,40 @@ bool rfu_update(unsigned cycles) {
          rfu_plen = 3;
          rfu_comstate = RFU_COMSTATE_WAITRESP;
          RFU_DEBUG_LOG("Wait command resp: disconnect\n");
@@ -553,7 +559,7 @@ index f4ae0b701d0a..a87fabb37277 100644
          rfu_buf[0] = 0x99660000 | RFU_CMD_RESP_DATA | (1 << 8);
          rfu_buf[1] = 0x00000F0F;  // TODO: just using 4 slots for now
          rfu_buf[2] = 0x80000000;
-@@ -905,6 +1119,7 @@ bool rfu_update(unsigned cycles) {
+@@ -919,6 +1134,7 @@ bool rfu_update(unsigned cycles) {
        }
        else if (!rfu_timeout_cycles) {
          // We ran out of time, just return an "error" code

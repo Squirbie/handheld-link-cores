@@ -5,7 +5,7 @@ c942499fc72a61400d4e6a486841fb37  77036704  fbneo_libretro.so
 d944c5c6451efea1aaab950317886426  4261840  fceumm_libretro.so
 8c0eb89d9c157eda094b293a4aa0b976  4367384  gambatte_libretro.so
 2db4468dac16b8754d268e90348639a0  11984232  genesisplusgx_gg_dual_libretro.so
-8bdd8b56e895a9625cddc932c3e2f926  902024  gpsp_libretro.so
+6c86b647977fafeea3a5cccfeb51d5a1  724264  gpsp_libretro.so
 5dbeaf459d9c05a5eb175a286c7ed4a7  42816416  mame2003_plus_libretro.so
 fb23fd640ae81b3cbdde89ad3d43f4e5  72584  mame2003_plus_mj_libretro.so
 91b8d251fbd72d776d1b2616b2a2b111  831096  mednafen_ngp_dual_libretro.so

@@ -31,7 +31,7 @@ Prepared but not opened: melonDS DS (its contributing guide asks for PR text wri
 | [`ds-melonds-ds`](cores/ds-melonds-ds/) | [JesseTG/melonds-ds](https://github.com/JesseTG/melonds-ds) | upstream unchanged since our base | 1 |
 | [`ds-dsperate`](cores/ds-dsperate/) | [beebono/DSperate](https://github.com/beebono/DSperate) | 46 upstream commits since our base; 1 of our files changed upstream | 1 |
 | [`gb-gambatte-link`](cores/gb-gambatte-link/) | [libretro/gambatte-libretro](https://github.com/libretro/gambatte-libretro) | 87 upstream commits since our base; 5 of our files changed upstream | 1 |
-| [`gba-gpsp-rfu`](cores/gba-gpsp-rfu/) | [libretro/gpsp](https://github.com/libretro/gpsp) | 76 upstream commits since our base; 2 of our files changed upstream | 1 |
+| [`gba-gpsp-rfu`](cores/gba-gpsp-rfu/) | [libretro/gpsp](https://github.com/libretro/gpsp) | 0 upstream commits since our base (moved onto upstream master `5819380` on 2026-11-19) | 1 |
 | [`wswan-mednafen-dual`](cores/wswan-mednafen-dual/) | [libretro/beetle-wswan-libretro](https://github.com/libretro/beetle-wswan-libretro) | upstream unchanged since our base | 1 |
 | [`ngp-mednafen-dual`](cores/ngp-mednafen-dual/) | [libretro/beetle-ngp-libretro](https://github.com/libretro/beetle-ngp-libretro) | 4 upstream commits since our base; none touch our files | 1 |
 | [`msx-bluemsx`](cores/msx-bluemsx/) | [libretro/blueMSX-libretro](https://github.com/libretro/blueMSX-libretro) | 101 upstream commits since our base; 32 of our files changed upstream | 1 |
@@ -273,7 +273,7 @@ Testing: (1) found and checked with a two-instance harness over netplay (Yu-Gi-O
 
 ## Game Boy Advance — `gba-gpsp-rfu`
 
-Upstream: https://github.com/libretro/gpsp · 76 upstream commits since our base; 2 of our files changed upstream
+Upstream: https://github.com/libretro/gpsp · 0 upstream commits since our base (moved onto upstream master `5819380` on 2026-11-19)
 
 ### RFU: survive netplay latency and bursts (ring queues, 1.2 s no-news time-out), bound client packet length, drain queued data before DISCONNECT, accept only the current peer
 

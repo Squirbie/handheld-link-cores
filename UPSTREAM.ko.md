@@ -31,7 +31,7 @@
 | [`ds-melonds-ds`](cores/ds-melonds-ds/README.ko.md) | [JesseTG/melonds-ds](https://github.com/JesseTG/melonds-ds) | 우리 바탕 뒤로 원본이 안 바뀜 | 1 |
 | [`ds-dsperate`](cores/ds-dsperate/README.ko.md) | [beebono/DSperate](https://github.com/beebono/DSperate) | 우리 바탕 뒤로 원본 커밋 46개 · 우리 파일 1개가 원본에서 바뀜 | 1 |
 | [`gb-gambatte-link`](cores/gb-gambatte-link/README.ko.md) | [libretro/gambatte-libretro](https://github.com/libretro/gambatte-libretro) | 우리 바탕 뒤로 원본 커밋 87개 · 우리 파일 5개가 원본에서 바뀜 | 1 |
-| [`gba-gpsp-rfu`](cores/gba-gpsp-rfu/README.ko.md) | [libretro/gpsp](https://github.com/libretro/gpsp) | 우리 바탕 뒤로 원본 커밋 76개 · 우리 파일 2개가 원본에서 바뀜 | 1 |
+| [`gba-gpsp-rfu`](cores/gba-gpsp-rfu/README.ko.md) | [libretro/gpsp](https://github.com/libretro/gpsp) | 우리 바탕 뒤로 원본 커밋 0개(2026-11-19 원본 master `5819380`으로 옮김) | 1 |
 | [`wswan-mednafen-dual`](cores/wswan-mednafen-dual/README.ko.md) | [libretro/beetle-wswan-libretro](https://github.com/libretro/beetle-wswan-libretro) | 우리 바탕 뒤로 원본이 안 바뀜 | 1 |
 | [`ngp-mednafen-dual`](cores/ngp-mednafen-dual/README.ko.md) | [libretro/beetle-ngp-libretro](https://github.com/libretro/beetle-ngp-libretro) | 우리 바탕 뒤로 원본 커밋 4개 · 우리 파일은 안 바뀜 | 1 |
 | [`msx-bluemsx`](cores/msx-bluemsx/README.ko.md) | [libretro/blueMSX-libretro](https://github.com/libretro/blueMSX-libretro) | 우리 바탕 뒤로 원본 커밋 101개 · 우리 파일 32개가 원본에서 바뀜 | 1 |
@@ -74,7 +74,7 @@
 
 ## GBA — `gba-gpsp-rfu`
 
-원본: https://github.com/libretro/gpsp · 우리 바탕 뒤로 원본 커밋 76개 · 우리 파일 2개가 원본에서 바뀜
+원본: https://github.com/libretro/gpsp · 우리 바탕 뒤로 원본 커밋 0개(2026-11-19 원본 master `5819380`으로 옮김)
 
 - **RFU: survive netplay latency and bursts (ring queues, 1.2 s no-news time-out), bound client packet length, drain queued data before DISCONNECT, accept only the current peer** (패치 ['patches/0001-arm64-linux-cache-sync.patch', 'patches/0002-rfu-wifi-netplay-robustness-v2.patch', 'patches/0003-rfu-less-waiting-v3.patch']) — 원본 master 의 rfu.c 도 pkts[4] 줄과 같은 시간 제한이라 같은 문제가 남아 있어요(웹으로 확인). 일부는 분명한 버그예요: 손님 패킷 길이 검사 없이 16바이트 칸에 복사(범위 밖 쓰기), 4칸 줄이 몰려 온 패킷을 버림, 끊김이 읽지 않은 패킷을 지움, 현재 상대가 아닌 기기 패킷 수용. 다만 v2 · v3 에는 우리 와이파이에 맞춘 상수와 ACK 넷째 칸 확장이 섞여 있어서 보낼 때는 견고성 고침만 따로 떼어 내야 해요.
 

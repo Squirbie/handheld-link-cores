@@ -1,4 +1,4 @@
-# Apply in this order (git apply or patch -p1)
+# Apply on libretro/gpsp 5819380c2ffb0900219d700a382ee68c464ebb99 in this order (git apply or patch -p1)
 0001-arm64-linux-cache-sync.patch
 0002-rfu-wifi-netplay-robustness-v2.patch
 0003-rfu-less-waiting-v3.patch

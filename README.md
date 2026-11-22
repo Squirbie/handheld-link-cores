@@ -117,7 +117,7 @@ Real screens from two RG35XX Pro handhelds linked over Wi-Fi. Left is device 1 (
 | Nintendo DS | [`ds-dsperate`](cores/ds-dsperate/) | Two-device local wireless over Wi-Fi without dropouts. A host with no guest plays solo, saves are fsync'd, same-game groups match automatically, three players can join, download play is fixed, and an IPC FIFO timing fix ends the white screen when no firmware dump is present. | [DSperate](https://github.com/beebono/DSperate) v3.0.3 |
 | Game Boy / Color | [`gb-gambatte-link`](cores/gb-gambatte-link/) | Uses a RetroArch netplay room as the link cable and as the GBC infrared port. Bytes are paced to fit each game's time limits, and two Gambatte bugs are fixed: a serial byte shift and a reset while the boot ROM is mapped. | [gambatte-libretro](https://github.com/libretro/gambatte-libretro) `4041d5a` |
 | Game Boy Advance | [`gba-mgba-dual`](cores/gba-mgba-dual/) | Runs two GBAs on a lockstep link cable inside one core, so link-cable games work over netplay. Linking works in any order, each player keeps their own save, paired versions link, and Single-Pak games boot player 2 from the BIOS without a cartridge. | [mgba](https://github.com/libretro/mgba) `7a12d6d` + [tangobattle/mgba](https://github.com/tangobattle/mgba) |
-| Game Boy Advance | [`gba-gpsp-rfu`](cores/gba-gpsp-rfu/) | Keeps the GBA Wireless Adapter (RFU) alive through Wi-Fi lag and bursts: a 128-slot packet queue, 1.2-second disconnect detection, late replies kept, and fewer waits. Made for Pokémon FireRed, LeafGreen and Emerald trades and battles. | [gpsp](https://github.com/libretro/gpsp) `4caf7a1` |
+| Game Boy Advance | [`gba-gpsp-rfu`](cores/gba-gpsp-rfu/) | Keeps the GBA Wireless Adapter (RFU) alive through Wi-Fi lag and bursts: a 128-slot packet queue, 1.2-second disconnect detection, late replies kept, and fewer waits. Made for Pokémon FireRed, LeafGreen and Emerald trades and battles. | [gpsp](https://github.com/libretro/gpsp) `5819380` |
 | WonderSwan | [`wswan-mednafen-dual`](cores/wswan-mednafen-dual/) | Two WonderSwans and a rewritten serial port in one core, with save states that stay identical on both devices. Adds per-player saves, portrait screens, per-game timing, Shanghai Pocket mode and paired versions. | [beetle-wswan-libretro](https://github.com/libretro/beetle-wswan-libretro) `4b01295` |
 | Neo Geo Pocket | [`ngp-mednafen-dual`](cores/ngp-mednafen-dual/) | Links two consoles through serial channel 0 and the BIOS link calls, with deterministic clock, flash and Z80 state. Adds per-player saves and paired versions (Card Fighters SNK ↔ Capcom, Dive Alert Becky ↔ Matt). | [beetle-ngp-libretro](https://github.com/libretro/beetle-ngp-libretro) `139fe34` |
 | Game Gear | [`gg-genesisplusgx-dual`](cores/gg-genesisplusgx-dual/) | Emulates the Gear-to-Gear cable (parallel, UART serial and NMI) and runs two consoles line by line. Each player keeps their own save. | [Genesis Plus GX](https://github.com/libretro/Genesis-Plus-GX) `302fe82` |
@@ -137,12 +137,12 @@ Releases are dated (`YYYY.MM.DD`). Each package is a zip with the prebuilt file(
 
 | Package | Contents | Size |
 |---|---|---|
-| [**Everything**](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/handheld-link-cores-all-linux-aarch64.zip) | All packages below in one zip | 44.1 MB |
+| [**Everything**](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/handheld-link-cores-all-linux-aarch64.zip) | All packages below in one zip | 44.0 MB |
 | [ds-melonds-ds](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/ds-melonds-ds-linux-aarch64.zip) | `melondsds_libretro.so` | 2.0 MB |
 | [ds-dsperate](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/ds-dsperate-linux-aarch64.zip) | `dsperate` + launch glue | 3.2 MB |
 | [gb-gambatte-link](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gb-gambatte-link-linux-aarch64.zip) | `gambatte_libretro.so` | 474 KB |
 | [gba-mgba-dual](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gba-mgba-dual-linux-aarch64.zip) | `mgba_dual_libretro.so` + `.info` | 387 KB |
-| [gba-gpsp-rfu](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gba-gpsp-rfu-linux-aarch64.zip) | `gpsp_libretro.so` | 297 KB |
+| [gba-gpsp-rfu](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gba-gpsp-rfu-linux-aarch64.zip) | `gpsp_libretro.so` | 248 KB |
 | [wswan-mednafen-dual](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/wswan-mednafen-dual-linux-aarch64.zip) | `mednafen_wswan_dual_libretro.so` + `.info` | 215 KB |
 | [ngp-mednafen-dual](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/ngp-mednafen-dual-linux-aarch64.zip) | `mednafen_ngp_dual_libretro.so` + `.info` | 216 KB |
 | [gg-genesisplusgx-dual](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gg-genesisplusgx-dual-linux-aarch64.zip) | `genesisplusgx_gg_dual_libretro.so` + `.info` | 1.7 MB |
@@ -269,7 +269,7 @@ Every package folder lists the upstream repository, the base commit and a `patch
 
 ```sh
 git clone https://github.com/libretro/gpsp && cd gpsp
-git checkout 4caf7a167d159866479ea94d6b2d13c26ceb3e72
+git checkout 5819380c2ffb0900219d700a382ee68c464ebb99
 grep -v '^#' ../handheld-link-cores/cores/gba-gpsp-rfu/patches/series | \
   while read -r p; do git apply "../handheld-link-cores/cores/gba-gpsp-rfu/patches/$p"; done
 make platform=unix
@@ -289,7 +289,7 @@ These fixes help more people when they live upstream, so on 2026-10-29 we sent t
 | FBNeo | v1.0.0.03 | 3,389 | Sent as a two-line source fix: [finalburnneo/FBNeo#2845](https://github.com/finalburnneo/FBNeo/pull/2845) |
 | DSperate | v3.0.3 | 46 | Sent (IPC FIFO timing only): [beebono/DSperate#34](https://github.com/beebono/DSperate/pull/34) |
 | gambatte | `4041d5a` | 87 | Sent: [libretro/gambatte-libretro#289](https://github.com/libretro/gambatte-libretro/pull/289) |
-| gpSP | `4caf7a1` | 76 | Sent (safety checks only): [libretro/gpsp#294](https://github.com/libretro/gpsp/pull/294) |
+| gpSP | `5819380` | 0 | Sent (safety checks only): [libretro/gpsp#294](https://github.com/libretro/gpsp/pull/294) |
 | blueMSX | `572c918` | 101 | Sent (SRAM on unload, WD2793 tags): [libretro/blueMSX-libretro#212](https://github.com/libretro/blueMSX-libretro/pull/212); the save-state completeness fixes are not sent yet |
 | MAME 2003-Plus | `61305d6` | 460 | The flag-bit fix landed upstream on 2026-10-24 ([#2131](https://github.com/libretro/mame2003-plus-libretro/pull/2131)). Sent: [#2177](https://github.com/libretro/mame2003-plus-libretro/pull/2177) (H6280 / battlera, re-tested on master: 0/300 → 300/300) and [#2178](https://github.com/libretro/mame2003-plus-libretro/pull/2178) (read-only banks). The Atari and Vs. System fixes need more work on current master |
 | mGBA Dual, GG Dual, FCEUmm, DOSBox Pure, Mahjong Pad | — | — | Not PR candidates: setup-specific features, or upstream rewrote the code |

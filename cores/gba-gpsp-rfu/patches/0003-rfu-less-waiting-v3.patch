@@ -1,5 +1,5 @@
 Subject: gpSP: RFU: wait and poll less while a peer answers (v3)
-Series-Step: 3/3 (gpsp rfu v3)
+Series-Step: 3/3 (gpsp rfu v3, base 5819380)
 Origin: hanbang (this project); record name rfu_v3.patch (on top of v2)
 요약: 교환 · 배틀 중 프레임이 끊기고 느려지던 것을 줄임 — 기다리는 동안 받기(poll)를 1/8 프레임마다만, 리더 "응답 없음" 기다림 상한 2.8ms, 손님 줄이 2개 이상 밀리면 한 프레임에 2개까지 넘겨 따라잡기.
 
@@ -13,9 +13,14 @@ After v2 the remaining slowness came from the leader being held back by up to 1.
 Optional HB_STATS counters (compiled out by default). Wire format and version string unchanged, so v1/v2/stock cores
 still connect.
 
+Rebased from base 4caf7a1 onto libretro/gpsp 5819380 (2026-11-19). One hunk in rfu_update() needed a hand merge:
+upstream 5cae71a replaced the comment above netpacket_poll_receive() with a re-entrancy note. The upstream comment is kept,
+the HB_STATS lines go before it, and the unconditional netpacket_poll_receive() becomes the RFU_POLL_CYCLES-gated call,
+exactly as in the 4caf7a1 version.
+
 ---
 diff --git a/rfu.c b/rfu.c
-index ea3ebb425dcb..a87fabb37277 100644
+index c6a4d94..7353bdf 100644
 --- a/rfu.c
 +++ b/rfu.c
 @@ -70,6 +70,25 @@
@@ -61,7 +66,7 @@ index ea3ebb425dcb..a87fabb37277 100644
  
  typedef struct {
    u8 valid;
-@@ -501,6 +530,7 @@ static s32 rfu_process_command() {
+@@ -506,6 +535,7 @@ static s32 rfu_process_command() {
  
    case RFU_CMD_SEND_DATAW:
    case RFU_CMD_SEND_DATA:
@@ -69,7 +74,7 @@ index ea3ebb425dcb..a87fabb37277 100644
      if (!rfu_plen)
        return 0;
  
-@@ -546,6 +576,7 @@ static s32 rfu_process_command() {
+@@ -551,6 +581,7 @@ static s32 rfu_process_command() {
      break;
  
    case RFU_CMD_RECV_DATA:
@@ -77,7 +82,7 @@ index ea3ebb425dcb..a87fabb37277 100644
      if (rfu_state == RFU_STATE_HOST) {
        // Receive data from clients
        u32 cnt = 0, bufbytes = 0;
-@@ -632,7 +663,9 @@ static s32 rfu_process_command() {
+@@ -637,7 +668,9 @@ static s32 rfu_process_command() {
  static bool rfu_data_avail() {
    if (rfu_state == RFU_STATE_CLIENT) {
      // 손님: 이번 프레임 몫(1개)을 아직 안 넘겼을 때만
@@ -88,7 +93,7 @@ index ea3ebb425dcb..a87fabb37277 100644
        return true;
    }
    else if (rfu_state == RFU_STATE_HOST) {
-@@ -741,8 +774,12 @@ u32 rfu_transfer(u32 sent_value) {
+@@ -746,8 +779,12 @@ u32 rfu_transfer(u32 sent_value) {
      // and reverse the clock roles (the RFU becomes master).
      if (rfu_cmd == RFU_CMD_WAIT || rfu_cmd == RFU_CMD_RTX_WAIT || rfu_cmd == RFU_CMD_SEND_DATAW) {
        rfu_comstate = RFU_COMSTATE_WAITEVENT;
@@ -101,7 +106,7 @@ index ea3ebb425dcb..a87fabb37277 100644
      } else {
        rfu_comstate = rfu_plen ? RFU_COMSTATE_RESPDAT : RFU_COMSTATE_WAITCMD;
      }
-@@ -778,6 +815,9 @@ u32 rfu_transfer(u32 sent_value) {
+@@ -783,6 +820,9 @@ u32 rfu_transfer(u32 sent_value) {
  
  // Gets called every frame for basic device updates.
  void rfu_frame_update() {
@@ -111,15 +116,21 @@ index ea3ebb425dcb..a87fabb37277 100644
    rfu_client_events = 0;   // 손님: 새 프레임이니 다시 1개 넘길 수 있음
    // If device is in reset state, do nothing really.
    if (rfu_comstate != RFU_COMSTATE_RESET) {
-@@ -1011,9 +1051,15 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
+@@ -1016,6 +1056,8 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
  // Account for consumed cycles and return if a serial IRQ should be raised.
  bool rfu_update(unsigned cycles) {
    if (rfu_comstate == RFU_COMSTATE_WAITEVENT) {
 +    HBS(hb_rfu_stats.wait_cycles += cycles);
 +    HBS(if (rfu_state == RFU_STATE_HOST && !rfu_resp_timeout && (rfu_net_backlogged() || rfu_net_wait_peer())) hb_rfu_stats.hold_cycles += cycles);
-     // Force receive packets so that we can perhaps abort the wait
-     // This helps minimize latency (othweise we need to wait a full frame!)
+     /* Force receive packets so that we can perhaps abort the wait.
+      * This helps minimize latency (otherwise we need to wait a full
+      * frame!).
+@@ -1027,7 +1069,12 @@ bool rfu_update(unsigned cycles) {
+      * rfu_peer_bcst[] and other rfu_* globals.  All reads below must
+      * re-fetch these globals after this point - do NOT cache rfu_state
+      * etc. into a local across this call. */
 -    netpacket_poll_receive();
++    // 한방 v3: 받기는 1/8 프레임마다(+기다림 시작 때 한 번)만
 +    rfu_poll_acc += cycles;
 +    if (rfu_poll_acc >= RFU_POLL_CYCLES) {
 +      rfu_poll_acc = 0;
@@ -128,7 +139,7 @@ index ea3ebb425dcb..a87fabb37277 100644
  
      // Check if we are running our of time to respond.
      rfu_timeout_cycles -= MIN(cycles, rfu_timeout_cycles);
-@@ -1030,10 +1076,12 @@ bool rfu_update(unsigned cycles) {
+@@ -1044,10 +1091,12 @@ bool rfu_update(unsigned cycles) {
          rfu_plen = 3;
          rfu_comstate = RFU_COMSTATE_WAITRESP;
          RFU_DEBUG_LOG("Wait command resp: disconnect\n");
@@ -141,7 +152,7 @@ index ea3ebb425dcb..a87fabb37277 100644
          // (v2 리더: 느린 손님의 패킷을 기다리는 중이면 다른 손님 패킷이 있어도 아직 안 알림)
          rfu_buf[0] = 0x99660000 | RFU_CMD_RESP_DATA;
          rfu_buf[1] = 0x80000000;
-@@ -1054,6 +1102,7 @@ bool rfu_update(unsigned cycles) {
+@@ -1068,6 +1117,7 @@ bool rfu_update(unsigned cycles) {
                  !rfu_timeout_cycles)) {
          // We "retransmitted" the message N times (not really, but the equivalent
          // time has elapsed) and we simulate a lack of client response.
@@ -149,7 +160,7 @@ index ea3ebb425dcb..a87fabb37277 100644
          // (v2: 와이파이가 크게 밀려 있거나 느린 손님을 기다리면 1.2초까지 더 기다린 뒤 여기로 옴)
          if (!rfu_timeout_cycles) {
            // 1.2초 동안 아무 답이 없었음: 손님 줄 길이 정보는 오래된 것이니 지움
-@@ -1070,6 +1119,7 @@ bool rfu_update(unsigned cycles) {
+@@ -1084,6 +1134,7 @@ bool rfu_update(unsigned cycles) {
        }
        else if (!rfu_timeout_cycles) {
          // We ran out of time, just return an "error" code

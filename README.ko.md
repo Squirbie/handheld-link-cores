@@ -117,7 +117,7 @@ MSX 게임 안 저장이 파일로 남고, 패미컴 매퍼 14 에 작업용 램
 | 닌텐도 DS | [`ds-dsperate`](cores/ds-dsperate/README.ko.md) | 와이파이로 두 기기 무선 통신을 끊김 없이 해요. 손님 없는 방장은 혼자 하기, fsync 세이브, 같은 게임끼리 자동으로 붙는 그룹, 세 명 같이하기, 다운로드 플레이 고침, 펌웨어 덤프가 없을 때 흰 화면이던 IPC FIFO 박자 고침이 들었어요. | [DSperate](https://github.com/beebono/DSperate) v3.0.3 |
 | 게임보이 · 컬러 | [`gb-gambatte-link`](cores/gb-gambatte-link/README.ko.md) | 레트로아크 넷플레이 방을 통신 케이블과 GBC 적외선으로 써요. 바이트 사이 시간을 맞춰 게임마다 정한 시간 제한을 넘기고, 감바테의 직렬 바이트 밀림과 부트롬 중 리셋 버그를 고쳤어요. | [gambatte-libretro](https://github.com/libretro/gambatte-libretro) `4041d5a` |
 | 게임보이 어드밴스 | [`gba-mgba-dual`](cores/gba-mgba-dual/README.ko.md) | 한 코어 안에서 GBA 두 대를 같은 박자의 케이블로 이어, 통신 케이블 게임을 넷플레이로 해요. 누가 먼저 들어가도 붙고, 각자 자기 세이브, 짝 게임, 팩 하나로 여럿이 하는 싱글팩(2P 를 팩 없이 바이오스로)까지 돼요. | [mgba](https://github.com/libretro/mgba) `7a12d6d` + [tangobattle/mgba](https://github.com/tangobattle/mgba) |
-| 게임보이 어드밴스 | [`gba-gpsp-rfu`](cores/gba-gpsp-rfu/README.ko.md) | GBA 무선 어댑터(RFU)가 와이파이 지연 · 몰아 오기에도 버텨요: 패킷 줄 128칸, 1.2초 끊김 판단, 늦은 답 보존, 기다림 줄이기. 포켓몬 파이어레드 · 리프그린 · 에메랄드 교환 · 대전용이에요. | [gpsp](https://github.com/libretro/gpsp) `4caf7a1` |
+| 게임보이 어드밴스 | [`gba-gpsp-rfu`](cores/gba-gpsp-rfu/README.ko.md) | GBA 무선 어댑터(RFU)가 와이파이 지연 · 몰아 오기에도 버텨요: 패킷 줄 128칸, 1.2초 끊김 판단, 늦은 답 보존, 기다림 줄이기. 포켓몬 파이어레드 · 리프그린 · 에메랄드 교환 · 대전용이에요. | [gpsp](https://github.com/libretro/gpsp) `5819380` |
 | 원더스완 | [`wswan-mednafen-dual`](cores/wswan-mednafen-dual/README.ko.md) | 한 코어에 원더스완 두 대와 다시 쓴 직렬 포트를 넣고, 두 기기에서 똑같은 상태 저장을 만들어요. 각자 세이브 · 세로 화면 · 게임별 박자 · 상해 포켓 모드 · 짝 게임을 더했어요. | [beetle-wswan-libretro](https://github.com/libretro/beetle-wswan-libretro) `4b01295` |
 | 네오지오 포켓 | [`ngp-mednafen-dual`](cores/ngp-mednafen-dual/README.ko.md) | 직렬 채널 0 과 바이오스 통신 함수로 두 대를 잇고, 시계 · 플래시 · Z80 상태를 결정적으로 만들었어요. 각자 세이브와 짝 게임(카드 파이터즈 SNK ↔ 캡콤, 다이브 얼러트 베키 ↔ 매트)을 더했어요. | [beetle-ngp-libretro](https://github.com/libretro/beetle-ngp-libretro) `139fe34` |
 | 게임기어 | [`gg-genesisplusgx-dual`](cores/gg-genesisplusgx-dual/README.ko.md) | 기어 투 기어 케이블(병렬 · 직렬 UART · NMI)을 흉내 내 두 대를 줄 단위로 번갈아 돌려요. 각자 자기 세이브도 돼요. | [Genesis Plus GX](https://github.com/libretro/Genesis-Plus-GX) `302fe82` |
@@ -137,12 +137,12 @@ KNULLI 에 붙이는 것(같이하기 창 · 각자 세이브 · DS 직접 연�
 
 | 꾸러미 | 들어 있는 것 | 크기 |
 |---|---|---|
-| [**전부**](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/handheld-link-cores-all-linux-aarch64.zip) | 아래 꾸러미 모두를 한 zip 으로 | 44.1 MB |
+| [**전부**](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/handheld-link-cores-all-linux-aarch64.zip) | 아래 꾸러미 모두를 한 zip 으로 | 44.0 MB |
 | [ds-melonds-ds](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/ds-melonds-ds-linux-aarch64.zip) | `melondsds_libretro.so` | 2.0 MB |
 | [ds-dsperate](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/ds-dsperate-linux-aarch64.zip) | `dsperate` + 켜기 파일 | 3.2 MB |
 | [gb-gambatte-link](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gb-gambatte-link-linux-aarch64.zip) | `gambatte_libretro.so` | 474 KB |
 | [gba-mgba-dual](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gba-mgba-dual-linux-aarch64.zip) | `mgba_dual_libretro.so` + `.info` | 387 KB |
-| [gba-gpsp-rfu](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gba-gpsp-rfu-linux-aarch64.zip) | `gpsp_libretro.so` | 297 KB |
+| [gba-gpsp-rfu](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gba-gpsp-rfu-linux-aarch64.zip) | `gpsp_libretro.so` | 248 KB |
 | [wswan-mednafen-dual](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/wswan-mednafen-dual-linux-aarch64.zip) | `mednafen_wswan_dual_libretro.so` + `.info` | 215 KB |
 | [ngp-mednafen-dual](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/ngp-mednafen-dual-linux-aarch64.zip) | `mednafen_ngp_dual_libretro.so` + `.info` | 216 KB |
 | [gg-genesisplusgx-dual](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gg-genesisplusgx-dual-linux-aarch64.zip) | `genesisplusgx_gg_dual_libretro.so` + `.info` | 1.7 MB |
@@ -269,7 +269,7 @@ flowchart LR
 
 ```sh
 git clone https://github.com/libretro/gpsp && cd gpsp
-git checkout 4caf7a167d159866479ea94d6b2d13c26ceb3e72
+git checkout 5819380c2ffb0900219d700a382ee68c464ebb99
 grep -v '^#' ../handheld-link-cores/cores/gba-gpsp-rfu/patches/series | \
   while read -r p; do git apply "../handheld-link-cores/cores/gba-gpsp-rfu/patches/$p"; done
 make platform=unix
@@ -289,7 +289,7 @@ make platform=unix
 | FBNeo | v1.0.0.03 | 3,389 | 소스 두 줄로 보냄: [finalburnneo/FBNeo#2845](https://github.com/finalburnneo/FBNeo/pull/2845) |
 | DSperate | v3.0.3 | 46 | IPC FIFO 박자만 보냄: [beebono/DSperate#34](https://github.com/beebono/DSperate/pull/34) |
 | gambatte | `4041d5a` | 87 | 보냄: [libretro/gambatte-libretro#289](https://github.com/libretro/gambatte-libretro/pull/289) |
-| gpSP | `4caf7a1` | 76 | 안전 확인만 보냄: [libretro/gpsp#294](https://github.com/libretro/gpsp/pull/294) |
+| gpSP | `5819380` | 0 | 안전 확인만 보냄: [libretro/gpsp#294](https://github.com/libretro/gpsp/pull/294) |
 | blueMSX | `572c918` | 101 | 끌 때 SRAM 저장 · WD2793 이름 보냄: [libretro/blueMSX-libretro#212](https://github.com/libretro/blueMSX-libretro/pull/212) — 상태 저장 전체 고침은 아직 |
 | MAME 2003-Plus | `61305d6` | 460 | 표시 비트 고침은 원본에 2026-10-24 들어감([#2131](https://github.com/libretro/mame2003-plus-libretro/pull/2131)). 보냄: [#2177](https://github.com/libretro/mame2003-plus-libretro/pull/2177)(H6280 · 배틀 레인저스 — 최신판에서 다시 재 봄: 0/300 → 300/300) · [#2178](https://github.com/libretro/mame2003-plus-libretro/pull/2178)(읽기 전용 뱅크). 아타리 · Vs. 시스템은 최신판에 맞춰 더 손봐야 해요 |
 | mGBA Dual · GG Dual · FCEUmm · DOSBox Pure · 마작 패드 | — | — | 보낼 것 아님 — 우리 구성 전용이거나 원본이 그 코드를 새로 씀 |
