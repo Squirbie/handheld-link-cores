@@ -3,6 +3,10 @@
 # nds_save_sync.sh - EmulationStation game-start / game-end hook for KNULLI that calls the helpers below. Keep it as the only file in /userdata/system/scripts/.
 #   2026-11-23: helpers left from the previous game are stopped by the PID saved when they were started (a full
 #   pkill -f scan only once per helper after boot), and the card flush on game end is now the very last step.
+#   2026-11-24: PSP ad-hoc games (standalone PPSSPP with EnableWlan=True: the per-game psp["<ROM file name>"] line if the game
+#   has one, otherwise the system-wide psp.ppsspp line; knulli.conf, or batocera.conf on older builds; only if neither line
+#   exists, EnableWlan in the [Network] section of PPSSPP's own ppsspp.ini) are reported to the hb_pspadhoc service with one
+#   line in /tmp/hb_pspadhoc.game (block 24).
 # ES 게임 시작/종료 훅 (scripts/ 폴더에는 실행 파일이 하나만 있어야 함: exFAT이라 모든 파일이 실행돼서)
 # (11/23) 지난 판 도우미 끄기: 예전엔 끌 때마다 pkill -f 로 프로세스 전체(250개 안팎)를 훑음(한 번 0.06~0.07초 · 켤 때 3번 · 끌 때 2번).
 #   이제 띄울 때 적어 둔 번호(/tmp/hb_hook_pids — 램 · 부팅마다 새로)로 바로 끔. 그 번호의 명령 줄에 같은 글이 있을 때만(번호 재사용 막기).
@@ -160,6 +164,50 @@ esac
 #     끄기: /userdata/system/claude/psp_gpu.off
 [ "$1" = "gameStart" ] && [ "$2" = "psp" ] && [ ! -e /userdata/system/claude/psp_gpu.off ] && [ -w $G ] && echo 1 > $G 2>/dev/null
 [ "$1" = "gameStop" ] && [ -w $G ] && [ "$(cat $G 2>/dev/null)" = 1 ] && echo 0 > $G 2>/dev/null
+# 24) (11/24) PSP 같이하기(애드혹) v2: 애드혹 게임을 켜고 끌 때 hb_pspadhoc 서비스에 귀띔 — /tmp/hb_pspadhoc.game 한 줄만 쓰고
+#     기다리지 않음(파이썬 안 띄움). 데몬이 1초 안에 읽어 서버 고르기를 시작하고(듣기 2초 → PPSSPP 가 통신을 열기 전에 끝남),
+#     PPSSPP 프로세스가 30초 안에 안 뜨거나 6초 넘게 없으면 혼자 끝냄(끌 때 이 훅이 안 불리는 죽음 · 전원 · 잠도).
+#     애드혹 게임 = EnableWlan 값이 True(PPSSPP 처럼 대소문자 안 가림 · 1 도): 그 롬의 게임별 줄 psp["<롬>"].ppsspp.Network.EnableWlan=…
+#     이 있으면 그 값(False 면 그 게임만 아님), 없으면(값이 빈 줄도) 기종 줄 psp.ppsspp.Network.EnableWlan=… 값. 같은 키가 여러 줄이면 마지막 줄.
+#     설정 파일은 knulli.conf, 없으면 batocera.conf(옛 빌드 · 키 꼴 같음). 이 두 키의 줄만 grep 으로 꺼냄(와이파이 줄 같은 다른 줄은 안 읽음).
+#     두 줄이 다 없을 때만(값이 빈 줄도 없는 것) 맨 마지막으로 PPSSPP 자기 설정 configs/ppsspp/PSP/SYSTEM/ppsspp.ini 의 [Network] 절 EnableWlan
+#     (PPSSPP 메뉴로 켠 값. 실행기가 이 파일을 읽어 이어 쓰는 빌드에서만 다음 실행까지 남음 · 이 훅은 실행기가 이 파일을 다시 쓰기 전에 불림).
+#     grep 은 절 머리 줄과 EnableWlan 줄만 꺼내고, 그중 [Network] 절 안의 EnableWlan 만 씀(다른 절 · 다른 키는 안 읽음 · 같은 키가 여러 줄이면
+#     마지막 줄). 절 이름 · 키는 대소문자 안 가림 · 머리 줄 [ ] 안팎 · = 둘레 · 값 앞뒤 빈칸과 탭 · CRLF · 첫 줄 BOM 은 견딤.
+#     혼자 하는 PSP 게임은 아무것도 안 씀. 설명: /userdata/system/claude/hb_pspadhoc.py 맨 위.
+if [ "$2" = psp ] && [ "$3" = ppsspp ]; then
+  case "$1" in
+    gameStart)
+      hb_r=${5##*/}; hb_c=/userdata/system/knulli.conf; [ -e $hb_c ] || hb_c=/userdata/system/batocera.conf
+      grep -F -e "psp[\"$hb_r\"].ppsspp.Network.EnableWlan=" -e psp.ppsspp.Network.EnableWlan= $hb_c 2>/dev/null | tr -d '\r' | {
+        hb_g=; hb_s=
+        while IFS= read -r hb_l; do
+          case "$hb_l" in
+            "psp[\"$hb_r\"].ppsspp.Network.EnableWlan="?*) hb_g=${hb_l##*=} ;;
+            psp.ppsspp.Network.EnableWlan=?*) hb_s=${hb_l##*=} ;;
+          esac
+        done
+        hb_v=${hb_g:-$hb_s}
+        [ -n "$hb_v" ] || { hb_b=$(printf '\357\273\277')
+          hb_v=$(grep -i -e '^[[:space:]]*\[' -e "^$hb_b\[" -e '^[[:space:]]*EnableWlan[[:space:]]*=' \
+                   /userdata/system/configs/ppsspp/PSP/SYSTEM/ppsspp.ini 2>/dev/null | tr '\t\r' '  ' | {
+            hb_n=; hb_w=
+            while IFS= read -r hb_l; do
+              hb_l=${hb_l#"$hb_b"}; hb_l=${hb_l#"${hb_l%%[! ]*}"}
+              case "$hb_l" in
+                (\[*\]*) hb_l=${hb_l#?}; hb_l=${hb_l%%\]*}; hb_l=${hb_l#"${hb_l%%[! ]*}"}; hb_n=
+                         case "${hb_l%"${hb_l##*[! ]}"}" in ([Nn][Ee][Tt][Ww][Oo][Rr][Kk]) hb_n=1 ;; esac ;;
+                (\[*) ;;
+                (*) [ -z "$hb_n" ] || { hb_w=${hb_l#*=}; hb_w=${hb_w#"${hb_w%%[! ]*}"}; hb_w=${hb_w%"${hb_w##*[! ]}"}; } ;;
+              esac
+            done
+            printf '%s\n' "$hb_w"
+          }); }
+        case "$hb_v" in [Tt][Rr][Uu][Ee]|1) echo "start $(date +%s) $hb_r" > /tmp/hb_pspadhoc.game 2>/dev/null ;; esac
+      } ;;
+    gameStop) [ -e /tmp/hb_pspadhoc.game ] && echo "stop $(date +%s)" > /tmp/hb_pspadhoc.game 2>/dev/null ;;
+  esac
+fi
 # 12) 같이하기 직접 연결(10/12): 같이하는 동안만 두 기기를 공유기 없이 바로 이어 게임 데이터가 직접 오가게 함(집 공유기가 몇 초마다
 #     모든 와이파이 기기를 0.05~0.1초 멈춰서). 레트로아크 게임이면 넷플레이 감시를 띄움(방을 열면 이 기기가 숨은 작은 공유기,
 #     남의 방에 들어가면 거기에 붙음). DSperate 는 hb_dsperate_run.sh 가 띄움. 게임이 끝나면 다 끄고 원래대로(남은 것도 치움).

@@ -137,7 +137,7 @@ KNULLI 에 붙이는 것(같이하기 창 · 각자 세이브 · DS 직접 연�
 
 | 꾸러미 | 들어 있는 것 | 크기 |
 |---|---|---|
-| [**전부**](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/handheld-link-cores-all-linux-aarch64.zip) | 아래 꾸러미 모두를 한 zip 으로 | 44.0 MB |
+| [**전부**](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/handheld-link-cores-all-linux-aarch64.zip) | 아래 꾸러미 모두를 한 zip 으로 | 44.1 MB |
 | [ds-melonds-ds](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/ds-melonds-ds-linux-aarch64.zip) | `melondsds_libretro.so` | 2.0 MB |
 | [ds-dsperate](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/ds-dsperate-linux-aarch64.zip) | `dsperate` + 켜기 파일 | 3.2 MB |
 | [gb-gambatte-link](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gb-gambatte-link-linux-aarch64.zip) | `gambatte_libretro.so` | 474 KB |
@@ -152,7 +152,7 @@ KNULLI 에 붙이는 것(같이하기 창 · 각자 세이브 · DS 직접 연�
 | [arcade-mame2003-plus](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/arcade-mame2003-plus-linux-aarch64.zip) | `mame2003_plus_libretro.so` | 10.0 MB |
 | [arcade-fbneo](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/arcade-fbneo-linux-aarch64.zip) | `fbneo_libretro.so` | 21.0 MB |
 | [arcade-mahjong-pad](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/arcade-mahjong-pad-linux-aarch64.zip) | `fbneo_mj_libretro.so` + `mame2003_plus_mj_libretro.so` + `.info` | 25 KB |
-| [knulli-scripts](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/knulli-scripts.zip) | 붙이는 스크립트 · 실행기 패치 · 갈무리 픽셀 글꼴 | 2.1 MB |
+| [knulli-scripts](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/knulli-scripts.zip) | 붙이는 스크립트 · 실행기 패치 · 갈무리 픽셀 글꼴 | 2.2 MB |
 
 롬 · 바이오스 · 펌웨어 · 세이브는 들어 있지 않아요. 쓸 수 있는 파일만 쓰세요.
 

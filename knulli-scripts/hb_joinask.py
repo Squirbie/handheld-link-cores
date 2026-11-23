@@ -192,7 +192,13 @@ def stem(p):
 def content_names(content):
     """(11/13) 방장 답의 content 를 견줄 이름 꼴 둘. content 는 이미 확장자가 빠진 이름이라, 점이 든 이름('(V1.1)' · 'Dr. Mario')은
     stem() 이 점 뒤를 한 번 더 잘라 이름으로 못 맞췄음 → 자르지 않은 이름도 같이 견줌(예전 꼴도 그대로 받음)"""
-    return (stem(content), content.strip().lower())
+    # 11/24: 점 뒤를 자른 꼴은 잘린 꼬리가 확장자 꼴(빈칸 · 괄호 없는 1~4자 · 글자 하나 이상)일 때만 받음
+    #   → 'Super Mario Bros. 2' 방(꼬리 '. 2')이 'Super Mario Bros.' 손님과 같은 이름이 되던 것 막음
+    full = content.strip().lower()
+    tail = os.path.splitext(os.path.basename(full))[1][1:]
+    if re.fullmatch(r'[a-z0-9]{1,4}', tail) and re.search(r'[a-z]', tail):
+        return (stem(content), full)
+    return (full,)
 
 
 def rom_crcs(rom):

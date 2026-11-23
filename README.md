@@ -137,7 +137,7 @@ Releases are dated (`YYYY.MM.DD`). Each package is a zip with the prebuilt file(
 
 | Package | Contents | Size |
 |---|---|---|
-| [**Everything**](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/handheld-link-cores-all-linux-aarch64.zip) | All packages below in one zip | 44.0 MB |
+| [**Everything**](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/handheld-link-cores-all-linux-aarch64.zip) | All packages below in one zip | 44.1 MB |
 | [ds-melonds-ds](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/ds-melonds-ds-linux-aarch64.zip) | `melondsds_libretro.so` | 2.0 MB |
 | [ds-dsperate](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/ds-dsperate-linux-aarch64.zip) | `dsperate` + launch glue | 3.2 MB |
 | [gb-gambatte-link](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/gb-gambatte-link-linux-aarch64.zip) | `gambatte_libretro.so` | 474 KB |
@@ -152,7 +152,7 @@ Releases are dated (`YYYY.MM.DD`). Each package is a zip with the prebuilt file(
 | [arcade-mame2003-plus](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/arcade-mame2003-plus-linux-aarch64.zip) | `mame2003_plus_libretro.so` | 10.0 MB |
 | [arcade-fbneo](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/arcade-fbneo-linux-aarch64.zip) | `fbneo_libretro.so` | 21.0 MB |
 | [arcade-mahjong-pad](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/arcade-mahjong-pad-linux-aarch64.zip) | `fbneo_mj_libretro.so` + `mame2003_plus_mj_libretro.so` + `.info` | 25 KB |
-| [knulli-scripts](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/knulli-scripts.zip) | Glue scripts, launcher patch, Galmuri pixel fonts | 2.1 MB |
+| [knulli-scripts](https://github.com/Squirbie/handheld-link-cores/releases/latest/download/knulli-scripts.zip) | Glue scripts, launcher patch, Galmuri pixel fonts | 2.2 MB |
 
 No ROMs, BIOS, firmware or saves are included. Use files you are allowed to use.
 
