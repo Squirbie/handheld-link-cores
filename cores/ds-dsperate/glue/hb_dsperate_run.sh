@@ -107,7 +107,12 @@ HB_T0=$(date +%s)
 P=$!
 # 같이하기 직접 연결(10/12, /userdata/system/claude/hb_direct.py): 손님이 붙으면 방장 기기는 숨은 작은 공유기를 켜고 손님 기기는 거기 붙어
 #   게임 데이터만 공유기를 안 거치고 오감(집 공유기가 몇 초마다 멈춰서). DSperate 가 끝나면 원래대로. 끄기: /userdata/system/claude/hb_direct.off
-[ ${#ARGS[@]} -gt 0 ] && [ -f /userdata/system/claude/hb_direct.py ] && setsid nohup python3 /userdata/system/claude/hb_direct.py watch-dsperate $P $LOG > /dev/null 2>&1 < /dev/null &
+#   (11/23) 게임 훅이 pkill -f 대신 번호로 끄므로 띄운 번호를 /tmp/hb_hook_pids/direct_dsp 에 적음 — 지킴: 강제로 꺼진 판의 감시가 다음 게임에 안 남게.
+#   예전 한 줄(a && b && setsid … &)은 && 줄 통째가 뒤로 가서 $! 가 감시 번호가 아님 → if 로 나눠 setsid 줄만 뒤로.
+if [ ${#ARGS[@]} -gt 0 ] && [ -f /userdata/system/claude/hb_direct.py ]; then
+  setsid nohup python3 /userdata/system/claude/hb_direct.py watch-dsperate $P $LOG > /dev/null 2>&1 < /dev/null &
+  mkdir -p /tmp/hb_hook_pids 2>/dev/null; echo $! > /tmp/hb_hook_pids/direct_dsp
+fi
 # 롬을 못 읽으면 DSperate 가 'could not read' 를 적고 끝나다가 제 일꾼 스레드를 기다리며 멈춤(끄라는 신호도 안 들음, 10/12 시험에서 찾음)
 #   → 켠 뒤 120초 안에 그 줄이 보이면 2초 뒤 강제로 꺼서 메뉴로 돌아가게 함(깨진 롬, 또는 zip 을 푸는 중에 끄면 생기는 일 — 드퀘 9 는 푸는 데 40초)
 ( for i in $(seq 1 120); do sleep 1; kill -0 $P 2>/dev/null || exit 0; grep -q '^could not read' $LOG && { sleep 2; kill -9 $P 2>/dev/null; exit 0; }; done ) &

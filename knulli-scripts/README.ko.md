@@ -14,7 +14,7 @@
 
 | 파일 | 하는 일 |
 |---|---|
-| `nds_save_sync.sh` | ES 게임 시작 · 끝 훅 — 아래 도우미들을 부르는 입구예요. `/userdata/system/scripts/` 에는 **이 파일 하나만** 두세요(KNULLI 가 그 폴더의 모든 파일을 실행해요). |
+| `nds_save_sync.sh` | ES 게임 시작 · 끝 훅 — 아래 도우미들을 부르는 입구예요. `/userdata/system/scripts/` 에는 **이 파일 하나만** 두세요(KNULLI 가 그 폴더의 모든 파일을 실행해요). 지난 게임의 도우미는 띄울 때 적어 둔 번호로 끄고(프로세스 전체 훑기는 도우미마다 부팅 뒤 한 번만), 게임이 끝날 때 카드 기록 확정은 맨 마지막에 해요. |
 | `hb_joinask.py` | **같이하기 창**. 게임을 켤 때 같은 와이파이에 같은 게임 방이 열려 있는지 묻고, 있으면 같이할지 물어요(10초 뒤 혼자). DSperate 방 · 짝 게임도 다뤄요. `system.language` 가 `ko` 로 시작하면 한국어, 아니면 영어(`HB_LANG` 으로 바꿀 수 있어요). |
 | `hb_keys.py` | 창에서 A · B 단추를 읽어요(읽기만 해요 · KNULLI 에 들어 있는 python-evdev 를 써요). `hb_joinask.py` 가 불러 쓰니 둘을 같이 두세요. |
 | `launcher/emulatorlauncher.patch` | KNULLI `configgen/emulatorlauncher.py` 에 거는 작은 패치: 창에서 '같이'를 고르면 손님으로 켜고, ES 넷플레이 로비로 들어온 손님도 게임별 코어를 그대로 써요. |
@@ -28,7 +28,7 @@
 | `hb_dskeys.py` · `hb_dshold.py` · `hb_ds_remember.py` | DraStic 도우미: 버튼 도우미 · L2 누르는 동안 두 화면 바꾸기 · 게임마다 큰 화면 배치 기억. |
 | `hb_idlesave.py` | 게임 중 오래 안 누르면 상태 저장하고 잠자기, 배터리가 바닥나기 직전 저장하고 끄기. |
 | `hb_wifimem.py` | 와이파이에 붙어 있는 동안 배경 검색을 꺼서 같이하기 중 주기적으로 끊기는 것을 줄여요(이름과 달리 와이파이 기억 기능은 꺼 두었어요). 절전에서 깬 뒤에는 연결을 건드리지 않고, 1분쯤 지나도 와이파이가 안 붙으면 와이파이를 껐다 켜 줘요. |
-| `services/` | `hb_idlesave` · `hb_wifimem` · `hb_dsmac` · `hb_pspadhoc` 를 켜는 KNULLI 서비스 파일. |
+| `services/` | `hb_idlesave` · `hb_wifimem` · `hb_dsmac` · `hb_pspadhoc` 를 켜는 KNULLI 서비스 파일. `hb_wifimem` · `hb_dsmac` · `hb_pspadhoc` 는 메뉴가 뜬 뒤(`/tmp/emulationstation.ready`, 늦어도 60초 뒤)에 켜져서 부팅을 늦추지 않아요. |
 
 ## 넣는 법
 

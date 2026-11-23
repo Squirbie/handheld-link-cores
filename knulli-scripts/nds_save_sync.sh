@@ -1,7 +1,24 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
 # nds_save_sync.sh - EmulationStation game-start / game-end hook for KNULLI that calls the helpers below. Keep it as the only file in /userdata/system/scripts/.
+#   2026-11-23: helpers left from the previous game are stopped by the PID saved when they were started (a full
+#   pkill -f scan only once per helper after boot), and the card flush on game end is now the very last step.
 # ES 게임 시작/종료 훅 (scripts/ 폴더에는 실행 파일이 하나만 있어야 함: exFAT이라 모든 파일이 실행돼서)
+# (11/23) 지난 판 도우미 끄기: 예전엔 끌 때마다 pkill -f 로 프로세스 전체(250개 안팎)를 훑음(한 번 0.06~0.07초 · 켤 때 3번 · 끌 때 2번).
+#   이제 띄울 때 적어 둔 번호(/tmp/hb_hook_pids — 램 · 부팅마다 새로)로 바로 끔. 그 번호의 명령 줄에 같은 글이 있을 때만(번호 재사용 막기).
+#   지키는 것: 지난 판 도우미가 다음 게임에 붙지 않게 — 도우미마다 부팅 뒤 처음 한 번(<이름>.on 표시 없음)은 예전처럼 pkill -f 로 다 훑어서
+#   이 판 전 훅 · 다른 곳이 띄운 것도 끔. 번호를 적는 곳: 이 훅 · dsperate/hb_dsperate_run.sh(watch-dsperate).
+HB_PIDS=/tmp/hb_hook_pids
+[ -d $HB_PIDS ] || mkdir -p $HB_PIDS 2>/dev/null
+hb_kill() {   # $1 = 번호 파일 이름 · $2 = 명령 줄에 든 글(예전 pkill -f 의 글)
+  if [ -f "$HB_PIDS/$1" ]; then
+    read -r hb_p < "$HB_PIDS/$1"; rm -f "$HB_PIDS/$1"
+    case "$hb_p" in ''|*[!0-9]*) ;; *) case "$(tr '\0' ' ' 2>/dev/null < /proc/$hb_p/cmdline)" in *"$2"*) kill "$hb_p" 2>/dev/null ;; esac ;; esac
+  fi
+  if [ ! -e "$HB_PIDS/$1.on" ]; then
+    pkill -f "$2" 2>/dev/null; : > "$HB_PIDS/$1.on" 2>/dev/null
+  fi
+}
 # 20) 각자 세이브(10/21 4판): 시작 때 지난 거래(강제 종료 · 배터리로 끝난 판의 중간 저장 포함)를 먼저 마무리하고 램만 정리,
 #     끝날 때 이번 판 2P 결과를 확인해 자기 1P 세이브에 씀(표 · 롬 CRC · 2P 확인 · CRC32 · SHA-256 · 원본 그대로일 때만).
 #     실패해도 카드 거래 폴더(saves/<기종>/.hb_ownsave)는 남겨 다음에 다시. 기록 /tmp/hb_ownsave_finish.log(램, 256KiB 상한).
@@ -59,44 +76,44 @@ esac
 #    - RetroArch 명령 포트(UDP 55355)는 기기 안(lo)에서만 받게 막음(같은 와이파이의 다른 기기가 못 보내게).
 #    - 넷플레이 저장 도중 리셋으로 .srm이 0바이트가 됐으면 마지막 정상본(.netplay_backup/…/.srm.bak)으로 되돌림.
 if [ "$1" = "gameStart" ]; then
-  pkill -f netplay_sram_flush.py
+  hb_kill npflush netplay_sram_flush.py   # (11/23) 지킴: 지난 게임 넷플 세이브 감시가 이번 게임에 안 붙게(pkill -f → 번호)
   if [ "$3" = "libretro" ]; then
-    iptables -C INPUT -p udp --dport 55355 ! -i lo -j DROP 2>/dev/null || iptables -I INPUT -p udp --dport 55355 ! -i lo -j DROP 2>/dev/null
+    # (11/23) 지킴: 명령 포트 55355 막기 — 부팅 뒤 첫 레트로아크 게임에서 한 번 확인 · 넣고 표시(램), 그 뒤는 표시만 봄(규칙을 지우는 곳은 없음 · hb_direct 는 자기 HBD 사슬만)
+    [ -e $HB_PIDS/fw55355.ok ] || { { iptables -C INPUT -p udp --dport 55355 ! -i lo -j DROP 2>/dev/null || iptables -I INPUT -p udp --dport 55355 ! -i lo -j DROP 2>/dev/null; } && : > $HB_PIDS/fw55355.ok; }
     n="${5##*/}"; n="${n%.*}"; s="/userdata/saves/$2/$n.srm"; b="/userdata/saves/.netplay_backup/$2/$n.srm.bak"
     if [ -f "$b" ] && [ -f "$s" ] && [ ! -s "$s" ]; then
       cp -f "$b" "$s" && echo "$(date '+%F %T') restored $s from $b" >> /userdata/system/logs/netplay_sram_flush.log
     fi
     nohup python3 /userdata/system/claude/netplay_sram_flush.py "$4" "$2" "$5" >> /userdata/system/logs/netplay_sram_flush.log 2>&1 < /dev/null &
+    echo $! > $HB_PIDS/npflush
   fi
 fi
 # 6) 게임을 켤 때마다 같은 와이파이의 다른 기기 이름을 /etc/hosts에 적음 → 스타듀밸리 등에서 IP 대신 이름으로 접속(lan_names.sh 가 있을 때만).
 if [ "$1" = "gameStart" ] && [ -f /userdata/system/claude/lan_names.sh ]; then
   nohup sh /userdata/system/claude/lan_names.sh >/dev/null 2>&1 < /dev/null &
 fi
-# 5) 게임이 끝날 때마다(모든 에뮬) 카드 기록을 확정: 이 카드는 exFAT(FUSE)라 fsync가 있어야 빈 칸 표(비트맵)까지 카드에 써짐.
-#    안 하면 리셋 뒤 방금 저장한 파일 자리가 빈 칸으로 남아 나중에 다른 파일에 덮일 수 있음.
-if [ "$1" = "gameStop" ]; then
-  python3 -c "import os; f = os.open('/userdata/system/knulli.conf', os.O_RDONLY); os.fsync(f)" 2>/dev/null
-fi
+# 5) 게임이 끝날 때 카드 기록 확정(fsync) — (11/23) 훅 맨 끝으로 옮김(아래 23번 FBNeo 손님 되돌리기 · 2번 DS 세이브 맞추기까지 담기게).
 # 7) 게임 안 팝업(볼륨·밝기·배터리 경고·배터리 확인 버튼): hb_osd.py 가 /tmp/hb_osd.txt 에 글자를 쓰면 MangoHud(hud_custom)가 왼쪽 위에 보여 주고,
 #    MangoHud 가 안 붙은 레트로아크 게임이면 UDP SHOW_MSG 로 보여 줌. 게임마다 하나만 띄우고 게임이 끝나면 끔. 카드에는 아무것도 안 씀(/tmp는 램).
 #    못 켜져도 게임에는 영향 없음. 끄고 싶으면 /userdata/system/claude/hb_osd.off 파일을 하나 만들면 됨(훅은 그대로).
 if [ "$1" = "gameStart" ]; then
-  pkill -f hb_osd.py 2>/dev/null
+  hb_kill osd hb_osd.py   # (11/23) 지킴: 팝업 도우미는 게임마다 하나만(pkill -f → 번호)
   : > /tmp/hb_osd.txt 2>/dev/null
   if [ -f /userdata/system/claude/hb_osd.py ] && [ ! -e /userdata/system/claude/hb_osd.off ]; then
     nohup python3 /userdata/system/claude/hb_osd.py --system "$2" --emulator "$3" --core "$4" --rom "$5" >> /tmp/hb_osd.log 2>&1 < /dev/null &
+    echo $! > $HB_PIDS/osd
   fi
 elif [ "$1" = "gameStop" ]; then
-  pkill -f hb_osd.py 2>/dev/null
+  hb_kill osd hb_osd.py   # (11/23) 지킴: 게임이 끝나면 팝업 도우미도 끝(pkill -f → 번호)
   : > /tmp/hb_osd.txt 2>/dev/null
 fi
 # 8) DS 안전장치: 기기를 오래 켜 두면 DraStic 이 화면용 연속 메모리를 못 받아 GPU 메모리를 계속 새로 잡다가 25~30초 만에
 #    기기가 굳고 꺼진다(10/5 확인, 재부팅하면 정상). drastic_guard.py 가 그 상태를 몇 초 만에 알아채 DraStic 만 끄고
 #    '재부팅해 주세요' 창을 띄운다. 정상일 때는 보기만 함. 끄기: /userdata/system/claude/drastic_guard.off
 if [ "$1" = "gameStart" ] && [ "$2" = "nds" ] && [ "$3" = "advanced_drastic" ] && [ -f /userdata/system/claude/drastic_guard.py ]; then
-  pkill -f drastic_guard.py 2>/dev/null
+  hb_kill guard drastic_guard.py   # (11/23) 지킴: DS 안전장치는 하나만(pkill -f → 번호)
   nohup python3 /userdata/system/claude/drastic_guard.py >/dev/null 2>&1 < /dev/null &
+  echo $! > $HB_PIDS/guard
 fi
 # 9) 마인크래프트: 켜기 직전에 같은 와이파이의 열린 방(다른 친구 기기 포함)을 2.5초 훑어서 서버 목록에 'LAN-이름 실제IP' 줄로 적음.
 #    이 마인크래프트(mcpelauncher 1.16)는 방송으로 방을 못 찾고 서버 목록에 적힌 주소에만 물어봐서, 적힌 방만 친구 탭 'LAN 게임'에 뜸
@@ -148,13 +165,14 @@ esac
 #     남의 방에 들어가면 거기에 붙음). DSperate 는 hb_dsperate_run.sh 가 띄움. 게임이 끝나면 다 끄고 원래대로(남은 것도 치움).
 #     끄기: /userdata/system/claude/hb_direct.off
 if [ -f /userdata/system/claude/hb_direct.py ] && { [ "$1" = "gameStart" ] || [ "$1" = "gameStop" ]; }; then
-  pkill -f "hb_direct.py watch-" 2>/dev/null
+  hb_kill direct_ra "hb_direct.py watch-"; hb_kill direct_dsp "hb_direct.py watch-"   # (11/23) 지킴: 지난 판 직접 연결 감시(레트로아크 · DSperate) 끄기(pkill -f → 번호)
   rm -f /tmp/hb_dual_screen      # 10/20 20:5x: 감시가 쓰는 두 대 코어 화면(1P/2P) — 게임마다 새로(남은 2P 가 다음 혼자 게임에 안 먹게)
   if [ -e /tmp/hb_direct/daemon.pid ] || [ -e /tmp/hb_direct/fw_on ] || [ $(( $(cat /sys/class/net/wlan1/flags 2>/dev/null || echo 0) & 1 )) = 1 ]; then
     python3 /userdata/system/claude/hb_direct.py stop >/dev/null 2>&1
   fi
   if [ "$1" = "gameStart" ] && [ "$3" = "libretro" ]; then
     nohup python3 /userdata/system/claude/hb_direct.py watch-retroarch "$2" "$5" "$4" >/dev/null 2>&1 < /dev/null &
+    echo $! > $HB_PIDS/direct_ra
   fi
 fi
 # 14) DS 스틱 누르기 창 켜기/끄기(10/14 19:38): 기기 메뉴 → 게임 설정 → 'DS 게임' → 'DS 스틱 누르기 창'(knulli.conf global.hb_ds_autopop, 끔 = 0 · 켬 = 줄 없음).
@@ -313,6 +331,16 @@ if [ "$3" = "libretro" ] && [ "$4" = "fbneo" ]; then
   fi
 fi
 # 2) Keeps DraStic and melonDS DS saves of NDS games in sync (see /userdata/system/claude/nds_save_sync.py).
-[ "$2" = "nds" ] || exit 0
-python3 /userdata/system/claude/nds_save_sync.py "$@" >> /userdata/system/logs/nds_save_sync.log 2>&1
+#    (11/23) 예전 'exit 0' 로 끝내던 것을 if 로 — DS 가 아닌 게임도 아래 5번 카드 확정까지 가게.
+if [ "$2" = "nds" ]; then
+  python3 /userdata/system/claude/nds_save_sync.py "$@" >> /userdata/system/logs/nds_save_sync.log 2>&1
+fi
+# 5) 게임이 끝날 때마다(모든 에뮬) 카드 기록을 확정: 이 카드는 exFAT(FUSE)라 fsync가 있어야 빈 칸 표(비트맵)까지 카드에 써짐.
+#    안 하면 리셋 뒤 방금 저장한 파일 자리가 빈 칸으로 남아 나중에 다른 파일에 덮일 수 있음.
+#    (11/23) 지킴: 같은 fsync — python3 -c(0.12~0.16초) 대신 coreutils 'sync 파일'(그 파일만 fsync · 0.03초). 맨 sync · sync -f 는 쓰지 않음
+#    (커널 4.9 FUSE 는 파일 시스템 통째 sync 를 exfat 에 못 넘김). 자리도 훅 맨 끝 — 위 20번 · 23번 · 2번이 쓴 세이브까지 확정.
+#    'sync 파일'이 실패하면(이상한 sync) 예전 파이썬 줄로.
+if [ "$1" = "gameStop" ]; then
+  sync /userdata/system/knulli.conf 2>/dev/null || python3 -c "import os; f = os.open('/userdata/system/knulli.conf', os.O_RDONLY); os.fsync(f)" 2>/dev/null
+fi
 exit 0

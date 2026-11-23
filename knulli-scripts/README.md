@@ -14,7 +14,7 @@
 
 | File | What it does |
 |---|---|
-| `nds_save_sync.sh` | EmulationStation game-start / game-end hook — the entry point that calls the helpers below. It must be the **only** file in `/userdata/system/scripts/` (KNULLI runs every file there). |
+| `nds_save_sync.sh` | EmulationStation game-start / game-end hook — the entry point that calls the helpers below. It must be the **only** file in `/userdata/system/scripts/` (KNULLI runs every file there). Helpers left from the previous game are stopped by the PID saved when they started (a full process scan only once per helper after boot), and the card flush runs as the last step when a game ends. |
 | `hb_joinask.py` | The **Join / Solo** prompt. When a game starts, it asks the local network whether a netplay room for the same game is open and, if so, offers to join it (solo after 10 s). Handles DSperate rooms and paired versions too. Shows Korean when `system.language` starts with `ko`, English otherwise (override with `HB_LANG`). |
 | `hb_keys.py` | Reads the A / B buttons for the prompt (read-only, through python-evdev, which KNULLI ships). `hb_joinask.py` imports it, so the two go together. |
 | `launcher/emulatorlauncher.patch` | Small patch for KNULLI's `configgen/emulatorlauncher.py`: starts the guest after the prompt picked Join, and keeps the per-game core for guests joining from the ES netplay lobby. |
@@ -28,7 +28,7 @@
 | `hb_dskeys.py` · `hb_dshold.py` · `hb_ds_remember.py` | DraStic helpers: button helper, swap the screens while L2 is held, remember the large-screen layout per game. |
 | `hb_idlesave.py` | Saves a state and sleeps after a long idle time in game; saves and powers off just before the battery runs out. |
 | `hb_wifimem.py` | Turns off background Wi-Fi scanning while connected, which removes periodic netplay stalls (the Wi-Fi memory it is named after is switched off). After waking from sleep it leaves the connection alone, and if Wi-Fi does not come back within about a minute it switches Wi-Fi off and on for you. |
-| `services/` | KNULLI service wrappers for `hb_idlesave`, `hb_wifimem`, `hb_dsmac` and `hb_pspadhoc`. |
+| `services/` | KNULLI service wrappers for `hb_idlesave`, `hb_wifimem`, `hb_dsmac` and `hb_pspadhoc`. `hb_wifimem`, `hb_dsmac` and `hb_pspadhoc` start once the menu is ready (`/tmp/emulationstation.ready`, or after 60 s at the latest), so they do not slow down the boot. |
 
 ## Install
 

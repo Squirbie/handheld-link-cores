@@ -5,13 +5,17 @@
 # psp.ppsspp.Network.proAdhocServer=hbpsp in knulli.conf. Details at the top of hb_pspadhoc.py.
 # Enable: add "hb_pspadhoc" to system.services in /userdata/system/knulli.conf (S99userservices starts it at boot).
 # Disable: remove that word and reboot. Install this file as /userdata/system/services/hb_pspadhoc
+# 2026-11-23: starts once the EmulationStation menu is ready (/tmp/emulationstation.ready), or after 60 s at the latest
+# (charge screen, no ES), so this Python helper does not compete with ES for CPU and the card while the game lists load at boot.
+# The PID file holds the same PID while it waits (the wait ends in exec), so stop works at any time.
 P=/var/run/hb_pspadhoc.pid
 case "$1" in
   start|"")
     if [ -f "$P" ] && kill -0 "$(cat "$P")" 2>/dev/null; then
       exit 0
     fi
-    python3 /userdata/system/claude/hb_pspadhoc.py >> /tmp/hb_pspadhoc.log 2>&1 < /dev/null &
+    ( i=0; while [ ! -e /tmp/emulationstation.ready ] && [ $i -lt 120 ]; do sleep 0.5; i=$((i+1)); done
+      exec python3 /userdata/system/claude/hb_pspadhoc.py ) >> /tmp/hb_pspadhoc.log 2>&1 < /dev/null &
     echo $! > "$P"
     ;;
   stop)
