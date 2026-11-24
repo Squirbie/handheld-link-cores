@@ -7,6 +7,9 @@
 #   has one, otherwise the system-wide psp.ppsspp line; knulli.conf, or batocera.conf on older builds; only if neither line
 #   exists, EnableWlan in the [Network] section of PPSSPP's own ppsspp.ini) are reported to the hb_pspadhoc service with one
 #   line in /tmp/hb_pspadhoc.game (block 24).
+#   2026-11-24 b: the ppsspp.ini fallback is skipped on builds whose launcher cannot read that file (Python 3.12 or newer with a
+#   configgen ppssppConfig.py that still calls readfp, so the file is rewritten from scratch on every launch and only holds the
+#   previous game's value). Before, a single-player PSP game started right after an ad-hoc game was reported as ad-hoc.
 # ES 게임 시작/종료 훅 (scripts/ 폴더에는 실행 파일이 하나만 있어야 함: exFAT이라 모든 파일이 실행돼서)
 # (11/23) 지난 판 도우미 끄기: 예전엔 끌 때마다 pkill -f 로 프로세스 전체(250개 안팎)를 훑음(한 번 0.06~0.07초 · 켤 때 3번 · 끌 때 2번).
 #   이제 띄울 때 적어 둔 번호(/tmp/hb_hook_pids — 램 · 부팅마다 새로)로 바로 끔. 그 번호의 명령 줄에 같은 글이 있을 때만(번호 재사용 막기).
@@ -172,6 +175,8 @@ esac
 #     설정 파일은 knulli.conf, 없으면 batocera.conf(옛 빌드 · 키 꼴 같음). 이 두 키의 줄만 grep 으로 꺼냄(와이파이 줄 같은 다른 줄은 안 읽음).
 #     두 줄이 다 없을 때만(값이 빈 줄도 없는 것) 맨 마지막으로 PPSSPP 자기 설정 configs/ppsspp/PSP/SYSTEM/ppsspp.ini 의 [Network] 절 EnableWlan
 #     (PPSSPP 메뉴로 켠 값. 실행기가 이 파일을 읽어 이어 쓰는 빌드에서만 다음 실행까지 남음 · 이 훅은 실행기가 이 파일을 다시 쓰기 전에 불림).
+#     (11/24 b) 실행기가 이 파일을 못 읽는 빌드(파이썬 3.12 이상인데 configgen ppssppConfig.py 가 3.12 에서 없어진 readfp 를 씀 → 매번 새로 씀)
+#     에서는 이 파일에 바로 앞 게임의 값이 남아 있을 뿐이라 보지 않음(애드혹 게임 바로 다음에 켠 혼자 하는 PSP 게임을 애드혹으로 알리던 것).
 #     grep 은 절 머리 줄과 EnableWlan 줄만 꺼내고, 그중 [Network] 절 안의 EnableWlan 만 씀(다른 절 · 다른 키는 안 읽음 · 같은 키가 여러 줄이면
 #     마지막 줄). 절 이름 · 키는 대소문자 안 가림 · 머리 줄 [ ] 안팎 · = 둘레 · 값 앞뒤 빈칸과 탭 · CRLF · 첫 줄 BOM 은 견딤.
 #     혼자 하는 PSP 게임은 아무것도 안 씀. 설명: /userdata/system/claude/hb_pspadhoc.py 맨 위.
@@ -188,7 +193,11 @@ if [ "$2" = psp ] && [ "$3" = ppsspp ]; then
           esac
         done
         hb_v=${hb_g:-$hb_s}
-        [ -n "$hb_v" ] || { hb_b=$(printf '\357\273\277')
+        hb_k=
+        for hb_p in /usr/lib/python3.1[2-9]/site-packages/configgen/generators/ppsspp/ppssppConfig.py; do
+          [ -f "$hb_p" ] && grep -q 'readfp(' "$hb_p" 2>/dev/null && hb_k=1
+        done
+        [ -n "$hb_v" ] || [ -n "$hb_k" ] || { hb_b=$(printf '\357\273\277')
           hb_v=$(grep -i -e '^[[:space:]]*\[' -e "^$hb_b\[" -e '^[[:space:]]*EnableWlan[[:space:]]*=' \
                    /userdata/system/configs/ppsspp/PSP/SYSTEM/ppsspp.ini 2>/dev/null | tr '\t\r' '  ' | {
             hb_n=; hb_w=
